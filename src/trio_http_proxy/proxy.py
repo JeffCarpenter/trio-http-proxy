@@ -17,7 +17,6 @@ from traceback import format_exc
 import h11
 import trio
 
-
 DEFAULT_PORT = 8080
 PORT = int(getenv('PORT', DEFAULT_PORT))
 
@@ -75,7 +74,7 @@ async def process_as_connect_request(stream, bufmaxsz=DEFAULT_BUFFER_SIZE, maxre
     See https://tools.ietf.org/html/rfc7231#section-4.3.6 for the CONNECT spec.
     """
     # TODO: give client 'bad request' errors on assertion failure
-    log(f'Reading...')
+    log('Reading...')
     h11_conn = h11.Connection(our_role=h11.SERVER)
     total_bytes_read = 0
     while (h11_nextevt := h11_conn.next_event()) == h11.NEED_DATA:
@@ -95,7 +94,7 @@ async def pipe(from_stream, to_stream, bufmaxsz=DEFAULT_BUFFER_SIZE):
     async for chunk in from_stream:
         await to_stream.send_all(chunk)
         log(f'Forwarded {len(chunk)} bytes')
-    log(f'Pipe finished')
+    log('Pipe finished')
 
 
 def log(*args, **kw):
