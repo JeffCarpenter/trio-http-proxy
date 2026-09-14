@@ -24,13 +24,21 @@ prn = partial(print, end="")
 indented = partial(indent, prefix="  ")
 decoded_and_indented = lambda some_bytes: indented(some_bytes.decode())
 
-CV_CLIENT_STREAM = ContextVar("client_stream", default=None)
-CV_DEST_STREAM = ContextVar("dest_stream", default=None)
-CV_PIPE_FROM = ContextVar("pipe_from", default=None)
+CV_CLIENT_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
+    "client_stream", default=None
+)
+CV_DEST_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
+    "dest_stream", default=None
+)
+CV_PIPE_FROM: ContextVar[trio.SocketStream | None] = ContextVar(
+    "pipe_from", default=None
+)
+CV_DESTHOST: ContextVar[str | None] = ContextVar("desthost", default=None)
+CV_CONN_ID: ContextVar[int | None] = ContextVar("conn_id", default=None)
 
 
 async def http_proxy(client_stream, _nextid=count(1).__next__):
-    client_stream.id = _nextid()
+    CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
     async with client_stream:
         try:
@@ -59,9 +67,8 @@ async def tunnel(client_stream):
     desthost, destport = await process_as_connect_request(client_stream)
     log(f"Got CONNECT request for {desthost}:{destport}, connecting...")
     dest_stream = await trio.open_tcp_stream(desthost, destport)
-    dest_stream.host = desthost
-    dest_stream.port = destport
     CV_DEST_STREAM.set(dest_stream)
+    CV_DESTHOST.set(desthost)
     log(f"Connected to {desthost}, sending 200 to client...")
     await client_stream.send_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
     log("Sent 200 to client, tunnel established.")
@@ -93,7 +100,7 @@ async def process_as_connect_request(
 
 async def pipe(from_stream, to_stream, bufmaxsz=DEFAULT_BUFFER_SIZE):
     CV_PIPE_FROM.set(from_stream)
-    async for chunk in from_stream:
+    while chunk := await from_stream.receive_some(bufmaxsz):
         await to_stream.send_all(chunk)
         log(f"Forwarded {len(chunk)} bytes")
     log("Pipe finished")
@@ -102,14 +109,14 @@ async def pipe(from_stream, to_stream, bufmaxsz=DEFAULT_BUFFER_SIZE):
 def log(*args, **kw):
     client_stream = CV_CLIENT_STREAM.get()
     if client_stream:
-        prn(f"[conn{client_stream.id}")
+        prn(f"[conn{CV_CONN_ID.get()}")
         dest_stream = CV_DEST_STREAM.get()
         if dest_stream:
             direction = "<>"
             pipe_from = CV_PIPE_FROM.get()
             if pipe_from:
                 direction = "->" if pipe_from is client_stream else "<-"
-            prn(f" {direction} {dest_stream.host}")
+            prn(f" {direction} {CV_DESTHOST.get()}")
         prn("] ")
     print(*args, **kw)
 
