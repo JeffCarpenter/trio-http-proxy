@@ -36,17 +36,24 @@ CV_PIPE_FROM: ContextVar[trio.SocketStream | None] = ContextVar(
 CV_DESTHOST: ContextVar[str | None] = ContextVar("desthost", default=None)
 CV_CONN_ID: ContextVar[int | None] = ContextVar("conn_id", default=None)
 
+_conn_ids = count(1)
 
-async def http_proxy(client_stream, _nextid=count(1).__next__):
+
+async def http_proxy(client_stream, _nextid=_conn_ids.__next__):
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
     async with client_stream:
         try:
             dest_stream = await tunnel(client_stream)
+        except AssertionError, ValueError, h11.ProtocolError, OSError:
+            return  # tunnel() already logged and notified the client
+        try:
             async with dest_stream, trio.open_nursery() as nursery:
                 nursery.start_soon(pipe, client_stream, dest_stream)
                 nursery.start_soon(pipe, dest_stream, client_stream)
-        except Exception:
+        except trio.BrokenResourceError, trio.ClosedResourceError:
+            log("Peer disconnected")
+        except Exception:  # noqa: BLE001 -- unexpected bug; isolate so trio.serve_tcp keeps serving other connections
             log(f"\n{indented(format_exc())}")
 
 
@@ -64,9 +71,21 @@ async def tunnel(client_stream):
     and notify the client when the end-to-end connection has been established.
     Return the destination stream and the corresponding host.
     """
-    desthost, destport = await process_as_connect_request(client_stream)
+    try:
+        desthost, destport = await process_as_connect_request(client_stream)
+    except AssertionError, ValueError, h11.ProtocolError:
+        log(f"Bad CONNECT request, sending 400 to client...\n{indented(format_exc())}")
+        await client_stream.send_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        raise
     log(f"Got CONNECT request for {desthost}:{destport}, connecting...")
-    dest_stream = await trio.open_tcp_stream(desthost, destport)
+    try:
+        dest_stream = await trio.open_tcp_stream(desthost, destport)
+    except OSError:
+        log(
+            f"Could not connect to {desthost}:{destport}, sending 502 to client...\n{indented(format_exc())}"
+        )
+        await client_stream.send_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        raise
     CV_DEST_STREAM.set(dest_stream)
     CV_DESTHOST.set(desthost)
     log(f"Connected to {desthost}, sending 200 to client...")
@@ -82,7 +101,6 @@ async def process_as_connect_request(
     Parse and return the destination host. Validate (lightly) and raise if request invalid.
     See https://tools.ietf.org/html/rfc7231#section-4.3.6 for the CONNECT spec.
     """
-    # TODO: give client 'bad request' errors on assertion failure
     log("Reading...")
     h11_conn = h11.Connection(our_role=h11.SERVER)
     total_bytes_read = 0
