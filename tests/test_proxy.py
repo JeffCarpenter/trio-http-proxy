@@ -325,13 +325,11 @@ class _RaisesOnClose:
 async def test_http_proxy_logs_peer_disconnected_when_dest_close_breaks(
     monkeypatch, capsys
 ):
-    # trio 0.34 wraps EVERY nursery-child exception in an ExceptionGroup,
-    # even a lone one (see test below), so a BrokenResourceError raised by a
-    # pipe() task can never match the bare `except trio.BrokenResourceError,
-    # trio.ClosedResourceError:` in http_proxy(). The only way that branch
-    # is actually reachable is if closing dest_stream itself raises, in
+    # dest_stream.aclose() raises directly from
     # `async with dest_stream, trio.open_nursery() as nursery:`'s __aexit__,
-    # which happens *outside* the nursery and so is not group-wrapped.
+    # outside the nursery, so it's a bare (non-group) exception. except* still
+    # matches a bare exception (treats it as a singleton group) same as the
+    # nursery-wrapped case exercised below.
     proxy_client, test_client = tt.memory_stream_pair()
     dest_proxy_side, _ = tt.memory_stream_pair()
     breaking_dest = _RaisesOnClose(
@@ -358,17 +356,13 @@ async def test_http_proxy_logs_peer_disconnected_when_dest_close_breaks(
 
 
 @tt.trio_test
-async def test_http_proxy_pipe_broken_resource_error_is_never_caught_quietly(
+async def test_http_proxy_logs_peer_disconnected_when_one_pipe_task_breaks(
     monkeypatch, capsys
 ):
-    # BUG: a BrokenResourceError raised *inside* a pipe() task (the common,
-    # realistic case -- e.g. the client resets the connection mid-transfer)
-    # is always delivered via trio's nursery ExceptionGroup, which the bare
-    # `except trio.BrokenResourceError, trio.ClosedResourceError:` in
-    # http_proxy() cannot match (only `except*` would). It falls through to
-    # the catch-all `except Exception` and dumps a full traceback instead of
-    # the intended quiet "Peer disconnected" line. This pins the current
-    # (surprising) behavior rather than the documented intent.
+    # Regression test: a BrokenResourceError raised *inside* a pipe() task
+    # (the common, realistic case -- e.g. the client resets the connection
+    # mid-transfer) is delivered via trio's nursery ExceptionGroup. This
+    # requires `except*` (not a bare `except`) to be caught quietly.
     proxy_client, test_client = tt.memory_stream_pair()
     dest_proxy_side, _ = tt.memory_stream_pair()
 
@@ -387,8 +381,38 @@ async def test_http_proxy_pipe_broken_resource_error_is_never_caught_quietly(
         await test_client.receive_some(4096)
 
     out = capsys.readouterr().out
-    assert "Peer disconnected" not in out
-    assert "ExceptionGroup" in out
+    assert "Peer disconnected" in out
+    assert "ExceptionGroup" not in out
+
+
+@tt.trio_test
+async def test_http_proxy_mixed_exception_group_logs_both_handlers(monkeypatch, capsys):
+    # When the two pipe() tasks fail with different exception types, except*
+    # runs every matching handler against its own subgroup -- so a mixed
+    # group produces BOTH the quiet line and a traceback, not just one.
+    proxy_client, test_client = tt.memory_stream_pair()
+    dest_proxy_side, _ = tt.memory_stream_pair()
+
+    async def fake_open_tcp_stream(_host, _port):
+        return dest_proxy_side
+
+    async def mixed_failure(from_stream, to_stream):
+        if from_stream is proxy_client:
+            raise trio.BrokenResourceError("peer went away")
+        raise RuntimeError("boom, unrelated bug")
+
+    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
+    monkeypatch.setattr(proxy, "pipe", mixed_failure)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(proxy.http_proxy, proxy_client)
+        await test_client.send_all(connect_request(target=b"example.com:443"))
+        await test_client.receive_some(4096)
+
+    out = capsys.readouterr().out
+    assert "Peer disconnected" in out
+    assert "RuntimeError" in out
+    assert "boom, unrelated bug" in out
 
 
 @tt.trio_test

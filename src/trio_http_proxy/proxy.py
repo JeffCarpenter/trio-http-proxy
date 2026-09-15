@@ -51,9 +51,9 @@ async def http_proxy(client_stream, _nextid=_conn_ids.__next__):
             async with dest_stream, trio.open_nursery() as nursery:
                 nursery.start_soon(pipe, client_stream, dest_stream)
                 nursery.start_soon(pipe, dest_stream, client_stream)
-        except trio.BrokenResourceError, trio.ClosedResourceError:
+        except* trio.BrokenResourceError, trio.ClosedResourceError:
             log("Peer disconnected")
-        except Exception:  # noqa: BLE001 -- unexpected bug; isolate so trio.serve_tcp keeps serving other connections
+        except* Exception:  # noqa: BLE001 -- unexpected bug; isolate so trio.serve_tcp keeps serving other connections
             log(f"\n{indented(format_exc())}")
 
 
