@@ -49,6 +49,14 @@ PIPE_IDLE_TIMEOUT = _float_env("PIPE_IDLE_TIMEOUT", DEFAULT_PIPE_IDLE_TIMEOUT)
 DEFAULT_PIPE_SEND_TIMEOUT = 30.0
 PIPE_SEND_TIMEOUT = _float_env("PIPE_SEND_TIMEOUT", DEFAULT_PIPE_SEND_TIMEOUT)
 
+# Connection cap: bounds how many tunnels run concurrently, so an unbounded
+# flood of clients can't exhaust file descriptors / memory (see
+# .planning/known-shortcomings/findings.md). A connection over the cap just
+# waits for a slot to free up rather than being rejected outright.
+DEFAULT_MAXCONNS = 1000
+MAXCONNS = _int_env("MAXCONNS", DEFAULT_MAXCONNS)
+CONN_LIMITER = trio.CapacityLimiter(MAXCONNS)
+
 prn = partial(print, end="")
 indented = partial(indent, prefix="  ")
 
@@ -73,10 +81,11 @@ async def http_proxy(
     _connect=trio.open_tcp_stream,
     idle_timeout=PIPE_IDLE_TIMEOUT,
     send_timeout=PIPE_SEND_TIMEOUT,
+    limiter=CONN_LIMITER,
 ):
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
-    async with client_stream:
+    async with client_stream, limiter:
         try:
             dest_stream = await tunnel(client_stream, _connect=_connect)
         except (

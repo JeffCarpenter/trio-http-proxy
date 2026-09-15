@@ -685,6 +685,104 @@ async def test_http_proxy_swallows_unexpected_exception_and_logs_traceback(capsy
 
 
 @tt.trio_test
+async def test_http_proxy_second_connection_waits_when_limiter_full():
+    limiter = trio.CapacityLimiter(1)
+    proxy_client1, test_client1 = tt.memory_stream_pair()
+    proxy_client2, test_client2 = tt.memory_stream_pair()
+
+    async def hang_connect(_host, _port):
+        await trio.sleep_forever()
+
+    connect2_started = False
+
+    async def fake_connect_2(_host, _port):
+        nonlocal connect2_started
+        connect2_started = True
+        await trio.sleep_forever()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(
+            partial(
+                proxy.http_proxy,
+                proxy_client1,
+                _connect=hang_connect,
+                limiter=limiter,
+            )
+        )
+        await test_client1.send_all(connect_request())
+        # conn1 is now blocked inside tunnel()'s _connect call, holding the
+        # single limiter slot.
+        await tt.wait_all_tasks_blocked()
+
+        nursery.start_soon(
+            partial(
+                proxy.http_proxy,
+                proxy_client2,
+                _connect=fake_connect_2,
+                limiter=limiter,
+            )
+        )
+        await test_client2.send_all(connect_request())
+        await tt.wait_all_tasks_blocked()
+
+        # conn2 never even reaches _connect -- it's parked waiting for the
+        # limiter, proving the cap provides backpressure rather than just
+        # rejecting outright.
+        assert connect2_started is False
+        assert limiter.statistics().borrowed_tokens == 1
+        assert limiter.statistics().tasks_waiting == 1
+
+        nursery.cancel_scope.cancel()
+
+
+@tt.trio_test
+async def test_http_proxy_releases_limiter_slot_when_connection_completes():
+    limiter = trio.CapacityLimiter(1)
+    proxy_client1, test_client1 = tt.memory_stream_pair()
+    proxy_client2, test_client2 = tt.memory_stream_pair()
+
+    async def fake_connect_1(_host, _port):
+        raise OSError("no route to host")
+
+    connect2_started = False
+
+    async def fake_connect_2(_host, _port):
+        nonlocal connect2_started
+        connect2_started = True
+        raise OSError("no route to host")
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(
+            partial(
+                proxy.http_proxy,
+                proxy_client1,
+                _connect=fake_connect_1,
+                limiter=limiter,
+            )
+        )
+        nursery.start_soon(
+            partial(
+                proxy.http_proxy,
+                proxy_client2,
+                _connect=fake_connect_2,
+                limiter=limiter,
+            )
+        )
+
+        await test_client1.send_all(connect_request())
+        reply1 = await test_client1.receive_some(4096)
+        assert reply1 == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+
+        # conn1 released the limiter on its way out, so conn2 -- which was
+        # parked waiting for a slot -- can now proceed.
+        await test_client2.send_all(connect_request())
+        reply2 = await test_client2.receive_some(4096)
+        assert reply2 == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+
+    assert connect2_started is True
+
+
+@tt.trio_test
 async def test_http_proxy_assigns_sequential_connection_ids(capsys):
     counter = iter(range(100, 103))
 
@@ -854,6 +952,20 @@ def test_int_env_uses_default_when_var_unset():
 
 def test_int_env_reads_value_from_env():
     assert proxy._int_env("X", 42, _getenv=lambda _name, _default: "4096") == 4096
+
+
+# ---------------------------------------------------------------------------
+# MAXCONNS / connection cap
+# ---------------------------------------------------------------------------
+
+
+def test_maxconns_defaults_to_1000_when_env_unset():
+    assert (
+        proxy._int_env(
+            "MAXCONNS", proxy.DEFAULT_MAXCONNS, _getenv=lambda _name, default: default
+        )
+        == 1000
+    )
 
 
 # ---------------------------------------------------------------------------
