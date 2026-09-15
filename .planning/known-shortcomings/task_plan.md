@@ -32,7 +32,19 @@
 6. Target allowlist/denylist (SSRF risk) — only matters if deployment isn't fully trusted-localhost; ask before investing here — depends on threat model.
 
 # Tier 3 — test coverage gaps, moderate effort
-7. Concurrent-connections test — verifies _conn_ids/task isolation, meaningful, straightforward with memory streams.
+7. Concurrent-connections test — verifies _conn_ids/task isolation, meaningful, straightforward with memory streams. [x]
+   - test_http_proxy_handles_concurrent_connections_without_cross_talk: 3
+     http_proxy() tasks run truly concurrently in one nursery (not
+     one-at-a-time), each sent a distinct payload in-flight simultaneously;
+     asserts each payload lands only at its own dest stream, proving
+     ContextVar/task isolation holds under real concurrency
+   - Found + fixed a real race in the earlier limiter-release test
+     (test_http_proxy_releases_limiter_slot_when_connection_completes):
+     it fed CONNECT bytes to only one client before the other's task could
+     win the CapacityLimiter race, so if scheduling order flipped, the
+     "loser" task could sit in process_as_connect_request() waiting on its
+     *real* (non-mock-clock) 10s CONNECT_READ_TIMEOUT. Fixed by sending
+     both CONNECT requests before awaiting either reply.
 8. Large-payload/multi-chunk-boundary test — cheap to add, catches chunking bugs.
 9. Oversized-header overflow test (not just target-length) — more realistic attack surface than current test.
 

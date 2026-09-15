@@ -769,13 +769,18 @@ async def test_http_proxy_releases_limiter_slot_when_connection_completes():
             )
         )
 
+        # Feed both CONNECT requests up front: whichever task wins the
+        # limiter race, its bytes are already waiting, so nothing blocks on
+        # process_as_connect_request()'s real (non-mock-clock) read timeout
+        # while the *other* connection's request is still in flight.
         await test_client1.send_all(connect_request())
+        await test_client2.send_all(connect_request())
+
         reply1 = await test_client1.receive_some(4096)
         assert reply1 == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
 
         # conn1 released the limiter on its way out, so conn2 -- which was
         # parked waiting for a slot -- can now proceed.
-        await test_client2.send_all(connect_request())
         reply2 = await test_client2.receive_some(4096)
         assert reply2 == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
 
@@ -800,6 +805,57 @@ async def test_http_proxy_assigns_sequential_connection_ids(capsys):
     assert "[conn100]" in out
     assert "[conn101]" in out
     assert "[conn102]" in out
+
+
+@tt.trio_test
+async def test_http_proxy_handles_concurrent_connections_without_cross_talk():
+    # Runs 3 http_proxy() tasks truly concurrently (one nursery, all started
+    # before any of them is awaited to completion) rather than one-at-a-time
+    # like test_http_proxy_assigns_sequential_connection_ids. Each
+    # connection's ContextVars (CV_CONN_ID, CV_CLIENT_STREAM, CV_DEST_STREAM,
+    # CV_DESTHOST) are set via trio's per-task context copying; if that
+    # isolation were broken, one connection's state would leak into another's
+    # log lines, or -- worse -- payloads could be forwarded to the wrong
+    # destination.
+    conns = []
+    for i in range(3):
+        proxy_client, test_client = tt.memory_stream_pair()
+        dest_proxy_side, dest_test_side = tt.memory_stream_pair()
+        conns.append((i, proxy_client, test_client, dest_proxy_side, dest_test_side))
+
+    def fake_open_tcp_stream_for(dest_proxy_side):
+        async def _connect(_host, _port):
+            return dest_proxy_side
+
+        return _connect
+
+    async with trio.open_nursery() as nursery:
+        for i, proxy_client, _test_client, dest_proxy_side, _dest_test_side in conns:
+            connect = fake_open_tcp_stream_for(dest_proxy_side)
+            nursery.start_soon(
+                partial(proxy.http_proxy, proxy_client, _connect=connect)
+            )
+
+        for i, _proxy_client, test_client, _dest_proxy_side, _dest_test_side in conns:
+            await test_client.send_all(
+                connect_request(target=f"dest{i}.example.com:443".encode())
+            )
+            reply = await test_client.receive_some(4096)
+            assert reply == b"HTTP/1.1 200 Connection established\r\n\r\n"
+
+        # Send a distinct, identifiable payload down each tunnel, all
+        # in-flight at once, then confirm each arrives only at its own
+        # destination -- never at a sibling connection's.
+        for i, _proxy_client, test_client, _dest_proxy_side, _dest_test_side in conns:
+            await test_client.send_all(f"payload-for-conn-{i}".encode())
+
+        for i, _proxy_client, _test_client, _dest_proxy_side, dest_test_side in conns:
+            received = await dest_test_side.receive_some(4096)
+            assert received == f"payload-for-conn-{i}".encode()
+
+        for _i, _proxy_client, test_client, _dest_proxy_side, dest_test_side in conns:
+            await test_client.aclose()
+            await dest_test_side.aclose()
 
 
 # ---------------------------------------------------------------------------
