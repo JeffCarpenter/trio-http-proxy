@@ -22,7 +22,6 @@ PORT = int(getenv("PORT", DEFAULT_PORT))
 
 prn = partial(print, end="")
 indented = partial(indent, prefix="  ")
-decoded_and_indented = lambda some_bytes: indented(some_bytes.decode())
 
 CV_CLIENT_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
     "client_stream", default=None
