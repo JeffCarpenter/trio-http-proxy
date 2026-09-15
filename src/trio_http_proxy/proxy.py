@@ -39,12 +39,14 @@ CV_CONN_ID: ContextVar[int | None] = ContextVar("conn_id", default=None)
 _conn_ids = count(1)
 
 
-async def http_proxy(client_stream, _nextid=_conn_ids.__next__):
+async def http_proxy(
+    client_stream, _nextid=_conn_ids.__next__, _connect=trio.open_tcp_stream
+):
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
     async with client_stream:
         try:
-            dest_stream = await tunnel(client_stream)
+            dest_stream = await tunnel(client_stream, _connect=_connect)
         except AssertionError, ValueError, h11.ProtocolError, OSError:
             return  # tunnel() already logged and notified the client
         try:
@@ -65,7 +67,7 @@ async def start_server(server=http_proxy, port=PORT):
         print("\nGoodbye for now.")
 
 
-async def tunnel(client_stream):
+async def tunnel(client_stream, _connect=trio.open_tcp_stream):
     """Given a stream from a client containing an HTTP CONNECT request,
     open a connection to the destination server specified in the CONNECT request,
     and notify the client when the end-to-end connection has been established.
@@ -79,7 +81,7 @@ async def tunnel(client_stream):
         raise
     log(f"Got CONNECT request for {desthost}:{destport}, connecting...")
     try:
-        dest_stream = await trio.open_tcp_stream(desthost, destport)
+        dest_stream = await _connect(desthost, destport)
     except OSError:
         log(
             f"Could not connect to {desthost}:{destport}, sending 502 to client...\n{indented(format_exc())}"

@@ -1,5 +1,6 @@
 import contextvars
 import importlib
+from functools import partial
 from typing import cast
 
 import h11
@@ -41,12 +42,33 @@ async def test_process_as_connect_request_success():
 
 @tt.trio_test
 async def test_process_as_connect_request_chunked_across_multiple_reads():
+    # memory_stream_pair() buffers unboundedly, so sending the whole request
+    # before the first read would let one receive_some() slurp it all in one
+    # shot. Trickle it in, yielding between chunks, to force process_as_
+    # connect_request's NEED_DATA loop to actually run more than once.
     server, client = tt.memory_stream_pair()
     req = connect_request()
-    for i in range(0, len(req), 3):
-        await client.send_all(req[i : i + 3])
-    host, port = await proxy.process_as_connect_request(server)
+    read_count = 0
+
+    async def count_reads():
+        nonlocal read_count
+        read_count += 1
+
+    server.receive_stream.receive_some_hook = count_reads
+
+    async def trickle():
+        for i in range(0, len(req), 3):
+            await client.send_all(req[i : i + 3])
+            await tt.wait_all_tasks_blocked()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(trickle)
+        host, port = await proxy.process_as_connect_request(server)
+
     assert (host, port) == ("example.com", 443)
+    # Confirms the trickle actually forced multiple receive_some() calls,
+    # rather than the whole request landing in one buffered read.
+    assert read_count > 1
 
 
 @tt.trio_test
@@ -123,7 +145,7 @@ async def test_process_as_connect_request_ignores_trailing_bytes_after_headers()
 
 
 @tt.trio_test
-async def test_tunnel_success_connects_and_replies_200(monkeypatch):
+async def test_tunnel_success_connects_and_replies_200():
     proxy_client, test_client = tt.memory_stream_pair()
     dest_proxy_side, _ = tt.memory_stream_pair()
     calls = []
@@ -132,10 +154,8 @@ async def test_tunnel_success_connects_and_replies_200(monkeypatch):
         calls.append((host, port))
         return dest_proxy_side
 
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-
     await test_client.send_all(connect_request(target=b"example.com:443"))
-    dest_stream = await proxy.tunnel(proxy_client)
+    dest_stream = await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     assert calls == [("example.com", 443)]
     assert dest_stream is dest_proxy_side
@@ -144,7 +164,7 @@ async def test_tunnel_success_connects_and_replies_200(monkeypatch):
 
 
 @tt.trio_test
-async def test_tunnel_bad_request_sends_400_and_raises_without_connecting(monkeypatch):
+async def test_tunnel_bad_request_sends_400_and_raises_without_connecting():
     proxy_client, test_client = tt.memory_stream_pair()
     called = False
 
@@ -153,11 +173,9 @@ async def test_tunnel_bad_request_sends_400_and_raises_without_connecting(monkey
         called = True
         raise AssertionError("should not be called")
 
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-
     await test_client.send_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
     with pytest.raises(AssertionError):
-        await proxy.tunnel(proxy_client)
+        await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     assert called is False
     reply = await test_client.receive_some(4096)
@@ -165,17 +183,15 @@ async def test_tunnel_bad_request_sends_400_and_raises_without_connecting(monkey
 
 
 @tt.trio_test
-async def test_tunnel_connect_failure_sends_502_and_raises(monkeypatch):
+async def test_tunnel_connect_failure_sends_502_and_raises():
     proxy_client, test_client = tt.memory_stream_pair()
 
     async def fake_open_tcp_stream(_host, _port):
         raise OSError("connection refused")
 
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-
     await test_client.send_all(connect_request(target=b"example.com:443"))
     with pytest.raises(OSError):
-        await proxy.tunnel(proxy_client)
+        await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     reply = await test_client.receive_some(4096)
     assert reply == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
@@ -187,7 +203,7 @@ async def test_tunnel_connect_failure_sends_502_and_raises(monkeypatch):
 
 
 @tt.trio_test
-async def test_pipe_forwards_multiple_chunks_in_order():
+async def test_pipe_forwards_multiple_chunks_in_order(capsys):
     from_proxy, from_test = tt.memory_stream_pair()
     to_proxy, to_test = tt.memory_stream_pair()
 
@@ -210,6 +226,14 @@ async def test_pipe_forwards_multiple_chunks_in_order():
         received += chunk
     assert received == b"firstsecond"
 
+    # The concatenated bytes alone can't tell "first"+"second" apart from a
+    # single coalesced "firstsecond" chunk, so also check pipe()'s per-chunk
+    # log lines to confirm the two sends really were forwarded separately.
+    out = capsys.readouterr().out
+    assert "Forwarded 5 bytes" in out
+    assert "Forwarded 6 bytes" in out
+    assert out.find("Forwarded 5 bytes") < out.find("Forwarded 6 bytes")
+
 
 @tt.trio_test
 async def test_pipe_immediate_eof_forwards_nothing():
@@ -230,17 +254,17 @@ async def test_pipe_immediate_eof_forwards_nothing():
 
 
 @tt.trio_test
-async def test_http_proxy_full_round_trip(monkeypatch):
+async def test_http_proxy_full_round_trip():
     proxy_client, test_client = tt.memory_stream_pair()
     dest_proxy_side, dest_test_side = tt.memory_stream_pair()
 
     async def fake_open_tcp_stream(_host, _port):
         return dest_proxy_side
 
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.http_proxy, proxy_client)
+        nursery.start_soon(
+            partial(proxy.http_proxy, proxy_client, _connect=fake_open_tcp_stream)
+        )
 
         await test_client.send_all(connect_request(target=b"example.com:443"))
         reply = await test_client.receive_some(4096)
@@ -259,7 +283,7 @@ async def test_http_proxy_full_round_trip(monkeypatch):
 
 
 @tt.trio_test
-async def test_http_proxy_bad_request_sends_400_and_closes_quietly(monkeypatch):
+async def test_http_proxy_bad_request_sends_400_and_closes_quietly():
     proxy_client, test_client = tt.memory_stream_pair()
     called = False
 
@@ -267,10 +291,10 @@ async def test_http_proxy_bad_request_sends_400_and_closes_quietly(monkeypatch):
         nonlocal called
         called = True
 
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.http_proxy, proxy_client)
+        nursery.start_soon(
+            partial(proxy.http_proxy, proxy_client, _connect=fake_open_tcp_stream)
+        )
         await test_client.send_all(b"not a valid request\r\n\r\n")
         reply = await test_client.receive_some(4096)
         assert reply == b"HTTP/1.1 400 Bad Request\r\n\r\n"
@@ -281,18 +305,16 @@ async def test_http_proxy_bad_request_sends_400_and_closes_quietly(monkeypatch):
 
 
 @tt.trio_test
-async def test_http_proxy_dest_connect_failure_sends_502_and_closes_quietly(
-    monkeypatch,
-):
+async def test_http_proxy_dest_connect_failure_sends_502_and_closes_quietly():
     proxy_client, test_client = tt.memory_stream_pair()
 
     async def fake_open_tcp_stream(_host, _port):
         raise OSError("no route to host")
 
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.http_proxy, proxy_client)
+        nursery.start_soon(
+            partial(proxy.http_proxy, proxy_client, _connect=fake_open_tcp_stream)
+        )
         await test_client.send_all(connect_request(target=b"example.com:443"))
         reply = await test_client.receive_some(4096)
         assert reply == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
@@ -300,55 +322,37 @@ async def test_http_proxy_dest_connect_failure_sends_502_and_closes_quietly(
         assert remainder == b""
 
 
-class _RaisesOnClose:
-    """Wraps a real stream but makes aclose() raise, to simulate a peer
-    that's already gone by the time we try to tear the tunnel down."""
-
-    def __init__(self, inner, exc):
-        self._inner = inner
-        self._exc = exc
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-    async def aclose(self):
-        raise self._exc
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc_info):
-        await self.aclose()
-
-
 @tt.trio_test
-async def test_http_proxy_logs_peer_disconnected_when_dest_close_breaks(
-    monkeypatch, capsys
-):
+async def test_http_proxy_logs_peer_disconnected_when_dest_close_breaks(capsys):
     # dest_stream.aclose() raises directly from
     # `async with dest_stream, trio.open_nursery() as nursery:`'s __aexit__,
     # outside the nursery, so it's a bare (non-group) exception. except* still
     # matches a bare exception (treats it as a singleton group) same as the
-    # nursery-wrapped case exercised below.
+    # nursery-wrapped case exercised below. We drive this with a real
+    # MemorySendStream close_hook rather than wrapping the stream, so both
+    # real pipe() tasks run and reach a normal EOF before the close breaks.
     proxy_client, test_client = tt.memory_stream_pair()
-    dest_proxy_side, _ = tt.memory_stream_pair()
-    breaking_dest = _RaisesOnClose(
-        dest_proxy_side, trio.BrokenResourceError("peer went away")
-    )
+    dest_proxy_side, dest_test_side = tt.memory_stream_pair()
+
+    def raise_on_close():
+        raise trio.BrokenResourceError("peer went away")
+
+    dest_proxy_side.send_stream.close_hook = raise_on_close
 
     async def fake_open_tcp_stream(_host, _port):
-        return breaking_dest
-
-    async def noop_pipe(from_stream, to_stream):
-        return
-
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-    monkeypatch.setattr(proxy, "pipe", noop_pipe)
+        return dest_proxy_side
 
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.http_proxy, proxy_client)
+        nursery.start_soon(
+            partial(proxy.http_proxy, proxy_client, _connect=fake_open_tcp_stream)
+        )
         await test_client.send_all(connect_request(target=b"example.com:443"))
         await test_client.receive_some(4096)
+        # Let both real pipe() tasks hit EOF and return normally, so the
+        # nursery inside http_proxy finishes and control reaches dest_stream's
+        # __aexit__ -- which is where close_hook raises.
+        await test_client.aclose()
+        await dest_test_side.aclose()
 
     out = capsys.readouterr().out
     assert "Peer disconnected" in out
@@ -356,27 +360,32 @@ async def test_http_proxy_logs_peer_disconnected_when_dest_close_breaks(
 
 
 @tt.trio_test
-async def test_http_proxy_logs_peer_disconnected_when_one_pipe_task_breaks(
-    monkeypatch, capsys
-):
+async def test_http_proxy_logs_peer_disconnected_when_one_pipe_task_breaks(capsys):
     # Regression test: a BrokenResourceError raised *inside* a pipe() task
     # (the common, realistic case -- e.g. the client resets the connection
     # mid-transfer) is delivered via trio's nursery ExceptionGroup. This
-    # requires `except*` (not a bare `except`) to be caught quietly.
+    # requires `except*` (not a bare `except`) to be caught quietly. Driven
+    # here by a real pipe() task hitting a receive_some_hook that raises,
+    # rather than monkeypatching pipe() itself out of the picture.
     proxy_client, test_client = tt.memory_stream_pair()
     dest_proxy_side, _ = tt.memory_stream_pair()
+
+    async def raise_broken():
+        raise trio.BrokenResourceError("peer went away")
+
+    # Set before the pipe task ever calls receive_some(): the hook only
+    # fires on the *next* call, so it must be in place before that task's
+    # first (blocking) receive_some() is already in flight. dest_proxy_side
+    # is never touched during the CONNECT handshake, so this is race-free.
+    dest_proxy_side.receive_stream.receive_some_hook = raise_broken
 
     async def fake_open_tcp_stream(_host, _port):
         return dest_proxy_side
 
-    async def broken_pipe(from_stream, to_stream):
-        raise trio.BrokenResourceError("peer went away")
-
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-    monkeypatch.setattr(proxy, "pipe", broken_pipe)
-
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.http_proxy, proxy_client)
+        nursery.start_soon(
+            partial(proxy.http_proxy, proxy_client, _connect=fake_open_tcp_stream)
+        )
         await test_client.send_all(connect_request(target=b"example.com:443"))
         await test_client.receive_some(4096)
 
@@ -386,28 +395,49 @@ async def test_http_proxy_logs_peer_disconnected_when_one_pipe_task_breaks(
 
 
 @tt.trio_test
-async def test_http_proxy_mixed_exception_group_logs_both_handlers(monkeypatch, capsys):
+async def test_http_proxy_mixed_exception_group_logs_both_handlers(capsys):
     # When the two pipe() tasks fail with different exception types, except*
     # runs every matching handler against its own subgroup -- so a mixed
     # group produces BOTH the quiet line and a traceback, not just one.
+    # Both real pipe() tasks run; each direction's stream is hooked to fail
+    # with a different exception. receive_some() checkpoints twice before
+    # calling the hook, so without synchronization the first task to raise
+    # can get its sibling cancelled before that one ever reaches its own
+    # hook. Gate both hooks on an Event and release it only once both pipe
+    # tasks are confirmed blocked there, so they raise together.
     proxy_client, test_client = tt.memory_stream_pair()
     dest_proxy_side, _ = tt.memory_stream_pair()
+    client_handshake_done = False
+    release = trio.Event()
 
     async def fake_open_tcp_stream(_host, _port):
         return dest_proxy_side
 
-    async def mixed_failure(from_stream, to_stream):
-        if from_stream is proxy_client:
-            raise trio.BrokenResourceError("peer went away")
+    async def client_receive_hook():
+        # The first call is the CONNECT handshake read; only calls after
+        # that belong to the client->dest pipe stage.
+        nonlocal client_handshake_done
+        if not client_handshake_done:
+            client_handshake_done = True
+            return
+        await release.wait()
+        raise trio.BrokenResourceError("peer went away")
+
+    async def dest_receive_hook():
+        await release.wait()
         raise RuntimeError("boom, unrelated bug")
 
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-    monkeypatch.setattr(proxy, "pipe", mixed_failure)
+    proxy_client.receive_stream.receive_some_hook = client_receive_hook
+    dest_proxy_side.receive_stream.receive_some_hook = dest_receive_hook
 
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.http_proxy, proxy_client)
+        nursery.start_soon(
+            partial(proxy.http_proxy, proxy_client, _connect=fake_open_tcp_stream)
+        )
         await test_client.send_all(connect_request(target=b"example.com:443"))
         await test_client.receive_some(4096)
+        await tt.wait_all_tasks_blocked()
+        release.set()
 
     out = capsys.readouterr().out
     assert "Peer disconnected" in out
@@ -416,23 +446,24 @@ async def test_http_proxy_mixed_exception_group_logs_both_handlers(monkeypatch, 
 
 
 @tt.trio_test
-async def test_http_proxy_swallows_unexpected_exception_and_logs_traceback(
-    monkeypatch, capsys
-):
+async def test_http_proxy_swallows_unexpected_exception_and_logs_traceback(capsys):
     proxy_client, test_client = tt.memory_stream_pair()
     dest_proxy_side, _ = tt.memory_stream_pair()
+
+    async def raise_bug():
+        raise RuntimeError("boom, unrelated bug")
+
+    # Set before the nursery starts, same race-avoidance reasoning as
+    # test_http_proxy_logs_peer_disconnected_when_one_pipe_task_breaks.
+    dest_proxy_side.receive_stream.receive_some_hook = raise_bug
 
     async def fake_open_tcp_stream(_host, _port):
         return dest_proxy_side
 
-    async def buggy_pipe(from_stream, to_stream):
-        raise RuntimeError("boom, unrelated bug")
-
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-    monkeypatch.setattr(proxy, "pipe", buggy_pipe)
-
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.http_proxy, proxy_client)
+        nursery.start_soon(
+            partial(proxy.http_proxy, proxy_client, _connect=fake_open_tcp_stream)
+        )
         await test_client.send_all(connect_request(target=b"example.com:443"))
         await test_client.receive_some(4096)
 
@@ -442,22 +473,23 @@ async def test_http_proxy_swallows_unexpected_exception_and_logs_traceback(
 
 
 @tt.trio_test
-async def test_http_proxy_assigns_sequential_connection_ids(monkeypatch):
-    seen_ids = []
+async def test_http_proxy_assigns_sequential_connection_ids(capsys):
     counter = iter(range(100, 103))
 
     async def fake_open_tcp_stream(_host, _port):
         raise OSError("irrelevant, just need tunnel() to short-circuit")
 
-    monkeypatch.setattr(trio, "open_tcp_stream", fake_open_tcp_stream)
-
     for _ in range(3):
         proxy_client, test_client = tt.memory_stream_pair()
         await test_client.send_all(connect_request(target=b"example.com:443"))
-        await proxy.http_proxy(proxy_client, _nextid=counter.__next__)
-        seen_ids.append(None)  # http_proxy ran to completion without raising
+        await proxy.http_proxy(
+            proxy_client, _nextid=counter.__next__, _connect=fake_open_tcp_stream
+        )
 
-    assert len(seen_ids) == 3
+    out = capsys.readouterr().out
+    assert "[conn100]" in out
+    assert "[conn101]" in out
+    assert "[conn102]" in out
 
 
 # ---------------------------------------------------------------------------
