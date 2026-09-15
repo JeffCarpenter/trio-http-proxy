@@ -1,4 +1,5 @@
 import contextvars
+import random
 from functools import partial
 from typing import cast
 
@@ -377,6 +378,77 @@ async def test_pipe_returns_after_send_timeout_when_dest_stalls(mock_clock):
     assert not watchdog.cancelled_caught, (
         "pipe() never gave up on the stalled destination"
     )
+
+
+@tt.trio_test
+async def test_http_proxy_forwards_large_payload_across_chunk_boundaries():
+    # Known coverage gap (.planning/known-shortcomings/findings.md):
+    # test_http_proxy_full_round_trip only sends small, single-shot payloads,
+    # so pipe()'s `while True: receive_some(bufmaxsz)` loop never actually
+    # iterates more than once. Send a payload several times BUFMAXSZ, with a
+    # non-boundary-aligned remainder, through both directions of a real
+    # tunnel, and confirm both byte-for-byte integrity across chunk
+    # boundaries and that pipe() really looped -- rather than one call
+    # slurping the whole (unboundedly buffered) memory stream at once.
+    proxy_client, test_client = tt.memory_stream_pair()
+    dest_proxy_side, dest_test_side = tt.memory_stream_pair()
+
+    async def fake_open_tcp_stream(_host, _port):
+        return dest_proxy_side
+
+    client_to_dest_reads = 0
+    dest_to_client_reads = 0
+
+    async def count_client_to_dest_reads():
+        nonlocal client_to_dest_reads
+        client_to_dest_reads += 1
+
+    async def count_dest_to_client_reads():
+        nonlocal dest_to_client_reads
+        dest_to_client_reads += 1
+
+    proxy_client.receive_stream.receive_some_hook = count_client_to_dest_reads
+    dest_proxy_side.receive_stream.receive_some_hook = count_dest_to_client_reads
+
+    payload_size = proxy.BUFMAXSZ * 3 + 777
+    client_payload = random.Random(1).randbytes(payload_size)
+    dest_payload = random.Random(2).randbytes(payload_size)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(
+            partial(proxy.http_proxy, proxy_client, _connect=fake_open_tcp_stream)
+        )
+
+        await test_client.send_all(connect_request(target=b"example.com:443"))
+        reply = await test_client.receive_some(4096)
+        assert reply == b"HTTP/1.1 200 Connection established\r\n\r\n"
+
+        # The CONNECT handshake read above already consumed one hook call on
+        # proxy_client; reset so the counter only reflects pipe()'s reads.
+        client_to_dest_reads = 0
+
+        await test_client.send_all(client_payload)
+        await dest_test_side.send_all(dest_payload)
+
+        received_by_dest = b""
+        while len(received_by_dest) < payload_size:
+            received_by_dest += await dest_test_side.receive_some(65536)
+
+        received_by_client = b""
+        while len(received_by_client) < payload_size:
+            received_by_client += await test_client.receive_some(65536)
+
+        assert received_by_dest == client_payload
+        assert received_by_client == dest_payload
+
+        # payload_size spans 4 bufmaxsz-sized reads (3 full + 1 partial
+        # remainder); >=4 proves pipe() actually looped rather than one
+        # buffered receive_some() returning everything in a single call.
+        assert client_to_dest_reads >= 4
+        assert dest_to_client_reads >= 4
+
+        await test_client.aclose()
+        await dest_test_side.aclose()
 
 
 # ---------------------------------------------------------------------------

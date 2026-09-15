@@ -59,9 +59,12 @@ tracked rather than silently assumed away.
 - **No concurrent-connections test.** Every `http_proxy`/`tunnel` test drives exactly
   one connection at a time. `_conn_ids` behavior and task isolation under several
   simultaneous tunnels is unverified.
-- **No large-payload / multi-chunk-boundary test through the full tunnel.**
-  `test_http_proxy_full_round_trip` only sends small, single-shot payloads in each
-  direction.
+- ~~**No large-payload / multi-chunk-boundary test through the full tunnel.**~~
+  **Fixed.** `test_http_proxy_forwards_large_payload_across_chunk_boundaries` sends a
+  `BUFMAXSZ * 3 + 777`-byte payload (non-boundary-aligned remainder) through both
+  tunnel directions, asserts byte-for-byte integrity, and uses `receive_some_hook`
+  counters to prove `pipe()`'s read loop actually iterated ≥4 times per direction
+  rather than one buffered `receive_some()` call returning everything at once.
 - **`start_server` tests still monkeypatch the global `trio.serve_tcp`** — the one
   place in the suite still coupled to a real trio API via `monkeypatch`, inconsistent
   with the `_connect`/`_nextid`-style dependency injection used everywhere else after
