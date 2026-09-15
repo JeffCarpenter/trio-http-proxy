@@ -13,12 +13,22 @@ from itertools import count
 from os import getenv
 from textwrap import indent
 from traceback import format_exc
+from urllib.parse import urlsplit
 
 import h11
 import trio
 
+
+def _int_env(name, default, _getenv=getenv):
+    return int(_getenv(name, default))
+
+
 DEFAULT_PORT = 8080
-PORT = int(getenv("PORT", DEFAULT_PORT))
+PORT = _int_env("PORT", DEFAULT_PORT)
+
+BUFMAXSZ = _int_env("BUFMAXSZ", DEFAULT_BUFFER_SIZE)
+DEFAULT_MAXREQSZ = 16384
+MAXREQSZ = _int_env("MAXREQSZ", DEFAULT_MAXREQSZ)
 
 prn = partial(print, end="")
 indented = partial(indent, prefix="  ")
@@ -58,10 +68,10 @@ async def http_proxy(
             log(f"\n{indented(format_exc())}")
 
 
-async def start_server(server=http_proxy, port=PORT):
+async def start_server(server=http_proxy, port=PORT, _serve=trio.serve_tcp):
     print(f"* Starting {server.__name__} on port {port or '(OS-selected port)'}...")
     try:
-        await trio.serve_tcp(server, port)
+        await _serve(server, port)
     except KeyboardInterrupt:
         print("\nGoodbye for now.")
 
@@ -95,9 +105,7 @@ async def tunnel(client_stream, _connect=trio.open_tcp_stream):
     return dest_stream
 
 
-async def process_as_connect_request(
-    stream, bufmaxsz=DEFAULT_BUFFER_SIZE, maxreqsz=16384
-):
+async def process_as_connect_request(stream, bufmaxsz=BUFMAXSZ, maxreqsz=MAXREQSZ):
     """Read a stream expected to contain a valid HTTP CONNECT request to desthost:destport.
     Parse and return the destination host. Validate (lightly) and raise if request invalid.
     See https://tools.ietf.org/html/rfc7231#section-4.3.6 for the CONNECT spec.
@@ -112,12 +120,17 @@ async def process_as_connect_request(
         h11_conn.receive_data(bytes_read)
     assert isinstance(h11_nextevt, h11.Request), f"{h11_nextevt=} is not a h11.Request"
     assert h11_nextevt.method == b"CONNECT", f"{h11_nextevt.method=} != CONNECT"
-    desthost, _, destport = h11_nextevt.target.partition(b":")
-    destport = int(destport.decode())
-    return desthost.decode(), destport
+    # urlsplit handles bracketed IPv6 authorities (e.g. "[::1]:443") correctly;
+    # a naive split on the first ":" tears such addresses apart.
+    parsed = urlsplit(f"//{h11_nextevt.target.decode()}")
+    desthost, destport = parsed.hostname, parsed.port
+    if destport is None:
+        raise ValueError(f"{h11_nextevt.target=} missing port")
+    assert desthost is not None, f"{h11_nextevt.target=} missing host"
+    return desthost, destport
 
 
-async def pipe(from_stream, to_stream, bufmaxsz=DEFAULT_BUFFER_SIZE):
+async def pipe(from_stream, to_stream, bufmaxsz=BUFMAXSZ):
     CV_PIPE_FROM.set(from_stream)
     while chunk := await from_stream.receive_some(bufmaxsz):
         await to_stream.send_all(chunk)

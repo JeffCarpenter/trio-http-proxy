@@ -1,5 +1,4 @@
 import contextvars
-import importlib
 from functools import partial
 from typing import cast
 
@@ -137,6 +136,25 @@ async def test_process_as_connect_request_ignores_trailing_bytes_after_headers()
     await client.send_all(connect_request(extra=b"leftover garbage"))
     host, port = await proxy.process_as_connect_request(server)
     assert (host, port) == ("example.com", 443)
+
+
+@tt.trio_test
+async def test_process_as_connect_request_supports_bracketed_ipv6_target():
+    # Regression test for the naive `target.partition(b":")` parse: a
+    # bracketed IPv6 authority like "[::1]:443" has colons *inside* the host
+    # itself, so splitting on the first colon tears the address apart.
+    server, client = tt.memory_stream_pair()
+    await client.send_all(connect_request(target=b"[::1]:443"))
+    host, port = await proxy.process_as_connect_request(server)
+    assert (host, port) == ("::1", 443)
+
+
+@tt.trio_test
+async def test_process_as_connect_request_supports_full_ipv6_target():
+    server, client = tt.memory_stream_pair()
+    await client.send_all(connect_request(target=b"[2001:db8::1]:8443"))
+    host, port = await proxy.process_as_connect_request(server)
+    assert (host, port) == ("2001:db8::1", 8443)
 
 
 # ---------------------------------------------------------------------------
@@ -570,48 +588,40 @@ def test_log_forwards_extra_kwargs_to_print(capsys):
 
 
 @tt.trio_test
-async def test_start_server_calls_serve_tcp_with_server_and_port(monkeypatch, capsys):
+async def test_start_server_calls_serve_tcp_with_server_and_port(capsys):
     calls = []
 
     async def fake_serve_tcp(server, port):
         calls.append((server, port))
 
-    monkeypatch.setattr(trio, "serve_tcp", fake_serve_tcp)
-
     async def marker():
         pass
 
-    await proxy.start_server(server=marker, port=9999)
+    await proxy.start_server(server=marker, port=9999, _serve=fake_serve_tcp)
 
     assert calls == [(marker, 9999)]
     assert "Starting marker on port 9999" in capsys.readouterr().out
 
 
 @tt.trio_test
-async def test_start_server_reports_unspecified_port_as_os_selected(
-    monkeypatch, capsys
-):
+async def test_start_server_reports_unspecified_port_as_os_selected(capsys):
     async def fake_serve_tcp(server, port):
         pass
-
-    monkeypatch.setattr(trio, "serve_tcp", fake_serve_tcp)
 
     async def marker():
         pass
 
-    await proxy.start_server(server=marker, port=0)
+    await proxy.start_server(server=marker, port=0, _serve=fake_serve_tcp)
 
     assert "(OS-selected port)" in capsys.readouterr().out
 
 
 @tt.trio_test
-async def test_start_server_swallows_keyboard_interrupt(monkeypatch, capsys):
+async def test_start_server_swallows_keyboard_interrupt(capsys):
     async def fake_serve_tcp(server, port):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(trio, "serve_tcp", fake_serve_tcp)
-
-    await proxy.start_server(server=proxy.http_proxy, port=1234)
+    await proxy.start_server(server=proxy.http_proxy, port=1234, _serve=fake_serve_tcp)
 
     assert "Goodbye for now." in capsys.readouterr().out
 
@@ -621,21 +631,32 @@ async def test_start_server_swallows_keyboard_interrupt(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_port_defaults_to_8080_when_env_unset(monkeypatch):
-    monkeypatch.delenv("PORT", raising=False)
-    reloaded = importlib.reload(proxy)
-    try:
-        assert reloaded.PORT == 8080
-    finally:
-        monkeypatch.delenv("PORT", raising=False)
-        importlib.reload(proxy)
+def test_port_defaults_to_8080_when_env_unset():
+    assert (
+        proxy._int_env(
+            "PORT", proxy.DEFAULT_PORT, _getenv=lambda _name, default: default
+        )
+        == 8080
+    )
 
 
-def test_port_reads_from_env_var(monkeypatch):
-    monkeypatch.setenv("PORT", "9191")
-    reloaded = importlib.reload(proxy)
-    try:
-        assert reloaded.PORT == 9191
-    finally:
-        monkeypatch.delenv("PORT", raising=False)
-        importlib.reload(proxy)
+def test_port_reads_from_env_var():
+    assert (
+        proxy._int_env(
+            "PORT", proxy.DEFAULT_PORT, _getenv=lambda _name, _default: "9191"
+        )
+        == 9191
+    )
+
+
+# ---------------------------------------------------------------------------
+# _int_env (backs BUFMAXSZ / MAXREQSZ)
+# ---------------------------------------------------------------------------
+
+
+def test_int_env_uses_default_when_var_unset():
+    assert proxy._int_env("X", 42, _getenv=lambda _name, default: default) == 42
+
+
+def test_int_env_reads_value_from_env():
+    assert proxy._int_env("X", 42, _getenv=lambda _name, _default: "4096") == 4096
