@@ -24,7 +24,7 @@ def connect_request(target=b"example.com:443", extra=b""):
 
 def fake_stream():
     """A sentinel that satisfies the CV_*_STREAM ContextVar's SocketStream
-    type for log() tests, which only compare stream identity."""
+    type for logger tests, which only compare stream identity."""
     return cast(trio.SocketStream, object())
 
 
@@ -1152,18 +1152,6 @@ def test_log_injects_structured_context_into_record_extra(caplog):
     assert record.conn_prefix == "[conn42 -> structured.example.com]"
 
 
-def test_log_backwards_compatible_helper(caplog):
-    def body():
-        proxy.CV_CONN_ID.set(99)
-        proxy.CV_CLIENT_STREAM.set(fake_stream())
-        proxy.log("compat", "message", level=logging.WARNING, end="")
-
-    run_isolated(body)
-    assert "[conn99] compat message" in caplog.text
-    record = next(r for r in caplog.records if "compat message" in r.message)
-    assert record.levelno == logging.WARNING
-
-
 def test_format_conn_prefix_helper():
     def body():
         assert proxy.format_conn_prefix() == ""
@@ -1383,11 +1371,6 @@ def test_logger_adapter_delegates_handlers_and_filters():
 def test_log_level_defaults_and_env():
     assert proxy.DEFAULT_LOG_LEVEL == "INFO"
     assert proxy.LOG_LEVEL in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-
-
-def test_log_with_no_args_is_noop(caplog):
-    proxy.log()
-    assert len(caplog.records) == 0
 
 
 def test_raw_logger_filter_populates_attributes(caplog):

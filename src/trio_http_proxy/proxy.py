@@ -179,15 +179,6 @@ _raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
 
-def log(*args: Any, level: int = logging.INFO, **kw: Any) -> None:
-    """Log a message using the module logger. Maintained for compatibility."""
-    if not args:
-        return
-    msg = " ".join(str(a) for a in args)
-    kw.pop("end", None)
-    logger.log(level, msg, **kw)
-
-
 async def http_proxy(
     client_stream,
     _nextid=_conn_ids.__next__,
