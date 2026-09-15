@@ -37,11 +37,9 @@ tracked rather than silently assumed away.
 
   For a target like `[::1]:443`, this splits on the *first* colon inside the address
   itself, not the host:port separator, producing garbage instead of a real host/port.
-  There is no test that would catch this (see below).
 - **No graceful shutdown.** `start_server` only catches `KeyboardInterrupt`; there's no
   SIGTERM handling to drain in-flight tunnels before exit.
-- **Logging is bare `print()`.** No levels, no timestamps, no way to redirect or
-  silence independently of stdout.
+- ~~**Logging is bare `print()`.**~~ **Fixed.** Replaced bare `print()` with standard library `logging` (`logger` / `log()`), structured contextual logging (`ConnectionLoggerAdapter` / `ConnectionFilter`) tracking `conn_id`, `desthost`, `direction`, `conn_prefix`, standard log levels (`DEBUG`, `INFO`, `WARNING`, `ERROR`), proper exception formatting via `logger.exception` / `exc_info=True`, `LOG_LEVEL` env override, and non-intrusive `NullHandler` by default.
 - **Dead code:** `decoded_and_indented` (line 25) is defined but never referenced
   anywhere in the module.
 - **`maxreqsz`/`bufmaxsz` are hardcoded** function-default constants with no env-var

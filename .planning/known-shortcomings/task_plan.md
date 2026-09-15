@@ -51,6 +51,6 @@
 # Tier 4 — lower ROI
 10. Real-socket integration test — valuable but flaky/slow, only 1 code path (serve_tcp+SocketStream) uncovered.
 11. Graceful shutdown (SIGTERM drain) — real gap bufor a CLI tool.
-12. Structured logging (replace print) — cosmetic, no bug risk.
+12. Structured logging (replace print) — cosmetic, no bug risk. [x]
 13. Fuzz/property testing on process_as_connect_reqain payoff given h11 already does parsing.
 14. memory-stream internals coupling note, __main__ line coverage — doc-only / accept as-is, not worth fixing.
