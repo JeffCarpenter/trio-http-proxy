@@ -1,4 +1,5 @@
 import contextvars
+import logging
 import random
 from functools import partial
 from typing import cast
@@ -36,6 +37,11 @@ def mock_clock():
     slowloris-style test with a multi-second (mock) timeout resolves in
     near-zero real wall-clock time."""
     return tt.MockClock(autojump_threshold=0)
+
+
+@pytest.fixture(autouse=True)
+def _enable_log_capture(caplog):
+    caplog.set_level(logging.DEBUG)
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +395,8 @@ async def test_tunnel_oversized_request_sends_414_not_bare_400():
 
 
 @tt.trio_test
-async def test_pipe_forwards_multiple_chunks_in_order(capsys):
+async def test_pipe_forwards_multiple_chunks_in_order(caplog):
+    caplog.set_level(logging.DEBUG)
     from_proxy, from_test = tt.memory_stream_pair()
     to_proxy, to_test = tt.memory_stream_pair()
 
@@ -415,10 +422,9 @@ async def test_pipe_forwards_multiple_chunks_in_order(capsys):
     # The concatenated bytes alone can't tell "first"+"second" apart from a
     # single coalesced "firstsecond" chunk, so also check pipe()'s per-chunk
     # log lines to confirm the two sends really were forwarded separately.
-    out = capsys.readouterr().out
-    assert "Forwarded 5 bytes" in out
-    assert "Forwarded 6 bytes" in out
-    assert out.find("Forwarded 5 bytes") < out.find("Forwarded 6 bytes")
+    assert "Forwarded 5 bytes" in caplog.text
+    assert "Forwarded 6 bytes" in caplog.text
+    assert caplog.text.find("Forwarded 5 bytes") < caplog.text.find("Forwarded 6 bytes")
 
 
 @tt.trio_test
@@ -744,7 +750,7 @@ async def test_http_proxy_dest_connect_failure_sends_502_and_closes_quietly():
 
 
 @tt.trio_test
-async def test_http_proxy_logs_peer_disconnected_when_dest_close_breaks(capsys):
+async def test_http_proxy_logs_peer_disconnected_when_dest_close_breaks(caplog):
     # dest_stream.aclose() raises directly from
     # `async with dest_stream, trio.open_nursery() as nursery:`'s __aexit__,
     # outside the nursery, so it's a bare (non-group) exception. except* still
@@ -775,13 +781,12 @@ async def test_http_proxy_logs_peer_disconnected_when_dest_close_breaks(capsys):
         await test_client.aclose()
         await dest_test_side.aclose()
 
-    out = capsys.readouterr().out
-    assert "Peer disconnected" in out
-    assert "Traceback" not in out
+    assert "Peer disconnected" in caplog.text
+    assert "Traceback" not in caplog.text
 
 
 @tt.trio_test
-async def test_http_proxy_logs_peer_disconnected_when_one_pipe_task_breaks(capsys):
+async def test_http_proxy_logs_peer_disconnected_when_one_pipe_task_breaks(caplog):
     # Regression test: a BrokenResourceError raised *inside* a pipe() task
     # (the common, realistic case -- e.g. the client resets the connection
     # mid-transfer) is delivered via trio's nursery ExceptionGroup. This
@@ -810,13 +815,12 @@ async def test_http_proxy_logs_peer_disconnected_when_one_pipe_task_breaks(capsy
         await test_client.send_all(connect_request(target=b"example.com:443"))
         await test_client.receive_some(4096)
 
-    out = capsys.readouterr().out
-    assert "Peer disconnected" in out
-    assert "ExceptionGroup" not in out
+    assert "Peer disconnected" in caplog.text
+    assert "ExceptionGroup" not in caplog.text
 
 
 @tt.trio_test
-async def test_http_proxy_mixed_exception_group_logs_both_handlers(capsys):
+async def test_http_proxy_mixed_exception_group_logs_both_handlers(caplog):
     # When the two pipe() tasks fail with different exception types, except*
     # runs every matching handler against its own subgroup -- so a mixed
     # group produces BOTH the quiet line and a traceback, not just one.
@@ -860,14 +864,13 @@ async def test_http_proxy_mixed_exception_group_logs_both_handlers(capsys):
         await tt.wait_all_tasks_blocked()
         release.set()
 
-    out = capsys.readouterr().out
-    assert "Peer disconnected" in out
-    assert "RuntimeError" in out
-    assert "boom, unrelated bug" in out
+    assert "Peer disconnected" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "boom, unrelated bug" in caplog.text
 
 
 @tt.trio_test
-async def test_http_proxy_swallows_unexpected_exception_and_logs_traceback(capsys):
+async def test_http_proxy_swallows_unexpected_exception_and_logs_traceback(caplog):
     proxy_client, test_client = tt.memory_stream_pair()
     dest_proxy_side, _ = tt.memory_stream_pair()
 
@@ -888,9 +891,8 @@ async def test_http_proxy_swallows_unexpected_exception_and_logs_traceback(capsy
         await test_client.send_all(connect_request(target=b"example.com:443"))
         await test_client.receive_some(4096)
 
-    out = capsys.readouterr().out
-    assert "RuntimeError" in out
-    assert "boom, unrelated bug" in out
+    assert "RuntimeError" in caplog.text
+    assert "boom, unrelated bug" in caplog.text
 
 
 @tt.trio_test
@@ -997,7 +999,7 @@ async def test_http_proxy_releases_limiter_slot_when_connection_completes():
 
 
 @tt.trio_test
-async def test_http_proxy_assigns_sequential_connection_ids(capsys):
+async def test_http_proxy_assigns_sequential_connection_ids(caplog):
     counter = iter(range(100, 103))
 
     async def fake_open_tcp_stream(_host, _port):
@@ -1010,10 +1012,9 @@ async def test_http_proxy_assigns_sequential_connection_ids(capsys):
             proxy_client, _nextid=counter.__next__, _connect=fake_open_tcp_stream
         )
 
-    out = capsys.readouterr().out
-    assert "[conn100]" in out
-    assert "[conn101]" in out
-    assert "[conn102]" in out
+    assert "[conn100]" in caplog.text
+    assert "[conn101]" in caplog.text
+    assert "[conn102]" in caplog.text
 
 
 @tt.trio_test
@@ -1068,41 +1069,42 @@ async def test_http_proxy_handles_concurrent_connections_without_cross_talk():
 
 
 # ---------------------------------------------------------------------------
-# log
+# log / logger
 # ---------------------------------------------------------------------------
 
 
-def test_log_with_no_client_stream_prints_bare_message(capsys):
+def test_log_with_no_client_stream_logs_bare_message(caplog):
     def body():
-        proxy.log("hello")
+        proxy.logger.info("hello")
 
     run_isolated(body)
-    assert capsys.readouterr().out == "hello\n"
+    assert "hello" in caplog.text
+    assert "[conn" not in caplog.text
 
 
-def test_log_with_client_stream_only_prints_conn_prefix(capsys):
+def test_log_with_client_stream_only_logs_conn_prefix(caplog):
     def body():
         proxy.CV_CONN_ID.set(7)
         proxy.CV_CLIENT_STREAM.set(fake_stream())
-        proxy.log("hello")
+        proxy.logger.info("hello")
 
     run_isolated(body)
-    assert capsys.readouterr().out == "[conn7] hello\n"
+    assert "[conn7] hello" in caplog.text
 
 
-def test_log_with_dest_but_no_pipe_from_shows_bidirectional_arrow(capsys):
+def test_log_with_dest_but_no_pipe_from_shows_bidirectional_arrow(caplog):
     def body():
         proxy.CV_CONN_ID.set(1)
         proxy.CV_CLIENT_STREAM.set(fake_stream())
         proxy.CV_DEST_STREAM.set(fake_stream())
         proxy.CV_DESTHOST.set("example.com")
-        proxy.log("hello")
+        proxy.logger.info("hello")
 
     run_isolated(body)
-    assert capsys.readouterr().out == "[conn1 <> example.com] hello\n"
+    assert "[conn1 <> example.com] hello" in caplog.text
 
 
-def test_log_direction_arrow_points_away_from_client_when_piping_from_client(capsys):
+def test_log_direction_arrow_points_away_from_client_when_piping_from_client(caplog):
     def body():
         client = fake_stream()
         proxy.CV_CONN_ID.set(2)
@@ -1110,13 +1112,13 @@ def test_log_direction_arrow_points_away_from_client_when_piping_from_client(cap
         proxy.CV_DEST_STREAM.set(fake_stream())
         proxy.CV_DESTHOST.set("example.com")
         proxy.CV_PIPE_FROM.set(client)
-        proxy.log("hello")
+        proxy.logger.info("hello")
 
     run_isolated(body)
-    assert capsys.readouterr().out == "[conn2 -> example.com] hello\n"
+    assert "[conn2 -> example.com] hello" in caplog.text
 
 
-def test_log_direction_arrow_points_toward_client_when_piping_from_dest(capsys):
+def test_log_direction_arrow_points_toward_client_when_piping_from_dest(caplog):
     def body():
         client = fake_stream()
         dest = fake_stream()
@@ -1125,18 +1127,57 @@ def test_log_direction_arrow_points_toward_client_when_piping_from_dest(capsys):
         proxy.CV_DEST_STREAM.set(dest)
         proxy.CV_DESTHOST.set("example.com")
         proxy.CV_PIPE_FROM.set(dest)
-        proxy.log("hello")
+        proxy.logger.info("hello")
 
     run_isolated(body)
-    assert capsys.readouterr().out == "[conn3 <- example.com] hello\n"
+    assert "[conn3 <- example.com] hello" in caplog.text
 
 
-def test_log_forwards_extra_kwargs_to_print(capsys):
+def test_log_injects_structured_context_into_record_extra(caplog):
     def body():
-        proxy.log("no", "newline", end="")
+        client = fake_stream()
+        dest = fake_stream()
+        proxy.CV_CONN_ID.set(42)
+        proxy.CV_CLIENT_STREAM.set(client)
+        proxy.CV_DEST_STREAM.set(dest)
+        proxy.CV_DESTHOST.set("structured.example.com")
+        proxy.CV_PIPE_FROM.set(client)
+        proxy.logger.info("structured check")
 
     run_isolated(body)
-    assert capsys.readouterr().out == "no newline"
+    record = next(r for r in caplog.records if "structured check" in r.message)
+    assert record.conn_id == 42
+    assert record.desthost == "structured.example.com"
+    assert record.direction == "->"
+    assert record.conn_prefix == "[conn42 -> structured.example.com]"
+
+
+def test_log_backwards_compatible_helper(caplog):
+    def body():
+        proxy.CV_CONN_ID.set(99)
+        proxy.CV_CLIENT_STREAM.set(fake_stream())
+        proxy.log("compat", "message", level=logging.WARNING, end="")
+
+    run_isolated(body)
+    assert "[conn99] compat message" in caplog.text
+    record = next(r for r in caplog.records if "compat message" in r.message)
+    assert record.levelno == logging.WARNING
+
+
+def test_format_conn_prefix_helper():
+    def body():
+        assert proxy.format_conn_prefix() == ""
+        client = fake_stream()
+        proxy.CV_CLIENT_STREAM.set(client)
+        proxy.CV_CONN_ID.set(10)
+        assert proxy.format_conn_prefix() == "[conn10]"
+        proxy.CV_DEST_STREAM.set(fake_stream())
+        proxy.CV_DESTHOST.set("example.org")
+        assert proxy.format_conn_prefix() == "[conn10 <> example.org]"
+        proxy.CV_PIPE_FROM.set(client)
+        assert proxy.format_conn_prefix() == "[conn10 -> example.org]"
+
+    run_isolated(body)
 
 
 # ---------------------------------------------------------------------------
@@ -1145,7 +1186,7 @@ def test_log_forwards_extra_kwargs_to_print(capsys):
 
 
 @tt.trio_test
-async def test_start_server_calls_serve_tcp_with_server_and_port(capsys):
+async def test_start_server_calls_serve_tcp_with_server_and_port(caplog):
     calls = []
 
     async def fake_serve_tcp(server, port):
@@ -1157,11 +1198,11 @@ async def test_start_server_calls_serve_tcp_with_server_and_port(capsys):
     await proxy.start_server(server=marker, port=9999, _serve=fake_serve_tcp)
 
     assert calls == [(marker, 9999)]
-    assert "Starting marker on port 9999" in capsys.readouterr().out
+    assert "Starting marker on port 9999" in caplog.text
 
 
 @tt.trio_test
-async def test_start_server_reports_unspecified_port_as_os_selected(capsys):
+async def test_start_server_reports_unspecified_port_as_os_selected(caplog):
     async def fake_serve_tcp(server, port):
         pass
 
@@ -1170,17 +1211,17 @@ async def test_start_server_reports_unspecified_port_as_os_selected(capsys):
 
     await proxy.start_server(server=marker, port=0, _serve=fake_serve_tcp)
 
-    assert "(OS-selected port)" in capsys.readouterr().out
+    assert "(OS-selected port)" in caplog.text
 
 
 @tt.trio_test
-async def test_start_server_swallows_keyboard_interrupt(capsys):
+async def test_start_server_swallows_keyboard_interrupt(caplog):
     async def fake_serve_tcp(server, port):
         raise KeyboardInterrupt
 
     await proxy.start_server(server=proxy.http_proxy, port=1234, _serve=fake_serve_tcp)
 
-    assert "Goodbye for now." in capsys.readouterr().out
+    assert "Goodbye for now." in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1244,3 +1285,119 @@ def test_float_env_uses_default_when_var_unset():
 
 def test_float_env_reads_value_from_env():
     assert proxy._float_env("X", 4.2, _getenv=lambda _name, _default: "1.5") == 1.5
+
+
+# ---------------------------------------------------------------------------
+# Logging levels, exception info, and adapter operations
+# ---------------------------------------------------------------------------
+
+
+@tt.trio_test
+async def test_tunnel_logs_warning_with_exc_info_on_bad_request(caplog):
+    proxy_client, test_client = tt.memory_stream_pair()
+    await test_client.send_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    with pytest.raises(proxy.ProxyProtocolError):
+        await proxy.tunnel(proxy_client)
+
+    rec = next(r for r in caplog.records if "Bad CONNECT request" in r.message)
+    assert rec.levelname == "WARNING"
+    assert rec.exc_info is not None
+    assert rec.exc_info[0] is proxy.ProxyProtocolError
+
+
+@tt.trio_test
+async def test_tunnel_logs_warning_with_exc_info_on_oversized_request(caplog):
+    proxy_client, test_client = tt.memory_stream_pair()
+    oversized = b"a" * (proxy.DEFAULT_MAXREQSZ + 1) + b":443"
+    await test_client.send_all(connect_request(target=oversized))
+    with pytest.raises(proxy.RequestTooLargeError):
+        await proxy.tunnel(proxy_client)
+
+    rec = next(r for r in caplog.records if "Oversized CONNECT request" in r.message)
+    assert rec.levelname == "WARNING"
+    assert rec.exc_info is not None
+    assert rec.exc_info[0] is proxy.RequestTooLargeError
+
+
+@tt.trio_test
+async def test_tunnel_logs_exception_on_dest_connect_failure(caplog):
+    proxy_client, test_client = tt.memory_stream_pair()
+
+    async def fake_connect(_host, _port):
+        raise OSError("network is unreachable")
+
+    await test_client.send_all(connect_request(target=b"example.com:443"))
+    with pytest.raises(OSError):
+        await proxy.tunnel(proxy_client, _connect=fake_connect)
+
+    rec = next(r for r in caplog.records if "Could not connect to" in r.message)
+    assert rec.levelname == "ERROR"
+    assert rec.exc_info is not None
+    assert rec.exc_info[0] is OSError
+
+
+@tt.trio_test
+async def test_tunnel_logs_exception_on_dest_connect_timeout(caplog, mock_clock):
+    proxy_client, test_client = tt.memory_stream_pair()
+
+    async def hang(_host, _port):
+        await trio.sleep_forever()
+
+    await test_client.send_all(connect_request(target=b"example.com:443"))
+    with pytest.raises(trio.TooSlowError):
+        await proxy.tunnel(proxy_client, _connect=hang, dest_connect_timeout=1)
+
+    rec = next(r for r in caplog.records if "Timed out connecting to" in r.message)
+    assert rec.levelname == "ERROR"
+    assert rec.exc_info is not None
+
+
+@tt.trio_test
+async def test_pipe_with_timeout_logs_warning_on_timeout(caplog, mock_clock):
+    from_proxy, _from_test = tt.memory_stream_pair()
+    to_proxy, _to_test = tt.memory_stream_pair()
+
+    with pytest.raises(trio.TooSlowError):
+        await proxy.pipe_with_timeout(from_proxy, to_proxy, idle_timeout=2)
+
+    rec = next(r for r in caplog.records if "closing tunnel" in r.message)
+    assert rec.levelname == "WARNING"
+    assert "Pipe idle for 2s" in rec.message
+
+
+def test_logger_adapter_delegates_handlers_and_filters():
+    test_handler = logging.NullHandler()
+    test_filter = logging.Filter()
+
+    proxy.logger.addHandler(test_handler)
+    assert test_handler in proxy.logger.logger.handlers
+    proxy.logger.removeHandler(test_handler)
+    assert test_handler not in proxy.logger.logger.handlers
+
+    proxy.logger.addFilter(test_filter)
+    assert test_filter in proxy.logger.logger.filters
+    proxy.logger.removeFilter(test_filter)
+    assert test_filter not in proxy.logger.logger.filters
+
+
+def test_log_level_defaults_and_env():
+    assert proxy.DEFAULT_LOG_LEVEL == "INFO"
+    assert proxy.LOG_LEVEL in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def test_log_with_no_args_is_noop(caplog):
+    proxy.log()
+    assert len(caplog.records) == 0
+
+
+def test_raw_logger_filter_populates_attributes(caplog):
+    def body():
+        client = fake_stream()
+        proxy.CV_CONN_ID.set(55)
+        proxy.CV_CLIENT_STREAM.set(client)
+        proxy._raw_logger.info("raw logger message")
+
+    run_isolated(body)
+    rec = next(r for r in caplog.records if "raw logger message" in r.message)
+    assert rec.conn_id == 55
+    assert rec.conn_prefix == "[conn55]"

@@ -6,13 +6,14 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import logging
+from collections.abc import MutableMapping
 from contextvars import ContextVar
 from functools import partial
 from io import DEFAULT_BUFFER_SIZE
 from itertools import count
 from os import getenv
-from textwrap import indent
-from traceback import format_exc
+from typing import Any
 from urllib.parse import urlsplit
 
 import h11
@@ -57,6 +58,9 @@ DEFAULT_MAXCONNS = 1000
 MAXCONNS = _int_env("MAXCONNS", DEFAULT_MAXCONNS)
 CONN_LIMITER = trio.CapacityLimiter(MAXCONNS)
 
+DEFAULT_LOG_LEVEL = "INFO"
+LOG_LEVEL = getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
+
 HTTP_METHOD_CONNECT = b"CONNECT"
 HTTP_400_BAD_REQUEST = b"HTTP/1.1 400 Bad Request\r\n\r\n"
 HTTP_408_REQUEST_TIMEOUT = b"HTTP/1.1 408 Request Timeout\r\n\r\n"
@@ -80,9 +84,6 @@ class RequestTooLargeError(ProxyProtocolError):
 
 HTTP_200_CONNECTION_ESTABLISHED = b"HTTP/1.1 200 Connection established\r\n\r\n"
 
-prn = partial(print, end="")
-indented = partial(indent, prefix="  ")
-
 CV_CLIENT_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
     "client_stream", default=None
 )
@@ -96,6 +97,95 @@ CV_DESTHOST: ContextVar[str | None] = ContextVar("desthost", default=None)
 CV_CONN_ID: ContextVar[int | None] = ContextVar("conn_id", default=None)
 
 _conn_ids = count(1)
+
+LOGGER_NAME = "trio_http_proxy"
+_raw_logger = logging.getLogger(LOGGER_NAME if __name__ == "__main__" else __name__)
+_raw_logger.addHandler(logging.NullHandler())
+
+
+def _connection_context() -> dict[str, Any]:
+    conn_id = CV_CONN_ID.get()
+    client_stream = CV_CLIENT_STREAM.get()
+    dest_stream = CV_DEST_STREAM.get()
+    desthost = CV_DESTHOST.get()
+    pipe_from = CV_PIPE_FROM.get()
+    direction = None
+    prefix = ""
+
+    if client_stream is not None:
+        if dest_stream is not None:
+            direction = "<>"
+            if pipe_from is not None:
+                direction = "->" if pipe_from is client_stream else "<-"
+            prefix = f"[conn{conn_id} {direction} {desthost}]"
+        else:
+            prefix = f"[conn{conn_id}]"
+
+    return {
+        "conn_id": conn_id,
+        "desthost": desthost,
+        "direction": direction,
+        "conn_prefix": prefix,
+    }
+
+
+def format_conn_prefix() -> str:
+    return str(_connection_context()["conn_prefix"])
+
+
+class ConnectionFilter(logging.Filter):
+    """Ensure connection attributes (conn_id, desthost, direction, conn_prefix)
+    are always populated on LogRecord instances."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        ctx = _connection_context()
+        for k, v in ctx.items():
+            if not hasattr(record, k):
+                setattr(record, k, v)
+        return True
+
+
+class ConnectionLoggerAdapter(logging.LoggerAdapter):
+    """LoggerAdapter that prepends connection context to log messages and injects
+    structured attributes into LogRecord extra."""
+
+    def process(
+        self, msg: Any, kwargs: MutableMapping[str, Any]
+    ) -> tuple[Any, MutableMapping[str, Any]]:
+        ctx = _connection_context()
+        prefix = ctx["conn_prefix"]
+        if prefix:
+            escaped_prefix = prefix.replace("%", "%%")
+            msg = f"{escaped_prefix} {msg}"
+        extra = kwargs.setdefault("extra", {})
+        for k, v in ctx.items():
+            extra.setdefault(k, v)
+        return msg, kwargs
+
+    def addHandler(self, hdlr: logging.Handler) -> None:
+        self.logger.addHandler(hdlr)
+
+    def removeHandler(self, hdlr: logging.Handler) -> None:
+        self.logger.removeHandler(hdlr)
+
+    def addFilter(self, fltr: logging.Filter | Any) -> None:
+        self.logger.addFilter(fltr)
+
+    def removeFilter(self, fltr: logging.Filter | Any) -> None:
+        self.logger.removeFilter(fltr)
+
+
+_raw_logger.addFilter(ConnectionFilter())
+logger = ConnectionLoggerAdapter(_raw_logger, {})
+
+
+def log(*args: Any, level: int = logging.INFO, **kw: Any) -> None:
+    """Log a message using the module logger. Maintained for compatibility."""
+    if not args:
+        return
+    msg = " ".join(str(a) for a in args)
+    kw.pop("end", None)
+    logger.log(level, msg, **kw)
 
 
 async def http_proxy(
@@ -139,19 +229,23 @@ async def http_proxy(
                     )
                 )
         except* trio.BrokenResourceError, trio.ClosedResourceError:
-            log("Peer disconnected")
+            logger.info("Peer disconnected")
         except* trio.TooSlowError:
             pass  # pipe() already logged the reason before raising
-        except* Exception:  # noqa: BLE001 -- unexpected bug; isolate so trio.serve_tcp keeps serving other connections
-            log(f"\n{indented(format_exc())}")
+        except* Exception:
+            logger.exception("Unexpected exception in connection handler")
 
 
 async def start_server(server=http_proxy, port=PORT, _serve=trio.serve_tcp):
-    print(f"* Starting {server.__name__} on port {port or '(OS-selected port)'}...")
+    logger.info(
+        "* Starting %s on port %s...",
+        server.__name__,
+        port or "(OS-selected port)",
+    )
     try:
         await _serve(server, port)
     except KeyboardInterrupt:
-        print("\nGoodbye for now.")
+        logger.info("Goodbye for now.")
 
 
 async def tunnel(
@@ -170,42 +264,47 @@ async def tunnel(
             client_stream, read_timeout=read_timeout
         )
     except RequestTooLargeError:
-        log(
-            f"Oversized CONNECT request, sending 414 to client...\n{indented(format_exc())}"
+        logger.warning(
+            "Oversized CONNECT request, sending 414 to client...", exc_info=True
         )
         await client_stream.send_all(HTTP_414_URI_TOO_LONG)
         raise
     except ProxyProtocolError, h11.ProtocolError:
-        log(f"Bad CONNECT request, sending 400 to client...\n{indented(format_exc())}")
+        logger.warning("Bad CONNECT request, sending 400 to client...", exc_info=True)
         await client_stream.send_all(HTTP_400_BAD_REQUEST)
         raise
     except trio.TooSlowError:
-        log(
-            f"CONNECT request took too long to arrive, sending 408 to client...\n{indented(format_exc())}"
+        logger.warning(
+            "CONNECT request took too long to arrive, sending 408 to client...",
+            exc_info=True,
         )
         await client_stream.send_all(HTTP_408_REQUEST_TIMEOUT)
         raise
-    log(f"Got CONNECT request for {desthost}:{destport}, connecting...")
+    logger.info("Got CONNECT request for %s:%d, connecting...", desthost, destport)
     try:
         with trio.fail_after(dest_connect_timeout):
             dest_stream = await _connect(desthost, destport)
     except OSError:
-        log(
-            f"Could not connect to {desthost}:{destport}, sending 502 to client...\n{indented(format_exc())}"
+        logger.exception(
+            "Could not connect to %s:%d, sending 502 to client...",
+            desthost,
+            destport,
         )
         await client_stream.send_all(HTTP_502_BAD_GATEWAY)
         raise
     except trio.TooSlowError:
-        log(
-            f"Timed out connecting to {desthost}:{destport}, sending 504 to client...\n{indented(format_exc())}"
+        logger.exception(
+            "Timed out connecting to %s:%d, sending 504 to client...",
+            desthost,
+            destport,
         )
         await client_stream.send_all(HTTP_504_GATEWAY_TIMEOUT)
         raise
     CV_DEST_STREAM.set(dest_stream)
     CV_DESTHOST.set(desthost)
-    log(f"Connected to {desthost}, sending 200 to client...")
+    logger.info("Connected to %s, sending 200 to client...", desthost)
     await client_stream.send_all(HTTP_200_CONNECTION_ESTABLISHED)
-    log("Sent 200 to client, tunnel established.")
+    logger.info("Sent 200 to client, tunnel established.")
     return dest_stream
 
 
@@ -218,7 +317,7 @@ async def process_as_connect_request(
     Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout
     seconds -- guards against a slowloris-style client trickling bytes forever.
     """
-    log("Reading...")
+    logger.debug("Reading...")
     # h11's own request-line/header buffering ceiling defaults to 16384 bytes
     # regardless of our maxreqsz. Left unset, a MAXREQSZ configured above
     # 16384 doesn't just get mislabeled -- a legitimate request that's well
@@ -301,8 +400,8 @@ async def pipe(
         await to_stream.send_all(chunk)
         if on_send is not None:
             on_send()
-        log(f"Forwarded {len(chunk)} bytes")
-    log("Pipe finished")
+        logger.debug("Forwarded %d bytes", len(chunk))
+    logger.debug("Pipe finished")
 
 
 async def pipe_with_timeout(
@@ -340,24 +439,13 @@ async def pipe_with_timeout(
     if cancel_scope.cancelled_caught:
         timeout = send_timeout if phase == "send" else idle_timeout
         reason = "send stalled" if phase == "send" else "idle"
-        log(f"Pipe {reason} for {timeout}s, closing tunnel")
+        logger.warning("Pipe %s for %ss, closing tunnel", reason, timeout)
         raise trio.TooSlowError(f"Pipe {reason} for {timeout}s")
 
 
-def log(*args, **kw):
-    client_stream = CV_CLIENT_STREAM.get()
-    if client_stream:
-        prn(f"[conn{CV_CONN_ID.get()}")
-        dest_stream = CV_DEST_STREAM.get()
-        if dest_stream:
-            direction = "<>"
-            pipe_from = CV_PIPE_FROM.get()
-            if pipe_from:
-                direction = "->" if pipe_from is client_stream else "<-"
-            prn(f" {direction} {CV_DESTHOST.get()}")
-        prn("] ")
-    print(*args, **kw)
-
-
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
     trio.run(start_server)
