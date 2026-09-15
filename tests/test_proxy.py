@@ -359,6 +359,26 @@ async def test_pipe_returns_after_idle_timeout_with_no_data(mock_clock):
     assert not watchdog.cancelled_caught, "pipe() never gave up on the idle peer"
 
 
+@tt.trio_test
+async def test_pipe_returns_after_send_timeout_when_dest_stalls(mock_clock):
+    # from_stream has data ready; to_stream never accepts it -- send_all_hook
+    # fires *after* send_all() has already buffered the bytes (see
+    # MemorySendStream docs), so a hook that never returns simulates a real
+    # filled TCP send buffer stalling the call itself, not data never
+    # arriving. With no send-side timeout, pipe() would hang here.
+    from_proxy, from_test = tt.memory_stream_pair()
+    to_proxy, _to_test = tt.memory_stream_pair()
+    to_proxy.send_stream.send_all_hook = trio.sleep_forever
+
+    await from_test.send_all(b"stuck payload")
+
+    with trio.move_on_after(60) as watchdog:
+        await proxy.pipe(from_proxy, to_proxy, idle_timeout=5, send_timeout=5)
+    assert not watchdog.cancelled_caught, (
+        "pipe() never gave up on the stalled destination"
+    )
+
+
 # ---------------------------------------------------------------------------
 # http_proxy (end-to-end)
 # ---------------------------------------------------------------------------
@@ -430,6 +450,48 @@ async def test_http_proxy_closes_tunnel_after_both_sides_go_idle(mock_clock):
     # The handler should have closed both streams on its way out.
     remainder = await dest_test_side.receive_some(4096)
     assert remainder == b""
+
+
+@tt.trio_test
+async def test_http_proxy_closes_tunnel_when_dest_stalls_on_send(mock_clock):
+    # Client keeps sending; the destination never drains (its send_all_hook
+    # never returns, simulating a filled TCP send buffer). Discriminating
+    # test for the send-side timeout, same shape as the idle-timeout one
+    # above: it fails unless the stalled pipe() also tears down its sibling
+    # and closes the whole tunnel, not just the stalled direction.
+    proxy_client, test_client = tt.memory_stream_pair()
+    dest_proxy_side, _dest_test_side = tt.memory_stream_pair()
+    dest_proxy_side.send_stream.send_all_hook = trio.sleep_forever
+
+    async def fake_open_tcp_stream(_host, _port):
+        return dest_proxy_side
+
+    with trio.move_on_after(120) as watchdog:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(
+                partial(
+                    proxy.http_proxy,
+                    proxy_client,
+                    _connect=fake_open_tcp_stream,
+                    # idle_timeout deliberately much larger than send_timeout:
+                    # the dest->client direction never receives anything
+                    # either, so without this gap its idle timeout could race
+                    # the send timeout below and fire first, leaving this
+                    # test unable to tell which code path actually closed the
+                    # tunnel.
+                    idle_timeout=1000,
+                    send_timeout=5,
+                )
+            )
+            await test_client.send_all(connect_request(target=b"example.com:443"))
+            reply = await test_client.receive_some(4096)
+            assert reply == b"HTTP/1.1 200 Connection established\r\n\r\n"
+            await test_client.send_all(b"client->dest payload")
+            # dest never drains -- wait for http_proxy() to notice the
+            # stalled send and return, which ends this nursery block.
+    assert not watchdog.cancelled_caught, (
+        "http_proxy() never gave up on the stalled destination"
+    )
 
 
 @tt.trio_test

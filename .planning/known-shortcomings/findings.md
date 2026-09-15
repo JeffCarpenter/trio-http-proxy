@@ -13,15 +13,16 @@ tracked rather than silently assumed away.
   504 on trip); each `pipe()` direction is bounded by `PIPE_IDLE_TIMEOUT`
   (`trio.move_on_after` per `receive_some`), and cancels its sibling via a shared
   `nursery.cancel_scope` so an idle tunnel closes entirely rather than leaking the
-  other direction's task. All three are env-overridable (`_float_env`, same pattern
-  as `PORT`/`BUFMAXSZ`). `send_all` remains unbounded — see below.
-- **`send_all` is still unbounded.** A client that completes the CONNECT
-  handshake and then simply stops reading can fill the OS send buffer and hold
-  the task open forever — the same slowloris shape as the now-fixed receive-side
-  gaps above, on the write side instead. Deferred: `memory_stream_pair()`
-  buffers unboundedly, so exercising this needs a `send_all_hook` (or a real
-  socket) to simulate backpressure rather than the trickle/idle patterns used
-  for the receive-side timeout tests.
+  other direction's task; all four (below) are env-overridable (`_float_env`, same
+  pattern as `PORT`/`BUFMAXSZ`).
+  ~~`send_all` remains unbounded~~ **Also fixed.** Each `pipe()` direction's
+  `send_all` is bounded by `PIPE_SEND_TIMEOUT` (`trio.move_on_after`); a stalled
+  destination (e.g. a client that completes CONNECT and stops reading, filling
+  the OS send buffer) trips it the same way an idle receive does, cancelling the
+  sibling via the shared `nursery.cancel_scope`. Tested via
+  `MemorySendStream.send_all_hook` set to `trio.sleep_forever` — the hook fires
+  *after* `send_all()` has already buffered the chunk, so it simulates the call
+  itself stalling (a filled real TCP send buffer), not data never arriving.
 - **No connection limit or backpressure.** `trio.serve_tcp` spawns one task per inbound
   TCP connection with no cap, so a connection flood has no throttle.
 - **No target allowlist/denylist.** The proxy will `CONNECT` to any `host:port`,

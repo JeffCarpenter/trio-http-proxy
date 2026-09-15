@@ -46,6 +46,9 @@ DEST_CONNECT_TIMEOUT = _float_env("DEST_CONNECT_TIMEOUT", DEFAULT_DEST_CONNECT_T
 DEFAULT_PIPE_IDLE_TIMEOUT = 300.0
 PIPE_IDLE_TIMEOUT = _float_env("PIPE_IDLE_TIMEOUT", DEFAULT_PIPE_IDLE_TIMEOUT)
 
+DEFAULT_PIPE_SEND_TIMEOUT = 30.0
+PIPE_SEND_TIMEOUT = _float_env("PIPE_SEND_TIMEOUT", DEFAULT_PIPE_SEND_TIMEOUT)
+
 prn = partial(print, end="")
 indented = partial(indent, prefix="  ")
 
@@ -69,6 +72,7 @@ async def http_proxy(
     _nextid=_conn_ids.__next__,
     _connect=trio.open_tcp_stream,
     idle_timeout=PIPE_IDLE_TIMEOUT,
+    send_timeout=PIPE_SEND_TIMEOUT,
 ):
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
@@ -86,20 +90,24 @@ async def http_proxy(
         try:
             async with dest_stream, trio.open_nursery() as nursery:
                 nursery.start_soon(
-                    pipe,
-                    client_stream,
-                    dest_stream,
-                    BUFMAXSZ,
-                    idle_timeout,
-                    nursery.cancel_scope,
+                    partial(
+                        pipe,
+                        client_stream,
+                        dest_stream,
+                        idle_timeout=idle_timeout,
+                        send_timeout=send_timeout,
+                        idle_cancel_scope=nursery.cancel_scope,
+                    )
                 )
                 nursery.start_soon(
-                    pipe,
-                    dest_stream,
-                    client_stream,
-                    BUFMAXSZ,
-                    idle_timeout,
-                    nursery.cancel_scope,
+                    partial(
+                        pipe,
+                        dest_stream,
+                        client_stream,
+                        idle_timeout=idle_timeout,
+                        send_timeout=send_timeout,
+                        idle_cancel_scope=nursery.cancel_scope,
+                    )
                 )
         except* trio.BrokenResourceError, trio.ClosedResourceError:
             log("Peer disconnected")
@@ -201,14 +209,17 @@ async def pipe(
     to_stream,
     bufmaxsz=BUFMAXSZ,
     idle_timeout=PIPE_IDLE_TIMEOUT,
+    send_timeout=PIPE_SEND_TIMEOUT,
     idle_cancel_scope=None,
 ):
     """Forward chunks from from_stream to to_stream until EOF.
-    If idle_timeout seconds pass with no data received, give up -- guards
-    against a slowloris-style peer that opens a tunnel and then goes silent
-    forever. idle_cancel_scope, when given, is cancelled too, so the
-    sibling pipe() task (which may be blocked reading the *other*
-    direction) is torn down along with this one rather than left dangling.
+    If idle_timeout seconds pass with no data received, or send_timeout
+    seconds pass with to_stream not accepting a chunk already read, give up
+    -- guards against a slowloris-style peer that opens a tunnel and then
+    goes silent (or stops draining) forever. idle_cancel_scope, when given,
+    is cancelled too, so the sibling pipe() task (which may be blocked on
+    the *other* direction) is torn down along with this one rather than
+    left dangling.
     """
     CV_PIPE_FROM.set(from_stream)
     while True:
@@ -222,7 +233,13 @@ async def pipe(
             return
         if not chunk:
             break
-        await to_stream.send_all(chunk)
+        with trio.move_on_after(send_timeout) as cancel_scope:
+            await to_stream.send_all(chunk)
+        if cancel_scope.cancelled_caught:
+            log(f"Pipe send stalled for {send_timeout}s, closing tunnel")
+            if idle_cancel_scope is not None:
+                idle_cancel_scope.cancel()
+            return
         log(f"Forwarded {len(chunk)} bytes")
     log("Pipe finished")
 
