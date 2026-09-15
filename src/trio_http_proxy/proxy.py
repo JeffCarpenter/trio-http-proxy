@@ -60,8 +60,24 @@ CONN_LIMITER = trio.CapacityLimiter(MAXCONNS)
 HTTP_METHOD_CONNECT = b"CONNECT"
 HTTP_400_BAD_REQUEST = b"HTTP/1.1 400 Bad Request\r\n\r\n"
 HTTP_408_REQUEST_TIMEOUT = b"HTTP/1.1 408 Request Timeout\r\n\r\n"
+HTTP_414_URI_TOO_LONG = b"HTTP/1.1 414 URI Too Long\r\n\r\n"
 HTTP_502_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
 HTTP_504_GATEWAY_TIMEOUT = b"HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+
+
+class ProxyProtocolError(ValueError):
+    """The client's CONNECT request is malformed or violates the
+    authority-form contract (RFC 7231 section 4.3.6). Raised in place of
+    `assert` so validation survives `python -O` (asserts are stripped under
+    optimization, silently turning every one of these checks into a no-op)."""
+
+
+class RequestTooLargeError(ProxyProtocolError):
+    """The CONNECT request exceeded maxreqsz before a complete request
+    arrived. A subclass of ProxyProtocolError so it's still caught wherever
+    that is, but distinguishable so tunnel() can reply 414 instead of 400."""
+
+
 HTTP_200_CONNECTION_ESTABLISHED = b"HTTP/1.1 200 Connection established\r\n\r\n"
 
 prn = partial(print, end="")
@@ -95,13 +111,12 @@ async def http_proxy(
     async with client_stream, limiter:
         try:
             dest_stream = await tunnel(client_stream, _connect=_connect)
-        except (
-            AssertionError,
-            ValueError,
-            h11.ProtocolError,
-            OSError,
-            trio.TooSlowError,
-        ):
+        except ValueError, h11.ProtocolError, OSError, trio.TooSlowError:
+            # ValueError here covers ProxyProtocolError/RequestTooLargeError
+            # (both subclass it). No AssertionError: tunnel() no longer uses
+            # assert for request validation, so one reaching here would be a
+            # genuine bug, not a bad request -- let it fall through to the
+            # except* Exception handler below instead of being swallowed.
             return  # tunnel() already logged and notified the client
         try:
             async with dest_stream, trio.open_nursery() as nursery:
@@ -154,7 +169,13 @@ async def tunnel(
         desthost, destport = await process_as_connect_request(
             client_stream, read_timeout=read_timeout
         )
-    except AssertionError, ValueError, h11.ProtocolError:
+    except RequestTooLargeError:
+        log(
+            f"Oversized CONNECT request, sending 414 to client...\n{indented(format_exc())}"
+        )
+        await client_stream.send_all(HTTP_414_URI_TOO_LONG)
+        raise
+    except ProxyProtocolError, h11.ProtocolError:
         log(f"Bad CONNECT request, sending 400 to client...\n{indented(format_exc())}")
         await client_stream.send_all(HTTP_400_BAD_REQUEST)
         raise
@@ -198,27 +219,64 @@ async def process_as_connect_request(
     seconds -- guards against a slowloris-style client trickling bytes forever.
     """
     log("Reading...")
-    h11_conn = h11.Connection(our_role=h11.SERVER)
+    # h11's own request-line/header buffering ceiling defaults to 16384 bytes
+    # regardless of our maxreqsz. Left unset, a MAXREQSZ configured above
+    # 16384 doesn't just get mislabeled -- a legitimate request that's well
+    # within *our* configured limit gets rejected outright, since h11 raises
+    # its own RemoteProtocolError ("Receive buffer too long") once buffered-
+    # but-still-incomplete data passes 16384, before our check below ever
+    # gets a say. Tying the two together keeps h11's ceiling from being
+    # stricter than the one we actually promised.
+    h11_conn = h11.Connection(our_role=h11.SERVER, max_incomplete_event_size=maxreqsz)
     total_bytes_read = 0
     with trio.fail_after(read_timeout):
         while (h11_nextevt := h11_conn.next_event()) == h11.NEED_DATA:
             bytes_read = await stream.receive_some(bufmaxsz)
             total_bytes_read += len(bytes_read)
-            assert total_bytes_read < maxreqsz, (
-                f"Request did not fit in {maxreqsz} bytes"
-            )
+            # Checked (and raised) before receive_data() below, so h11 never
+            # sees a cumulative total >= maxreqsz -- which is also what keeps
+            # a *small* maxreqsz (tightening h11's ceiling below its 16384
+            # default) safe: our guard always wins the race, never h11's.
+            if total_bytes_read >= maxreqsz:
+                raise RequestTooLargeError(f"Request did not fit in {maxreqsz} bytes")
             h11_conn.receive_data(bytes_read)
-    assert isinstance(h11_nextevt, h11.Request), f"{h11_nextevt=} is not a h11.Request"
-    assert h11_nextevt.method == HTTP_METHOD_CONNECT, (
-        f"{h11_nextevt.method=} != CONNECT"
-    )
+    if not isinstance(h11_nextevt, h11.Request):
+        raise ProxyProtocolError(f"{h11_nextevt=} is not a h11.Request")
+    if h11_nextevt.method != HTTP_METHOD_CONNECT:
+        raise ProxyProtocolError(f"{h11_nextevt.method=} != CONNECT")
+    target = h11_nextevt.target
+    # h11's request-target grammar (vchar = [\x21-\x7e]) is validated against
+    # the raw request line before a Request event is ever constructed -- an
+    # out-of-range byte here already raised h11.RemoteProtocolError upstream,
+    # caught by tunnel()'s h11.ProtocolError handler. So .decode() below can't
+    # raise UnicodeDecodeError; confirmed against h11's grammar and by direct
+    # reproduction, not assumed.
+    decoded_target = target.decode()
     # urlsplit handles bracketed IPv6 authorities (e.g. "[::1]:443") correctly;
     # a naive split on the first ":" tears such addresses apart.
-    parsed = urlsplit(f"//{h11_nextevt.target.decode()}")
-    desthost, destport = parsed.hostname, parsed.port
+    parsed = urlsplit(f"//{decoded_target}")
+    # RFC 7231 4.3.6: a CONNECT request-target must be bare authority-form
+    # (host:port) -- no userinfo, path, query, or fragment. urlsplit() is lax
+    # about this and silently discards everything but host/port, so a
+    # smuggled path or "user:pass@" prefix must be rejected explicitly,
+    # before any parsed component is trusted.
+    if (
+        parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise ProxyProtocolError(f"{target=} is not authority-form (RFC 7231 4.3.6)")
+    try:
+        desthost, destport = parsed.hostname, parsed.port
+    except ValueError as e:
+        # parsed.port raises ValueError for a non-numeric port (e.g. "notaport").
+        raise ProxyProtocolError(f"{target=} has an invalid port") from e
     if destport is None:
-        raise ValueError(f"{h11_nextevt.target=} missing port")
-    assert desthost is not None, f"{h11_nextevt.target=} missing host"
+        raise ProxyProtocolError(f"{target=} missing port")
+    if desthost is None:
+        raise ProxyProtocolError(f"{target=} missing host")
     return desthost, destport
 
 

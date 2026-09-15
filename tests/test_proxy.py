@@ -86,7 +86,7 @@ async def test_process_as_connect_request_chunked_across_multiple_reads():
 async def test_process_as_connect_request_rejects_non_connect_method():
     server, client = tt.memory_stream_pair()
     await client.send_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
-    with pytest.raises(AssertionError, match="CONNECT"):
+    with pytest.raises(proxy.ProxyProtocolError, match="CONNECT"):
         await proxy.process_as_connect_request(server)
 
 
@@ -103,8 +103,35 @@ async def test_process_as_connect_request_enforces_max_size():
     server, client = tt.memory_stream_pair()
     huge_target = b"a" * 100 + b":443"
     await client.send_all(connect_request(target=huge_target))
-    with pytest.raises(AssertionError, match="did not fit"):
+    with pytest.raises(proxy.RequestTooLargeError, match="did not fit"):
         await proxy.process_as_connect_request(server, bufmaxsz=8, maxreqsz=32)
+
+
+@tt.trio_test
+async def test_process_as_connect_request_honors_maxreqsz_above_h11_default():
+    # h11.Connection's own max_incomplete_event_size defaults to 16384 bytes,
+    # independent of maxreqsz, unless we pass it through explicitly. Without
+    # that wiring, a maxreqsz configured above 16384 would never actually
+    # apply: h11 raises its own RemoteProtocolError once the buffered-but-
+    # still-incomplete request exceeds 16384 bytes, before our own maxreqsz
+    # guard ever gets a chance to fire.
+    #
+    # h11 only enforces that ceiling while a request is still incomplete --
+    # if a read happens to deliver the rest of the request in the same
+    # receive_data() call that crosses 16384, it never trips. So bufmaxsz is
+    # chosen to force the first receive_some() to return more than 16384
+    # bytes while deliberately withholding the final CRLFCRLF (still
+    # incomplete), which is what actually exercises h11's ceiling.
+    server, client = tt.memory_stream_pair()
+    long_host = "a" * 17000
+    req = connect_request(target=f"{long_host}:443".encode())
+    assert len(req) > 16384 + 100
+    await client.send_all(req)
+    first_read_size = 16384 + 100  # > h11's default ceiling, still incomplete
+    host, port = await proxy.process_as_connect_request(
+        server, bufmaxsz=first_read_size, maxreqsz=20000
+    )
+    assert (host, port) == (long_host, 443)
 
 
 @tt.trio_test
@@ -127,7 +154,7 @@ async def test_process_as_connect_request_rejects_missing_port():
 async def test_process_as_connect_request_rejects_eof_before_complete_request():
     server, client = tt.memory_stream_pair()
     await client.aclose()
-    with pytest.raises(AssertionError, match="is not a h11.Request"):
+    with pytest.raises(proxy.ProxyProtocolError, match="is not a h11.Request"):
         await proxy.process_as_connect_request(server)
 
 
@@ -252,7 +279,7 @@ async def test_tunnel_bad_request_sends_400_and_raises_without_connecting():
         raise AssertionError("should not be called")
 
     await test_client.send_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-    with pytest.raises(AssertionError):
+    with pytest.raises(proxy.ProxyProtocolError):
         await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     assert called is False
@@ -317,6 +344,25 @@ async def test_tunnel_times_out_connecting_to_dest_sends_504(mock_clock):
 
 
 @tt.trio_test
+async def test_tunnel_rejects_non_numeric_port_sends_400():
+    # Regression test: process_as_connect_request's non-numeric-port case
+    # (a bare ValueError from urlsplit(...).port, not an explicit raise) must
+    # still land in tunnel()'s ProxyProtocolError/h11.ProtocolError handler
+    # and get a 400 reply -- not escape unhandled and drop the client silently.
+    proxy_client, test_client = tt.memory_stream_pair()
+
+    async def fake_open_tcp_stream(_host, _port):
+        raise AssertionError("should not be called")
+
+    await test_client.send_all(connect_request(target=b"example.com:notaport"))
+    with pytest.raises(proxy.ProxyProtocolError):
+        await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
+
+    reply = await test_client.receive_some(4096)
+    assert reply == b"HTTP/1.1 400 Bad Request\r\n\r\n"
+
+
+@tt.trio_test
 async def test_tunnel_oversized_request_sends_414_not_bare_400():
     # process_as_connect_request's size-cap check (proxy.py:207) is a plain
     # `assert`, caught by the same except clause as a garden-variety
@@ -330,7 +376,7 @@ async def test_tunnel_oversized_request_sends_414_not_bare_400():
     async def fake_open_tcp_stream(_host, _port):
         raise AssertionError("should not be called -- request is too large")
 
-    with pytest.raises(Exception):
+    with pytest.raises(proxy.RequestTooLargeError):
         await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     reply = await test_client.receive_some(4096)
