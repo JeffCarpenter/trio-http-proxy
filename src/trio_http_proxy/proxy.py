@@ -57,6 +57,13 @@ DEFAULT_MAXCONNS = 1000
 MAXCONNS = _int_env("MAXCONNS", DEFAULT_MAXCONNS)
 CONN_LIMITER = trio.CapacityLimiter(MAXCONNS)
 
+HTTP_METHOD_CONNECT = b"CONNECT"
+HTTP_400_BAD_REQUEST = b"HTTP/1.1 400 Bad Request\r\n\r\n"
+HTTP_408_REQUEST_TIMEOUT = b"HTTP/1.1 408 Request Timeout\r\n\r\n"
+HTTP_502_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+HTTP_504_GATEWAY_TIMEOUT = b"HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+HTTP_200_CONNECTION_ESTABLISHED = b"HTTP/1.1 200 Connection established\r\n\r\n"
+
 prn = partial(print, end="")
 indented = partial(indent, prefix="  ")
 
@@ -149,13 +156,13 @@ async def tunnel(
         )
     except AssertionError, ValueError, h11.ProtocolError:
         log(f"Bad CONNECT request, sending 400 to client...\n{indented(format_exc())}")
-        await client_stream.send_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        await client_stream.send_all(HTTP_400_BAD_REQUEST)
         raise
     except trio.TooSlowError:
         log(
             f"CONNECT request took too long to arrive, sending 408 to client...\n{indented(format_exc())}"
         )
-        await client_stream.send_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n")
+        await client_stream.send_all(HTTP_408_REQUEST_TIMEOUT)
         raise
     log(f"Got CONNECT request for {desthost}:{destport}, connecting...")
     try:
@@ -165,18 +172,18 @@ async def tunnel(
         log(
             f"Could not connect to {desthost}:{destport}, sending 502 to client...\n{indented(format_exc())}"
         )
-        await client_stream.send_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        await client_stream.send_all(HTTP_502_BAD_GATEWAY)
         raise
     except trio.TooSlowError:
         log(
             f"Timed out connecting to {desthost}:{destport}, sending 504 to client...\n{indented(format_exc())}"
         )
-        await client_stream.send_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+        await client_stream.send_all(HTTP_504_GATEWAY_TIMEOUT)
         raise
     CV_DEST_STREAM.set(dest_stream)
     CV_DESTHOST.set(desthost)
     log(f"Connected to {desthost}, sending 200 to client...")
-    await client_stream.send_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    await client_stream.send_all(HTTP_200_CONNECTION_ESTABLISHED)
     log("Sent 200 to client, tunnel established.")
     return dest_stream
 
@@ -202,7 +209,9 @@ async def process_as_connect_request(
             )
             h11_conn.receive_data(bytes_read)
     assert isinstance(h11_nextevt, h11.Request), f"{h11_nextevt=} is not a h11.Request"
-    assert h11_nextevt.method == b"CONNECT", f"{h11_nextevt.method=} != CONNECT"
+    assert h11_nextevt.method == HTTP_METHOD_CONNECT, (
+        f"{h11_nextevt.method=} != CONNECT"
+    )
     # urlsplit handles bracketed IPv6 authorities (e.g. "[::1]:443") correctly;
     # a naive split on the first ":" tears such addresses apart.
     parsed = urlsplit(f"//{h11_nextevt.target.decode()}")
