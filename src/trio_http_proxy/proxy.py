@@ -23,12 +23,28 @@ def _int_env(name, default, _getenv=getenv):
     return int(_getenv(name, default))
 
 
+def _float_env(name, default, _getenv=getenv):
+    return float(_getenv(name, default))
+
+
 DEFAULT_PORT = 8080
 PORT = _int_env("PORT", DEFAULT_PORT)
 
 BUFMAXSZ = _int_env("BUFMAXSZ", DEFAULT_BUFFER_SIZE)
 DEFAULT_MAXREQSZ = 16384
 MAXREQSZ = _int_env("MAXREQSZ", DEFAULT_MAXREQSZ)
+
+# Slowloris-shaped resource-exhaustion protection: without these, a slow or
+# stalled client/destination can hold a task open forever (see
+# .planning/known-shortcomings/findings.md).
+DEFAULT_CONNECT_READ_TIMEOUT = 10.0
+CONNECT_READ_TIMEOUT = _float_env("CONNECT_READ_TIMEOUT", DEFAULT_CONNECT_READ_TIMEOUT)
+
+DEFAULT_DEST_CONNECT_TIMEOUT = 10.0
+DEST_CONNECT_TIMEOUT = _float_env("DEST_CONNECT_TIMEOUT", DEFAULT_DEST_CONNECT_TIMEOUT)
+
+DEFAULT_PIPE_IDLE_TIMEOUT = 300.0
+PIPE_IDLE_TIMEOUT = _float_env("PIPE_IDLE_TIMEOUT", DEFAULT_PIPE_IDLE_TIMEOUT)
 
 prn = partial(print, end="")
 indented = partial(indent, prefix="  ")
@@ -49,19 +65,42 @@ _conn_ids = count(1)
 
 
 async def http_proxy(
-    client_stream, _nextid=_conn_ids.__next__, _connect=trio.open_tcp_stream
+    client_stream,
+    _nextid=_conn_ids.__next__,
+    _connect=trio.open_tcp_stream,
+    idle_timeout=PIPE_IDLE_TIMEOUT,
 ):
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
     async with client_stream:
         try:
             dest_stream = await tunnel(client_stream, _connect=_connect)
-        except AssertionError, ValueError, h11.ProtocolError, OSError:
+        except (
+            AssertionError,
+            ValueError,
+            h11.ProtocolError,
+            OSError,
+            trio.TooSlowError,
+        ):
             return  # tunnel() already logged and notified the client
         try:
             async with dest_stream, trio.open_nursery() as nursery:
-                nursery.start_soon(pipe, client_stream, dest_stream)
-                nursery.start_soon(pipe, dest_stream, client_stream)
+                nursery.start_soon(
+                    pipe,
+                    client_stream,
+                    dest_stream,
+                    BUFMAXSZ,
+                    idle_timeout,
+                    nursery.cancel_scope,
+                )
+                nursery.start_soon(
+                    pipe,
+                    dest_stream,
+                    client_stream,
+                    BUFMAXSZ,
+                    idle_timeout,
+                    nursery.cancel_scope,
+                )
         except* trio.BrokenResourceError, trio.ClosedResourceError:
             log("Peer disconnected")
         except* Exception:  # noqa: BLE001 -- unexpected bug; isolate so trio.serve_tcp keeps serving other connections
@@ -76,26 +115,46 @@ async def start_server(server=http_proxy, port=PORT, _serve=trio.serve_tcp):
         print("\nGoodbye for now.")
 
 
-async def tunnel(client_stream, _connect=trio.open_tcp_stream):
+async def tunnel(
+    client_stream,
+    _connect=trio.open_tcp_stream,
+    read_timeout=CONNECT_READ_TIMEOUT,
+    dest_connect_timeout=DEST_CONNECT_TIMEOUT,
+):
     """Given a stream from a client containing an HTTP CONNECT request,
     open a connection to the destination server specified in the CONNECT request,
     and notify the client when the end-to-end connection has been established.
     Return the destination stream and the corresponding host.
     """
     try:
-        desthost, destport = await process_as_connect_request(client_stream)
+        desthost, destport = await process_as_connect_request(
+            client_stream, read_timeout=read_timeout
+        )
     except AssertionError, ValueError, h11.ProtocolError:
         log(f"Bad CONNECT request, sending 400 to client...\n{indented(format_exc())}")
         await client_stream.send_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
         raise
+    except trio.TooSlowError:
+        log(
+            f"CONNECT request took too long to arrive, sending 408 to client...\n{indented(format_exc())}"
+        )
+        await client_stream.send_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n")
+        raise
     log(f"Got CONNECT request for {desthost}:{destport}, connecting...")
     try:
-        dest_stream = await _connect(desthost, destport)
+        with trio.fail_after(dest_connect_timeout):
+            dest_stream = await _connect(desthost, destport)
     except OSError:
         log(
             f"Could not connect to {desthost}:{destport}, sending 502 to client...\n{indented(format_exc())}"
         )
         await client_stream.send_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        raise
+    except trio.TooSlowError:
+        log(
+            f"Timed out connecting to {desthost}:{destport}, sending 504 to client...\n{indented(format_exc())}"
+        )
+        await client_stream.send_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
         raise
     CV_DEST_STREAM.set(dest_stream)
     CV_DESTHOST.set(desthost)
@@ -105,19 +164,26 @@ async def tunnel(client_stream, _connect=trio.open_tcp_stream):
     return dest_stream
 
 
-async def process_as_connect_request(stream, bufmaxsz=BUFMAXSZ, maxreqsz=MAXREQSZ):
+async def process_as_connect_request(
+    stream, bufmaxsz=BUFMAXSZ, maxreqsz=MAXREQSZ, read_timeout=CONNECT_READ_TIMEOUT
+):
     """Read a stream expected to contain a valid HTTP CONNECT request to desthost:destport.
     Parse and return the destination host. Validate (lightly) and raise if request invalid.
     See https://tools.ietf.org/html/rfc7231#section-4.3.6 for the CONNECT spec.
+    Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout
+    seconds -- guards against a slowloris-style client trickling bytes forever.
     """
     log("Reading...")
     h11_conn = h11.Connection(our_role=h11.SERVER)
     total_bytes_read = 0
-    while (h11_nextevt := h11_conn.next_event()) == h11.NEED_DATA:
-        bytes_read = await stream.receive_some(bufmaxsz)
-        total_bytes_read += len(bytes_read)
-        assert total_bytes_read < maxreqsz, f"Request did not fit in {maxreqsz} bytes"
-        h11_conn.receive_data(bytes_read)
+    with trio.fail_after(read_timeout):
+        while (h11_nextevt := h11_conn.next_event()) == h11.NEED_DATA:
+            bytes_read = await stream.receive_some(bufmaxsz)
+            total_bytes_read += len(bytes_read)
+            assert total_bytes_read < maxreqsz, (
+                f"Request did not fit in {maxreqsz} bytes"
+            )
+            h11_conn.receive_data(bytes_read)
     assert isinstance(h11_nextevt, h11.Request), f"{h11_nextevt=} is not a h11.Request"
     assert h11_nextevt.method == b"CONNECT", f"{h11_nextevt.method=} != CONNECT"
     # urlsplit handles bracketed IPv6 authorities (e.g. "[::1]:443") correctly;
@@ -130,9 +196,32 @@ async def process_as_connect_request(stream, bufmaxsz=BUFMAXSZ, maxreqsz=MAXREQS
     return desthost, destport
 
 
-async def pipe(from_stream, to_stream, bufmaxsz=BUFMAXSZ):
+async def pipe(
+    from_stream,
+    to_stream,
+    bufmaxsz=BUFMAXSZ,
+    idle_timeout=PIPE_IDLE_TIMEOUT,
+    idle_cancel_scope=None,
+):
+    """Forward chunks from from_stream to to_stream until EOF.
+    If idle_timeout seconds pass with no data received, give up -- guards
+    against a slowloris-style peer that opens a tunnel and then goes silent
+    forever. idle_cancel_scope, when given, is cancelled too, so the
+    sibling pipe() task (which may be blocked reading the *other*
+    direction) is torn down along with this one rather than left dangling.
+    """
     CV_PIPE_FROM.set(from_stream)
-    while chunk := await from_stream.receive_some(bufmaxsz):
+    while True:
+        chunk = b""
+        with trio.move_on_after(idle_timeout) as cancel_scope:
+            chunk = await from_stream.receive_some(bufmaxsz)
+        if cancel_scope.cancelled_caught:
+            log(f"Pipe idle for {idle_timeout}s, closing tunnel")
+            if idle_cancel_scope is not None:
+                idle_cancel_scope.cancel()
+            return
+        if not chunk:
+            break
         await to_stream.send_all(chunk)
         log(f"Forwarded {len(chunk)} bytes")
     log("Pipe finished")

@@ -26,6 +26,17 @@ def fake_stream():
     return cast(trio.SocketStream, object())
 
 
+@pytest.fixture
+def mock_clock():
+    """Passed by name to a @tt.trio_test function, trio_test's wrapper
+    detects any Clock-typed fixture in its kwargs and hands it to
+    trio.run(clock=...). autojump_threshold=0 makes the run jump straight
+    to the next scheduled deadline whenever every task is blocked, so a
+    slowloris-style test with a multi-second (mock) timeout resolves in
+    near-zero real wall-clock time."""
+    return tt.MockClock(autojump_threshold=0)
+
+
 # ---------------------------------------------------------------------------
 # process_as_connect_request
 # ---------------------------------------------------------------------------
@@ -157,6 +168,33 @@ async def test_process_as_connect_request_supports_full_ipv6_target():
     assert (host, port) == ("2001:db8::1", 8443)
 
 
+@tt.trio_test
+async def test_process_as_connect_request_times_out_on_slowloris_trickle(mock_clock):
+    # A slowloris client dribbles one byte every 2 (mock) seconds -- slower
+    # than read_timeout=5 lets a complete request arrive. The 60s watchdog
+    # is itself mock time: if proxy.py has no timeout of its own, the only
+    # deadline in the run is the watchdog's, so autojump jumps straight to
+    # it and cancels the wait -- a Cancelled that doesn't match
+    # pytest.raises(trio.TooSlowError) propagates out to be absorbed by the
+    # watchdog scope, flipping cancelled_caught. That's what proves this
+    # runs in near-zero real time rather than hanging.
+    server, client = tt.memory_stream_pair()
+
+    async def slowloris():
+        req = connect_request()
+        for i in range(len(req)):
+            await client.send_all(req[i : i + 1])
+            await trio.sleep(2)
+
+    with trio.move_on_after(60) as watchdog:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(slowloris)
+            with pytest.raises(trio.TooSlowError):
+                await proxy.process_as_connect_request(server, read_timeout=5)
+            nursery.cancel_scope.cancel()
+    assert not watchdog.cancelled_caught, "proxy never gave up on the slow client"
+
+
 # ---------------------------------------------------------------------------
 # tunnel
 # ---------------------------------------------------------------------------
@@ -215,6 +253,47 @@ async def test_tunnel_connect_failure_sends_502_and_raises():
     assert reply == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
 
 
+@tt.trio_test
+async def test_tunnel_times_out_reading_connect_request_sends_408(mock_clock):
+    # Client opens the TCP connection but never sends a single byte.
+    proxy_client, test_client = tt.memory_stream_pair()
+    called = False
+
+    async def fake_open_tcp_stream(_host, _port):
+        nonlocal called
+        called = True
+
+    with trio.move_on_after(60) as watchdog:
+        with pytest.raises(trio.TooSlowError):
+            await proxy.tunnel(
+                proxy_client, _connect=fake_open_tcp_stream, read_timeout=5
+            )
+    assert not watchdog.cancelled_caught, "proxy never gave up on the slow client"
+
+    assert called is False
+    reply = await test_client.receive_some(4096)
+    assert reply == b"HTTP/1.1 408 Request Timeout\r\n\r\n"
+
+
+@tt.trio_test
+async def test_tunnel_times_out_connecting_to_dest_sends_504(mock_clock):
+    proxy_client, test_client = tt.memory_stream_pair()
+
+    async def hanging_connect(_host, _port):
+        await trio.sleep_forever()
+
+    await test_client.send_all(connect_request(target=b"example.com:443"))
+    with trio.move_on_after(60) as watchdog:
+        with pytest.raises(trio.TooSlowError):
+            await proxy.tunnel(
+                proxy_client, _connect=hanging_connect, dest_connect_timeout=5
+            )
+    assert not watchdog.cancelled_caught, "proxy never gave up on the slow destination"
+
+    reply = await test_client.receive_some(4096)
+    assert reply == b"HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+
+
 # ---------------------------------------------------------------------------
 # pipe
 # ---------------------------------------------------------------------------
@@ -266,6 +345,20 @@ async def test_pipe_immediate_eof_forwards_nothing():
     assert remainder == b""
 
 
+@tt.trio_test
+async def test_pipe_returns_after_idle_timeout_with_no_data(mock_clock):
+    # Neither side ever sends anything or closes -- receive_some() blocks
+    # forever. With no timeout of its own, pipe() would hang here (the only
+    # deadline available for autojump to target would be our watchdog's),
+    # so this is RED against current proxy.py.
+    from_proxy, _from_test = tt.memory_stream_pair()
+    to_proxy, _to_test = tt.memory_stream_pair()
+
+    with trio.move_on_after(60) as watchdog:
+        await proxy.pipe(from_proxy, to_proxy, idle_timeout=5)
+    assert not watchdog.cancelled_caught, "pipe() never gave up on the idle peer"
+
+
 # ---------------------------------------------------------------------------
 # http_proxy (end-to-end)
 # ---------------------------------------------------------------------------
@@ -298,6 +391,45 @@ async def test_http_proxy_full_round_trip():
 
         await test_client.aclose()
         await dest_test_side.aclose()
+
+
+@tt.trio_test
+async def test_http_proxy_closes_tunnel_after_both_sides_go_idle(mock_clock):
+    # Establishes a real tunnel, then neither side sends another byte.
+    # Against current proxy.py pipe() has no idle timeout, so both pipe()
+    # tasks block forever in receive_some() and the nursery in http_proxy()
+    # never exits -- this is the discriminating slowloris test: it fails
+    # even if pipe() alone gets a timeout, unless that timeout also tears
+    # down the sibling pipe task and closes the tunnel.
+    proxy_client, test_client = tt.memory_stream_pair()
+    dest_proxy_side, dest_test_side = tt.memory_stream_pair()
+
+    async def fake_open_tcp_stream(_host, _port):
+        return dest_proxy_side
+
+    with trio.move_on_after(120) as watchdog:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(
+                partial(
+                    proxy.http_proxy,
+                    proxy_client,
+                    _connect=fake_open_tcp_stream,
+                    idle_timeout=5,
+                )
+            )
+            await test_client.send_all(connect_request(target=b"example.com:443"))
+            reply = await test_client.receive_some(4096)
+            assert reply == b"HTTP/1.1 200 Connection established\r\n\r\n"
+            # Neither side sends anything from here on -- just wait for
+            # http_proxy() (started above) to notice the idle tunnel and
+            # return, which ends this nursery block.
+    assert not watchdog.cancelled_caught, (
+        "http_proxy() never gave up on the idle tunnel"
+    )
+
+    # The handler should have closed both streams on its way out.
+    remainder = await dest_test_side.receive_some(4096)
+    assert remainder == b""
 
 
 @tt.trio_test
@@ -660,3 +792,16 @@ def test_int_env_uses_default_when_var_unset():
 
 def test_int_env_reads_value_from_env():
     assert proxy._int_env("X", 42, _getenv=lambda _name, _default: "4096") == 4096
+
+
+# ---------------------------------------------------------------------------
+# _float_env (backs CONNECT_READ_TIMEOUT / DEST_CONNECT_TIMEOUT / PIPE_IDLE_TIMEOUT)
+# ---------------------------------------------------------------------------
+
+
+def test_float_env_uses_default_when_var_unset():
+    assert proxy._float_env("X", 4.2, _getenv=lambda _name, default: default) == 4.2
+
+
+def test_float_env_reads_value_from_env():
+    assert proxy._float_env("X", 4.2, _getenv=lambda _name, _default: "1.5") == 1.5

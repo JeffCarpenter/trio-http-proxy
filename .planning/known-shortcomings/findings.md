@@ -7,10 +7,21 @@ tracked rather than silently assumed away.
 
 ## Implementation (`src/trio_http_proxy/proxy.py`)
 
-- **No timeouts anywhere.** `receive_some`, `_connect`, and `send_all` are all
-  unbounded. A slow or stalled client or destination holds a task open forever — no
-  `trio.fail_after`/`trio.move_on_after` on any I/O call. This is a slowloris-shaped
-  resource-exhaustion vector for a proxy exposed beyond localhost.
+- ~~**No timeouts anywhere.**~~ **Fixed.** `process_as_connect_request` (via `tunnel`)
+  is now bounded by `CONNECT_READ_TIMEOUT` (`trio.fail_after`, 408 on trip);
+  `tunnel`'s `_connect` call is bounded by `DEST_CONNECT_TIMEOUT` (`trio.fail_after`,
+  504 on trip); each `pipe()` direction is bounded by `PIPE_IDLE_TIMEOUT`
+  (`trio.move_on_after` per `receive_some`), and cancels its sibling via a shared
+  `nursery.cancel_scope` so an idle tunnel closes entirely rather than leaking the
+  other direction's task. All three are env-overridable (`_float_env`, same pattern
+  as `PORT`/`BUFMAXSZ`). `send_all` remains unbounded — see below.
+- **`send_all` is still unbounded.** A client that completes the CONNECT
+  handshake and then simply stops reading can fill the OS send buffer and hold
+  the task open forever — the same slowloris shape as the now-fixed receive-side
+  gaps above, on the write side instead. Deferred: `memory_stream_pair()`
+  buffers unboundedly, so exercising this needs a `send_all_hook` (or a real
+  socket) to simulate backpressure rather than the trickle/idle patterns used
+  for the receive-side timeout tests.
 - **No connection limit or backpressure.** `trio.serve_tcp` spawns one task per inbound
   TCP connection with no cap, so a connection flood has no throttle.
 - **No target allowlist/denylist.** The proxy will `CONNECT` to any `host:port`,
