@@ -107,26 +107,26 @@ async def http_proxy(
             async with dest_stream, trio.open_nursery() as nursery:
                 nursery.start_soon(
                     partial(
-                        pipe,
+                        pipe_with_timeout,
                         client_stream,
                         dest_stream,
                         idle_timeout=idle_timeout,
                         send_timeout=send_timeout,
-                        idle_cancel_scope=nursery.cancel_scope,
                     )
                 )
                 nursery.start_soon(
                     partial(
-                        pipe,
+                        pipe_with_timeout,
                         dest_stream,
                         client_stream,
                         idle_timeout=idle_timeout,
                         send_timeout=send_timeout,
-                        idle_cancel_scope=nursery.cancel_scope,
                     )
                 )
         except* trio.BrokenResourceError, trio.ClosedResourceError:
             log("Peer disconnected")
+        except* trio.TooSlowError:
+            pass  # pipe() already logged the reason before raising
         except* Exception:  # noqa: BLE001 -- unexpected bug; isolate so trio.serve_tcp keeps serving other connections
             log(f"\n{indented(format_exc())}")
 
@@ -223,43 +223,67 @@ async def process_as_connect_request(
 
 
 async def pipe(
+    from_stream, to_stream, bufmaxsz=BUFMAXSZ, on_receive=None, on_send=None
+):
+    """Forward chunks from from_stream to to_stream until EOF.
+    on_receive and on_send, when given, are called with no arguments right
+    after each successful receive_some()/send_all(). pipe() itself knows
+    nothing about timeouts; a caller can use these hooks to implement one
+    (see pipe_with_timeout) by nudging a CancelScope's deadline forward on
+    every sign of progress -- Trio's recommended pattern for timeouts,
+    which keeps a reusable function like this one oblivious to them.
+    """
+    CV_PIPE_FROM.set(from_stream)
+    while True:
+        chunk = await from_stream.receive_some(bufmaxsz)
+        if on_receive is not None:
+            on_receive()
+        if not chunk:
+            break
+        await to_stream.send_all(chunk)
+        if on_send is not None:
+            on_send()
+        log(f"Forwarded {len(chunk)} bytes")
+    log("Pipe finished")
+
+
+async def pipe_with_timeout(
     from_stream,
     to_stream,
     bufmaxsz=BUFMAXSZ,
     idle_timeout=PIPE_IDLE_TIMEOUT,
     send_timeout=PIPE_SEND_TIMEOUT,
-    idle_cancel_scope=None,
 ):
-    """Forward chunks from from_stream to to_stream until EOF.
-    If idle_timeout seconds pass with no data received, or send_timeout
-    seconds pass with to_stream not accepting a chunk already read, give up
-    -- guards against a slowloris-style peer that opens a tunnel and then
-    goes silent (or stops draining) forever. idle_cancel_scope, when given,
-    is cancelled too, so the sibling pipe() task (which may be blocked on
-    the *other* direction) is torn down along with this one rather than
-    left dangling.
+    """Run pipe(from_stream, to_stream), raising trio.TooSlowError if
+    idle_timeout seconds pass with no data received, or send_timeout
+    seconds pass with to_stream not accepting a chunk already read --
+    guards against a slowloris-style peer that opens a tunnel and then goes
+    silent (or stops draining) forever. Owns a CancelScope here, in the
+    caller, and nudges its deadline from pipe()'s on_receive/on_send hooks
+    rather than making pipe() take a timeout= parameter of its own.
     """
-    CV_PIPE_FROM.set(from_stream)
-    while True:
-        chunk = b""
-        with trio.move_on_after(idle_timeout) as cancel_scope:
-            chunk = await from_stream.receive_some(bufmaxsz)
-        if cancel_scope.cancelled_caught:
-            log(f"Pipe idle for {idle_timeout}s, closing tunnel")
-            if idle_cancel_scope is not None:
-                idle_cancel_scope.cancel()
-            return
-        if not chunk:
-            break
-        with trio.move_on_after(send_timeout) as cancel_scope:
-            await to_stream.send_all(chunk)
-        if cancel_scope.cancelled_caught:
-            log(f"Pipe send stalled for {send_timeout}s, closing tunnel")
-            if idle_cancel_scope is not None:
-                idle_cancel_scope.cancel()
-            return
-        log(f"Forwarded {len(chunk)} bytes")
-    log("Pipe finished")
+    phase = "idle"  # which of the two blocking calls the deadline is guarding
+
+    def on_receive():
+        nonlocal phase
+        phase = "send"
+        cancel_scope.deadline = trio.current_time() + send_timeout
+
+    def on_send():
+        nonlocal phase
+        phase = "idle"
+        cancel_scope.deadline = trio.current_time() + idle_timeout
+
+    with trio.CancelScope() as cancel_scope:
+        cancel_scope.deadline = trio.current_time() + idle_timeout
+        await pipe(
+            from_stream, to_stream, bufmaxsz, on_receive=on_receive, on_send=on_send
+        )
+    if cancel_scope.cancelled_caught:
+        timeout = send_timeout if phase == "send" else idle_timeout
+        reason = "send stalled" if phase == "send" else "idle"
+        log(f"Pipe {reason} for {timeout}s, closing tunnel")
+        raise trio.TooSlowError(f"Pipe {reason} for {timeout}s")
 
 
 def log(*args, **kw):

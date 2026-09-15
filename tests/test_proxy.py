@@ -389,21 +389,27 @@ async def test_pipe_immediate_eof_forwards_nothing():
 
 
 @tt.trio_test
-async def test_pipe_returns_after_idle_timeout_with_no_data(mock_clock):
+async def test_pipe_with_timeout_raises_after_idle_timeout_with_no_data(mock_clock):
     # Neither side ever sends anything or closes -- receive_some() blocks
     # forever. With no timeout of its own, pipe() would hang here (the only
-    # deadline available for autojump to target would be our watchdog's),
-    # so this is RED against current proxy.py.
+    # deadline available for autojump to target would be our watchdog's), so
+    # this exercises pipe_with_timeout()'s CancelScope wrapper rather than
+    # pipe() itself, which no longer knows what a timeout is.
     from_proxy, _from_test = tt.memory_stream_pair()
     to_proxy, _to_test = tt.memory_stream_pair()
 
     with trio.move_on_after(60) as watchdog:
-        await proxy.pipe(from_proxy, to_proxy, idle_timeout=5)
-    assert not watchdog.cancelled_caught, "pipe() never gave up on the idle peer"
+        with pytest.raises(trio.TooSlowError):
+            await proxy.pipe_with_timeout(from_proxy, to_proxy, idle_timeout=5)
+    assert not watchdog.cancelled_caught, (
+        "pipe_with_timeout() never gave up on the idle peer"
+    )
 
 
 @tt.trio_test
-async def test_pipe_returns_after_send_timeout_when_dest_stalls(mock_clock):
+async def test_pipe_with_timeout_raises_after_send_timeout_when_dest_stalls(
+    mock_clock,
+):
     # from_stream has data ready; to_stream never accepts it -- send_all_hook
     # fires *after* send_all() has already buffered the bytes (see
     # MemorySendStream docs), so a hook that never returns simulates a real
@@ -416,10 +422,53 @@ async def test_pipe_returns_after_send_timeout_when_dest_stalls(mock_clock):
     await from_test.send_all(b"stuck payload")
 
     with trio.move_on_after(60) as watchdog:
-        await proxy.pipe(from_proxy, to_proxy, idle_timeout=5, send_timeout=5)
+        with pytest.raises(trio.TooSlowError):
+            await proxy.pipe_with_timeout(
+                from_proxy, to_proxy, idle_timeout=5, send_timeout=5
+            )
     assert not watchdog.cancelled_caught, (
-        "pipe() never gave up on the stalled destination"
+        "pipe_with_timeout() never gave up on the stalled destination"
     )
+
+
+@tt.trio_test
+async def test_pipe_calls_on_receive_and_on_send_hooks_per_chunk():
+    from_proxy, from_test = tt.memory_stream_pair()
+    to_proxy, to_test = tt.memory_stream_pair()
+    receives = 0
+    sends = 0
+
+    def on_receive():
+        nonlocal receives
+        receives += 1
+
+    def on_send():
+        nonlocal sends
+        sends += 1
+
+    async def feed():
+        await from_test.send_all(b"first")
+        await trio.testing.wait_all_tasks_blocked()
+        await from_test.send_all(b"second")
+        await trio.testing.wait_all_tasks_blocked()
+        await from_test.aclose()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(
+            partial(
+                proxy.pipe, from_proxy, to_proxy, on_receive=on_receive, on_send=on_send
+            )
+        )
+        nursery.start_soon(feed)
+
+    await to_proxy.aclose()
+    while await to_test.receive_some(4096):
+        pass
+
+    # 3 receives: "first", "second", then the EOF read -- EOF doesn't
+    # trigger a send, so on_send() only fires for the two real chunks.
+    assert receives == 3
+    assert sends == 2
 
 
 @tt.trio_test
