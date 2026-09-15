@@ -170,6 +170,27 @@ async def test_process_as_connect_request_supports_full_ipv6_target():
 
 
 @tt.trio_test
+async def test_process_as_connect_request_rejects_target_with_path():
+    # RFC 7231 4.3.6: a CONNECT request-target must be authority-form
+    # (host:port) only -- no path, query, or fragment. urlsplit() is lax
+    # about this and silently discards a trailing path, so a smuggled path
+    # is currently accepted rather than rejected.
+    server, client = tt.memory_stream_pair()
+    await client.send_all(connect_request(target=b"evil.com:443/smuggled"))
+    with pytest.raises(ValueError, match="authority-form"):
+        await proxy.process_as_connect_request(server)
+
+
+@tt.trio_test
+async def test_process_as_connect_request_rejects_target_with_userinfo():
+    # Same authority-form requirement: no "user:pass@" prefix either.
+    server, client = tt.memory_stream_pair()
+    await client.send_all(connect_request(target=b"user:pass@evil.com:443"))
+    with pytest.raises(ValueError, match="authority-form"):
+        await proxy.process_as_connect_request(server)
+
+
+@tt.trio_test
 async def test_process_as_connect_request_times_out_on_slowloris_trickle(mock_clock):
     # A slowloris client dribbles one byte every 2 (mock) seconds -- slower
     # than read_timeout=5 lets a complete request arrive. The 60s watchdog
@@ -293,6 +314,27 @@ async def test_tunnel_times_out_connecting_to_dest_sends_504(mock_clock):
 
     reply = await test_client.receive_some(4096)
     assert reply == b"HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+
+
+@tt.trio_test
+async def test_tunnel_oversized_request_sends_414_not_bare_400():
+    # process_as_connect_request's size-cap check (proxy.py:207) is a plain
+    # `assert`, caught by the same except clause as a garden-variety
+    # malformed request -- so an oversized CONNECT currently gets an
+    # indistinguishable 400 Bad Request instead of a status that actually
+    # tells the client its request was too big.
+    proxy_client, test_client = tt.memory_stream_pair()
+    oversized_target = b"a" * (proxy.DEFAULT_MAXREQSZ + 1) + b":443"
+    await test_client.send_all(connect_request(target=oversized_target))
+
+    async def fake_open_tcp_stream(_host, _port):
+        raise AssertionError("should not be called -- request is too large")
+
+    with pytest.raises(Exception):
+        await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
+
+    reply = await test_client.receive_some(4096)
+    assert reply == b"HTTP/1.1 414 URI Too Long\r\n\r\n"
 
 
 # ---------------------------------------------------------------------------
