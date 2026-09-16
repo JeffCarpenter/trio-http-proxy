@@ -1,5 +1,7 @@
 from .cache import (
+    CACHE_FAILURE_POLICY,
     DEFAULT_CACHE_ENABLED,
+    DEFAULT_CACHE_FAILURE_POLICY,
     DEFAULT_CACHE_URL,
     DEFAULT_CIRCUIT_BREAKER_ENABLED,
     DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE,
@@ -12,6 +14,7 @@ from .cache import (
     DEFAULT_RATE_LIMIT_ENABLED,
     DEFAULT_RATE_LIMIT_PERIOD,
     DEFAULT_RATE_LIMIT_TTL,
+    CacheBackendUnavailable,
     CircuitBreakerOpen,
     ProxyCache,
     RateLimitError,
@@ -67,6 +70,7 @@ from .proxy import (
 
 __all__ = [
     "BUFMAXSZ",
+    "CACHE_FAILURE_POLICY",
     "CONNECT_READ_TIMEOUT",
     "CONN_LIMITER",
     "CV_CLIENT_STREAM",
@@ -76,6 +80,7 @@ __all__ = [
     "CV_PIPE_FROM",
     "DEFAULT_BUFFER_SIZE",
     "DEFAULT_CACHE_ENABLED",
+    "DEFAULT_CACHE_FAILURE_POLICY",
     "DEFAULT_CACHE_URL",
     "DEFAULT_CIRCUIT_BREAKER_ENABLED",
     "DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE",
@@ -112,6 +117,7 @@ __all__ = [
     "PIPE_IDLE_TIMEOUT",
     "PIPE_SEND_TIMEOUT",
     "PORT",
+    "CacheBackendUnavailable",
     "CircuitBreakerOpen",
     "ConnectionFilter",
     "ConnectionLoggerAdapter",
