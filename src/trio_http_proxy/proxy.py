@@ -19,38 +19,68 @@ from urllib.parse import urlsplit
 import h11
 import trio
 
-try:
-    from .cache import (
-        DEFAULT_PROXY_CACHE,
-        CircuitBreakerOpen,
-        ProxyCache,
-        RateLimitError,
-        get_client_key,
-    )
-except ImportError:
-    from trio_http_proxy.cache import (
-        DEFAULT_PROXY_CACHE,
-        CircuitBreakerOpen,
-        ProxyCache,
-        RateLimitError,
-        get_client_key,
-    )
+from .cache import (
+    DEFAULT_PROXY_CACHE,
+    DEFAULT_RATE_LIMIT_PERIOD,
+    CircuitBreakerOpen,
+    RateLimitError,
+    get_client_key,
+)
 
 
-def _int_env(name, default, _getenv=getenv):
-    return int(_getenv(name, default))
+def _int_env(
+    name: str,
+    default: int,
+    min_val: int | None = None,
+    max_val: int | None = None,
+    _getenv: Any = getenv,
+) -> int:
+    try:
+        val = _getenv(name, default)
+    except TypeError:
+        val = _getenv(name)
+    if val is None or (isinstance(val, str) and not val.strip()):
+        res = default
+    else:
+        try:
+            res = int(val)
+        except ValueError:
+            raise ValueError(f"Invalid integer for {name}: {val!r}") from None
+    if min_val is not None and res < min_val:
+        raise ValueError(f"{name} must be >= {min_val}, got {res}")
+    if max_val is not None and res > max_val:
+        raise ValueError(f"{name} must be <= {max_val}, got {res}")
+    return res
 
 
-def _float_env(name, default, _getenv=getenv):
+def _validate_bufmaxsz(val: int) -> int:
+    if val < 1:
+        raise ValueError(f"BUFMAXSZ must be >= 1, got {val}")
+    return val
+
+
+def _float_env(name: str, default: float, _getenv: Any = getenv) -> float:
     return float(_getenv(name, default))
 
 
-DEFAULT_PORT = 8080
-PORT = _int_env("PORT", DEFAULT_PORT)
+def _retry_after_seconds(period: str) -> int:
+    if period.endswith("s"):
+        try:
+            return int(period[:-1])
+        except ValueError:
+            pass
+    try:
+        return int(period)
+    except ValueError:
+        return 60
 
-BUFMAXSZ = _int_env("BUFMAXSZ", DEFAULT_BUFFER_SIZE)
+
+DEFAULT_PORT = 8080
+PORT = _int_env("PORT", DEFAULT_PORT, min_val=0, max_val=65535)
+
+BUFMAXSZ = _validate_bufmaxsz(_int_env("BUFMAXSZ", DEFAULT_BUFFER_SIZE, min_val=1))
 DEFAULT_MAXREQSZ = 16384
-MAXREQSZ = _int_env("MAXREQSZ", DEFAULT_MAXREQSZ)
+MAXREQSZ = _int_env("MAXREQSZ", DEFAULT_MAXREQSZ, min_val=1)
 
 # Slowloris-shaped resource-exhaustion protection: without these, a slow or
 # stalled client/destination can hold a task open forever (see
@@ -67,27 +97,39 @@ PIPE_IDLE_TIMEOUT = _float_env("PIPE_IDLE_TIMEOUT", DEFAULT_PIPE_IDLE_TIMEOUT)
 DEFAULT_PIPE_SEND_TIMEOUT = 30.0
 PIPE_SEND_TIMEOUT = _float_env("PIPE_SEND_TIMEOUT", DEFAULT_PIPE_SEND_TIMEOUT)
 
-# Connection cap: bounds how many tunnels run concurrently, so an unbounded
-# flood of clients can't exhaust file descriptors / memory (see
-# .planning/known-shortcomings/findings.md). A connection over the cap just
-# waits for a slot to free up rather than being rejected outright.
+# Connection cap: bounds how many active proxy tunnels run concurrently.
+# Note: this limits active tunnels/sessions, not raw accepted socket file
+# descriptors, as connections exceeding the limit wait in the limiter's
+# acquire queue holding their open client socket until a slot frees up.
 DEFAULT_MAXCONNS = 1000
-MAXCONNS = _int_env("MAXCONNS", DEFAULT_MAXCONNS)
+MAXCONNS = _int_env("MAXCONNS", DEFAULT_MAXCONNS, min_val=1)
 CONN_LIMITER = trio.CapacityLimiter(MAXCONNS)
 
 DEFAULT_LOG_LEVEL = "INFO"
 LOG_LEVEL = getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
 
 HTTP_METHOD_CONNECT = b"CONNECT"
-HTTP_400_BAD_REQUEST = b"HTTP/1.1 400 Bad Request\r\n\r\n"
-HTTP_408_REQUEST_TIMEOUT = b"HTTP/1.1 408 Request Timeout\r\n\r\n"
-HTTP_414_URI_TOO_LONG = b"HTTP/1.1 414 URI Too Long\r\n\r\n"
-HTTP_429_TOO_MANY_REQUESTS = (
-    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n"
+HTTP_400_BAD_REQUEST = (
+    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
 )
-HTTP_502_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
-HTTP_503_SERVICE_UNAVAILABLE = b"HTTP/1.1 503 Service Unavailable\r\n\r\n"
-HTTP_504_GATEWAY_TIMEOUT = b"HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+HTTP_408_REQUEST_TIMEOUT = (
+    b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+)
+HTTP_414_URI_TOO_LONG = (
+    b"HTTP/1.1 414 URI Too Long\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+)
+RETRY_AFTER_SECS = _retry_after_seconds(DEFAULT_RATE_LIMIT_PERIOD)
+HTTP_429_TOO_MANY_REQUESTS = (
+    f"HTTP/1.1 429 Too Many Requests\r\nRetry-After: {RETRY_AFTER_SECS}\r\n"
+    f"Connection: close\r\nContent-Length: 0\r\n\r\n".encode()
+)
+HTTP_502_BAD_GATEWAY = (
+    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+)
+HTTP_503_SERVICE_UNAVAILABLE = b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+HTTP_504_GATEWAY_TIMEOUT = (
+    b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+)
 
 
 class ProxyProtocolError(ValueError):
@@ -200,6 +242,9 @@ _raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
 
+_DEFAULT_PROXY_CACHE_SENTINEL = object()
+
+
 async def http_proxy(
     client_stream,
     _nextid=_conn_ids.__next__,
@@ -207,74 +252,92 @@ async def http_proxy(
     idle_timeout=PIPE_IDLE_TIMEOUT,
     send_timeout=PIPE_SEND_TIMEOUT,
     limiter=CONN_LIMITER,
-    proxy_cache: ProxyCache | None = DEFAULT_PROXY_CACHE,
+    proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
+    if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
+        proxy_cache = DEFAULT_PROXY_CACHE
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
-    async with client_stream, limiter:
-        if proxy_cache is not None:
-            client_key = get_client_key(client_stream)
-            if client_key:
+    try:
+        async with client_stream, limiter:
+            if proxy_cache is not None:
                 try:
-                    await proxy_cache.check_rate_limit(client_key)
-                except RateLimitError:
-                    logger.warning(
-                        "Rate limit exceeded for %s, sending 429 to client...",
-                        client_key,
-                    )
-                    await client_stream.send_all(HTTP_429_TOO_MANY_REQUESTS)
+                    client_key = get_client_key(client_stream)
+                    if client_key:
+                        try:
+                            await proxy_cache.check_rate_limit(client_key)
+                        except RateLimitError:
+                            logger.warning(
+                                "Rate limit exceeded for %s, sending 429 to client...",
+                                client_key,
+                            )
+                            try:
+                                await client_stream.send_all(HTTP_429_TOO_MANY_REQUESTS)
+                            except trio.BrokenResourceError, trio.ClosedResourceError:
+                                pass
+                            return
+                except trio.BrokenResourceError, trio.ClosedResourceError:
+                    logger.info("Peer disconnected before rate limit check")
                     return
-        try:
-            dest_stream = await tunnel(
-                client_stream, _connect=_connect, proxy_cache=proxy_cache
-            )
-        except (
-            ValueError,
-            h11.ProtocolError,
-            OSError,
-            trio.TooSlowError,
-            CircuitBreakerOpen,
-        ):
-            # ValueError here covers ProxyProtocolError/RequestTooLargeError
-            # (both subclass it). No AssertionError: tunnel() no longer uses
-            # assert for request validation, so one reaching here would be a
-            # genuine bug, not a bad request -- let it fall through to the
-            # except* Exception handler below instead of being swallowed.
-            return  # tunnel() already logged and notified the client
-        try:
-            async with dest_stream, trio.open_nursery() as nursery:
-                nursery.start_soon(
-                    partial(
-                        pipe_with_timeout,
-                        client_stream,
-                        dest_stream,
-                        idle_timeout=idle_timeout,
-                        send_timeout=send_timeout,
-                    )
+                except Exception:
+                    logger.exception("Unexpected error in rate limiting check")
+
+            try:
+                dest_stream = await tunnel(
+                    client_stream, _connect=_connect, proxy_cache=proxy_cache
                 )
-                nursery.start_soon(
-                    partial(
-                        pipe_with_timeout,
-                        dest_stream,
-                        client_stream,
-                        idle_timeout=idle_timeout,
-                        send_timeout=send_timeout,
+            except (
+                ValueError,
+                h11.ProtocolError,
+                OSError,
+                trio.TooSlowError,
+                CircuitBreakerOpen,
+            ):
+                return
+            except trio.BrokenResourceError, trio.ClosedResourceError:
+                logger.info("Peer disconnected during handshake")
+                return
+
+            try:
+                async with dest_stream, trio.open_nursery() as nursery:
+                    nursery.start_soon(
+                        partial(
+                            pipe_with_timeout,
+                            client_stream,
+                            dest_stream,
+                            idle_timeout=idle_timeout,
+                            send_timeout=send_timeout,
+                        )
                     )
-                )
-        except* trio.BrokenResourceError, trio.ClosedResourceError:
-            logger.info("Peer disconnected")
-        except* trio.TooSlowError:
-            pass  # pipe() already logged the reason before raising
-        except* Exception:
-            logger.exception("Unexpected exception in connection handler")
+                    nursery.start_soon(
+                        partial(
+                            pipe_with_timeout,
+                            dest_stream,
+                            client_stream,
+                            idle_timeout=idle_timeout,
+                            send_timeout=send_timeout,
+                        )
+                    )
+            except* trio.BrokenResourceError, trio.ClosedResourceError:
+                logger.info("Peer disconnected")
+            except* trio.TooSlowError:
+                pass  # pipe() already logged the reason before raising
+            except* Exception:
+                logger.exception("Unexpected exception in connection handler")
+    except* trio.BrokenResourceError, trio.ClosedResourceError:
+        logger.info("Peer disconnected")
+    except* Exception:
+        logger.exception("Unexpected exception in connection handler")
 
 
 async def start_server(
     server=http_proxy,
     port=PORT,
     _serve=trio.serve_tcp,
-    proxy_cache: ProxyCache | None = DEFAULT_PROXY_CACHE,
+    proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
+    if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
+        proxy_cache = DEFAULT_PROXY_CACHE
     if proxy_cache is not None:
         proxy_cache.start()
     logger.info(
@@ -284,7 +347,7 @@ async def start_server(
     )
     try:
         await _serve(server, port)
-    except KeyboardInterrupt:
+    except* KeyboardInterrupt:
         logger.info("Goodbye for now.")
     finally:
         if proxy_cache is not None:
@@ -296,34 +359,52 @@ async def tunnel(
     _connect=trio.open_tcp_stream,
     read_timeout=CONNECT_READ_TIMEOUT,
     dest_connect_timeout=DEST_CONNECT_TIMEOUT,
-    proxy_cache: ProxyCache | None = DEFAULT_PROXY_CACHE,
+    proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
     """Given a stream from a client containing an HTTP CONNECT request,
     open a connection to the destination server specified in the CONNECT request,
     and notify the client when the end-to-end connection has been established.
-    Return the destination stream and the corresponding host.
+    Return the destination stream.
     """
+    if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
+        proxy_cache = DEFAULT_PROXY_CACHE
     try:
-        desthost, destport = await process_as_connect_request(
+        connect_res = await process_as_connect_request(
             client_stream, read_timeout=read_timeout
         )
+        if len(connect_res) == 3:
+            desthost, destport, trailing_data = connect_res
+        else:
+            desthost, destport = connect_res[0], connect_res[1]
+            trailing_data = b""
     except RequestTooLargeError:
         logger.warning(
             "Oversized CONNECT request, sending 414 to client...", exc_info=True
         )
-        await client_stream.send_all(HTTP_414_URI_TOO_LONG)
+        try:
+            await client_stream.send_all(HTTP_414_URI_TOO_LONG)
+        except trio.BrokenResourceError, trio.ClosedResourceError:
+            pass
         raise
     except ProxyProtocolError, h11.ProtocolError:
         logger.warning("Bad CONNECT request, sending 400 to client...", exc_info=True)
-        await client_stream.send_all(HTTP_400_BAD_REQUEST)
+        try:
+            await client_stream.send_all(HTTP_400_BAD_REQUEST)
+        except trio.BrokenResourceError, trio.ClosedResourceError:
+            pass
         raise
     except trio.TooSlowError:
         logger.warning(
             "CONNECT request took too long to arrive, sending 408 to client...",
             exc_info=True,
         )
-        await client_stream.send_all(HTTP_408_REQUEST_TIMEOUT)
+        try:
+            await client_stream.send_all(HTTP_408_REQUEST_TIMEOUT)
+        except trio.BrokenResourceError, trio.ClosedResourceError:
+            pass
         raise
+
+    CV_DESTHOST.set(desthost)
 
     if proxy_cache is not None:
         try:
@@ -334,56 +415,87 @@ async def tunnel(
                 desthost,
                 destport,
             )
-            await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+            try:
+                await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+            except trio.BrokenResourceError, trio.ClosedResourceError:
+                pass
             raise
 
     logger.info("Got CONNECT request for %s:%d, connecting...", desthost, destport)
 
-    target_host = desthost
+    target_hosts = [desthost]
     if proxy_cache is not None:
         try:
-            target_host = await proxy_cache.resolve_host(desthost)
+            if hasattr(proxy_cache, "resolve_hosts"):
+                target_hosts = await proxy_cache.resolve_hosts(desthost)
+            else:
+                resolved = await proxy_cache.resolve_host(desthost)
+                target_hosts = [resolved]
         except OSError as exc:
             if proxy_cache is not None:
                 await proxy_cache.record_connection_result(desthost, destport, exc)
-            logger.exception(
+            logger.warning(
                 "Could not resolve %s, sending 502 to client...",
                 desthost,
             )
-            await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+            try:
+                await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+            except trio.BrokenResourceError, trio.ClosedResourceError:
+                pass
             raise
 
-    try:
-        with trio.fail_after(dest_connect_timeout):
-            dest_stream = await _connect(target_host, destport)
-    except OSError as exc:
-        if proxy_cache is not None:
-            await proxy_cache.record_connection_result(desthost, destport, exc)
-        logger.exception(
-            "Could not connect to %s:%d, sending 502 to client...",
-            desthost,
-            destport,
-        )
-        await client_stream.send_all(HTTP_502_BAD_GATEWAY)
-        raise
-    except trio.TooSlowError as exc:
-        if proxy_cache is not None:
-            await proxy_cache.record_connection_result(desthost, destport, exc)
-        logger.exception(
-            "Timed out connecting to %s:%d, sending 504 to client...",
-            desthost,
-            destport,
-        )
-        await client_stream.send_all(HTTP_504_GATEWAY_TIMEOUT)
-        raise
+    dest_stream = None
+    last_exc: OSError | trio.TooSlowError | None = None
+    for host in target_hosts:
+        try:
+            with trio.fail_after(dest_connect_timeout):
+                dest_stream = await _connect(host, destport)
+            break
+        except OSError as exc:
+            last_exc = exc
+            continue
+        except trio.TooSlowError as exc:
+            last_exc = exc
+            break
+
+    if dest_stream is None:
+        if isinstance(last_exc, trio.TooSlowError):
+            if proxy_cache is not None:
+                await proxy_cache.record_connection_result(desthost, destport, last_exc)
+            logger.warning(
+                "Timed out connecting to %s:%d, sending 504 to client...",
+                desthost,
+                destport,
+            )
+            try:
+                await client_stream.send_all(HTTP_504_GATEWAY_TIMEOUT)
+            except trio.BrokenResourceError, trio.ClosedResourceError:
+                pass
+            raise last_exc
+        else:
+            if proxy_cache is not None:
+                await proxy_cache.record_connection_result(desthost, destport, last_exc)
+            logger.warning(
+                "Could not connect to %s:%d, sending 502 to client...",
+                desthost,
+                destport,
+            )
+            try:
+                await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+            except trio.BrokenResourceError, trio.ClosedResourceError:
+                pass
+            if last_exc is not None:
+                raise last_exc
+            raise OSError(f"Failed to connect to {desthost}:{destport}")
 
     if proxy_cache is not None:
         await proxy_cache.record_connection_result(desthost, destport, None)
 
     CV_DEST_STREAM.set(dest_stream)
-    CV_DESTHOST.set(desthost)
     logger.info("Connected to %s, sending 200 to client...", desthost)
     await client_stream.send_all(HTTP_200_CONNECTION_ESTABLISHED)
+    if trailing_data:
+        await dest_stream.send_all(trailing_data)
     logger.info("Sent 200 to client, tunnel established.")
     return dest_stream
 
@@ -392,30 +504,18 @@ async def process_as_connect_request(
     stream, bufmaxsz=BUFMAXSZ, maxreqsz=MAXREQSZ, read_timeout=CONNECT_READ_TIMEOUT
 ):
     """Read a stream expected to contain a valid HTTP CONNECT request to desthost:destport.
-    Parse and return the destination host. Validate (lightly) and raise if request invalid.
+    Parse and return (destination host, port, trailing_bytes). Validate (lightly) and raise if request invalid.
     See https://tools.ietf.org/html/rfc7231#section-4.3.6 for the CONNECT spec.
     Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout
     seconds -- guards against a slowloris-style client trickling bytes forever.
     """
     logger.debug("Reading...")
-    # h11's own request-line/header buffering ceiling defaults to 16384 bytes
-    # regardless of our maxreqsz. Left unset, a MAXREQSZ configured above
-    # 16384 doesn't just get mislabeled -- a legitimate request that's well
-    # within *our* configured limit gets rejected outright, since h11 raises
-    # its own RemoteProtocolError ("Receive buffer too long") once buffered-
-    # but-still-incomplete data passes 16384, before our check below ever
-    # gets a say. Tying the two together keeps h11's ceiling from being
-    # stricter than the one we actually promised.
     h11_conn = h11.Connection(our_role=h11.SERVER, max_incomplete_event_size=maxreqsz)
     total_bytes_read = 0
     with trio.fail_after(read_timeout):
         while (h11_nextevt := h11_conn.next_event()) == h11.NEED_DATA:
             bytes_read = await stream.receive_some(bufmaxsz)
             total_bytes_read += len(bytes_read)
-            # Checked (and raised) before receive_data() below, so h11 never
-            # sees a cumulative total >= maxreqsz -- which is also what keeps
-            # a *small* maxreqsz (tightening h11's ceiling below its 16384
-            # default) safe: our guard always wins the race, never h11's.
             if total_bytes_read >= maxreqsz:
                 raise RequestTooLargeError(f"Request did not fit in {maxreqsz} bytes")
             h11_conn.receive_data(bytes_read)
@@ -424,21 +524,8 @@ async def process_as_connect_request(
     if h11_nextevt.method != HTTP_METHOD_CONNECT:
         raise ProxyProtocolError(f"{h11_nextevt.method=} != CONNECT")
     target = h11_nextevt.target
-    # h11's request-target grammar (vchar = [\x21-\x7e]) is validated against
-    # the raw request line before a Request event is ever constructed -- an
-    # out-of-range byte here already raised h11.RemoteProtocolError upstream,
-    # caught by tunnel()'s h11.ProtocolError handler. So .decode() below can't
-    # raise UnicodeDecodeError; confirmed against h11's grammar and by direct
-    # reproduction, not assumed.
     decoded_target = target.decode()
-    # urlsplit handles bracketed IPv6 authorities (e.g. "[::1]:443") correctly;
-    # a naive split on the first ":" tears such addresses apart.
     parsed = urlsplit(f"//{decoded_target}")
-    # RFC 7231 4.3.6: a CONNECT request-target must be bare authority-form
-    # (host:port) -- no userinfo, path, query, or fragment. urlsplit() is lax
-    # about this and silently discards everything but host/port, so a
-    # smuggled path or "user:pass@" prefix must be rejected explicitly,
-    # before any parsed component is trusted.
     if (
         parsed.path
         or parsed.query
@@ -450,13 +537,17 @@ async def process_as_connect_request(
     try:
         desthost, destport = parsed.hostname, parsed.port
     except ValueError as e:
-        # parsed.port raises ValueError for a non-numeric port (e.g. "notaport").
         raise ProxyProtocolError(f"{target=} has an invalid port") from e
     if destport is None:
         raise ProxyProtocolError(f"{target=} missing port")
     if desthost is None:
         raise ProxyProtocolError(f"{target=} missing host")
-    return desthost, destport
+
+    trailing_data = b""
+    if h11_conn.trailing_data:
+        trailing_data = h11_conn.trailing_data[0]
+
+    return desthost, destport, trailing_data
 
 
 async def pipe(
@@ -469,6 +560,7 @@ async def pipe(
     (see pipe_with_timeout) by nudging a CancelScope's deadline forward on
     every sign of progress -- Trio's recommended pattern for timeouts,
     which keeps a reusable function like this one oblivious to them.
+    On EOF, calls to_stream.send_eof() if supported to signal half-close.
     """
     CV_PIPE_FROM.set(from_stream)
     while True:
@@ -481,6 +573,11 @@ async def pipe(
         if on_send is not None:
             on_send()
         logger.debug("Forwarded %d bytes", len(chunk))
+    if hasattr(to_stream, "send_eof"):
+        try:
+            await to_stream.send_eof()
+        except trio.BrokenResourceError, trio.ClosedResourceError:
+            pass
     logger.debug("Pipe finished")
 
 
@@ -499,7 +596,7 @@ async def pipe_with_timeout(
     caller, and nudges its deadline from pipe()'s on_receive/on_send hooks
     rather than making pipe() take a timeout= parameter of its own.
     """
-    phase = "idle"  # which of the two blocking calls the deadline is guarding
+    phase = "idle"
 
     def on_receive():
         nonlocal phase
@@ -523,9 +620,69 @@ async def pipe_with_timeout(
         raise trio.TooSlowError(f"Pipe {reason} for {timeout}s")
 
 
-if __name__ == "__main__":
+def main(args: list[str] | None = None) -> None:
+    import sys
+
+    if args is None:
+        args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print("Usage: trio_http_proxy [PORT]")
+        return
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
     trio.run(start_server)
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = [
+    "BUFMAXSZ",
+    "CONNECT_READ_TIMEOUT",
+    "CONN_LIMITER",
+    "CV_CLIENT_STREAM",
+    "CV_CONN_ID",
+    "CV_DESTHOST",
+    "CV_DEST_STREAM",
+    "CV_PIPE_FROM",
+    "DEFAULT_BUFFER_SIZE",
+    "DEFAULT_CONNECT_READ_TIMEOUT",
+    "DEFAULT_DEST_CONNECT_TIMEOUT",
+    "DEFAULT_LOG_LEVEL",
+    "DEFAULT_MAXCONNS",
+    "DEFAULT_MAXREQSZ",
+    "DEFAULT_PIPE_IDLE_TIMEOUT",
+    "DEFAULT_PIPE_SEND_TIMEOUT",
+    "DEFAULT_PORT",
+    "DEST_CONNECT_TIMEOUT",
+    "HTTP_200_CONNECTION_ESTABLISHED",
+    "HTTP_400_BAD_REQUEST",
+    "HTTP_408_REQUEST_TIMEOUT",
+    "HTTP_414_URI_TOO_LONG",
+    "HTTP_429_TOO_MANY_REQUESTS",
+    "HTTP_502_BAD_GATEWAY",
+    "HTTP_503_SERVICE_UNAVAILABLE",
+    "HTTP_504_GATEWAY_TIMEOUT",
+    "HTTP_METHOD_CONNECT",
+    "LOG_LEVEL",
+    "MAXCONNS",
+    "MAXREQSZ",
+    "PIPE_IDLE_TIMEOUT",
+    "PIPE_SEND_TIMEOUT",
+    "PORT",
+    "ConnectionFilter",
+    "ConnectionLoggerAdapter",
+    "ProxyProtocolError",
+    "RequestTooLargeError",
+    "format_conn_prefix",
+    "http_proxy",
+    "main",
+    "pipe",
+    "pipe_with_timeout",
+    "process_as_connect_request",
+    "start_server",
+    "tunnel",
+]

@@ -36,9 +36,10 @@ Everything lives in `src/trio_http_proxy/`:
 - `__init__.py`: Re-exports public symbols from `.proxy` and `.cache`.
 
 - `start_server` calls `trio.serve_tcp(http_proxy, port)` and manages the `proxy_cache` lifecycle. Each inbound TCP connection spawns `http_proxy` as its own Trio task.
-- `http_proxy(client_stream, proxy_cache=...)` is the per-connection entry point: it checks client rate limits, calls `tunnel()` to complete the CONNECT handshake, then runs two `pipe()` tasks concurrently in a nursery — one for each direction of the tunnel — so data flows client→dest and dest→client simultaneously until either side closes.
+- `http_proxy(client_stream, proxy_cache=...)` is the per-connection entry point: it checks client rate limits, calls `tunnel()` to complete the CONNECT handshake, then runs two `pipe_with_timeout()` tasks concurrently in a nursery — one for each direction of the tunnel — so data flows client→dest and dest→client simultaneously until either side closes or stalls.
 - `tunnel(client_stream, proxy_cache=...)` calls `process_as_connect_request()` (parses the CONNECT line via `h11`, in `h11.SERVER` role) to get the destination host/port, probes the destination circuit breaker, optionally resolves/caches destination IP via cashews, opens a TCP stream to it with `trio.open_tcp_stream`, records connection outcomes to the circuit breaker, and replies `200 Connection established` to the client. If circuit breaker is tripped, fast-fails with `502 Bad Gateway`.
-- `pipe(from_stream, to_stream)` just loops `async for chunk in from_stream: await to_stream.send_all(chunk)`.
+- `pipe(from_stream, to_stream)` forwards chunks until EOF, and sends EOF on destination if supported.
+- `pipe_with_timeout(from_stream, to_stream, ...)` wraps `pipe()` with idle and send timeouts.
 - Logging (`logger`) uses the standard library `logging` module. It is connection-aware via three `ContextVar`s (`CV_CLIENT_STREAM`, `CV_DEST_STREAM`, `CV_PIPE_FROM`) so that concurrent connections' log records are automatically prefixed with `[connN ...]` and enriched with structured attributes (`conn_id`, `desthost`, `direction`, `conn_prefix`). Each `client_stream` gets a sequential `.id` for this purpose (via the `_nextid` counter default arg on `http_proxy`).
 - Requires Python 3.14+ (see `pyproject.toml`).
 
@@ -47,6 +48,14 @@ Everything lives in `src/trio_http_proxy/`:
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | Proxy listen port |
+| `BUFMAXSZ` | `8192` | Maximum chunk read buffer size (bytes) |
+| `MAXREQSZ` | `16384` | Maximum CONNECT request header size (bytes) |
+| `CONNECT_READ_TIMEOUT` | `10.0` | Maximum time (seconds) to wait for complete CONNECT request |
+| `DEST_CONNECT_TIMEOUT` | `10.0` | Maximum time (seconds) to wait for destination TCP connect |
+| `PIPE_IDLE_TIMEOUT` | `300.0` | Inactivity timeout (seconds) closing idle tunnels |
+| `PIPE_SEND_TIMEOUT` | `30.0` | Stalled send timeout (seconds) closing blocked writes |
+| `MAXCONNS` | `1000` | Connection limiter capacity cap for concurrent tunnels |
+| `LOG_LEVEL` | `INFO` | Minimum log level (DEBUG, INFO, WARNING, ERROR) |
 | `CACHE_URL` | `mem://` | Cashews cache backend (`mem://`, `disk://...`, `redis://...`) |
 | `CACHE_ENABLED` | `true` | Enable or disable cashews caching entirely |
 | `DNS_CACHE_TTL` | `0s` | TTL for destination DNS resolution caching (`0s` = pass through to trio) |
@@ -58,3 +67,4 @@ Everything lives in `src/trio_http_proxy/`:
 | `RATE_LIMIT_ENABLED` | `false`| Enable client connection rate limiting |
 | `RATE_LIMIT` | `0` | Requests allowed per client IP within `RATE_LIMIT_PERIOD` (0 = unlimited) |
 | `RATE_LIMIT_PERIOD` | `60s` | Window for client rate limiting |
+| `RATE_LIMIT_TTL` | `60s` | Key expiry TTL for rate limiter in cashews |
