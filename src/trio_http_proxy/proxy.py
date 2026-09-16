@@ -19,6 +19,23 @@ from urllib.parse import urlsplit
 import h11
 import trio
 
+try:
+    from .cache import (
+        DEFAULT_PROXY_CACHE,
+        CircuitBreakerOpen,
+        ProxyCache,
+        RateLimitError,
+        get_client_key,
+    )
+except ImportError:
+    from trio_http_proxy.cache import (
+        DEFAULT_PROXY_CACHE,
+        CircuitBreakerOpen,
+        ProxyCache,
+        RateLimitError,
+        get_client_key,
+    )
+
 
 def _int_env(name, default, _getenv=getenv):
     return int(_getenv(name, default))
@@ -65,7 +82,11 @@ HTTP_METHOD_CONNECT = b"CONNECT"
 HTTP_400_BAD_REQUEST = b"HTTP/1.1 400 Bad Request\r\n\r\n"
 HTTP_408_REQUEST_TIMEOUT = b"HTTP/1.1 408 Request Timeout\r\n\r\n"
 HTTP_414_URI_TOO_LONG = b"HTTP/1.1 414 URI Too Long\r\n\r\n"
+HTTP_429_TOO_MANY_REQUESTS = (
+    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n"
+)
 HTTP_502_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+HTTP_503_SERVICE_UNAVAILABLE = b"HTTP/1.1 503 Service Unavailable\r\n\r\n"
 HTTP_504_GATEWAY_TIMEOUT = b"HTTP/1.1 504 Gateway Timeout\r\n\r\n"
 
 
@@ -186,13 +207,34 @@ async def http_proxy(
     idle_timeout=PIPE_IDLE_TIMEOUT,
     send_timeout=PIPE_SEND_TIMEOUT,
     limiter=CONN_LIMITER,
+    proxy_cache: ProxyCache | None = DEFAULT_PROXY_CACHE,
 ):
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
     async with client_stream, limiter:
+        if proxy_cache is not None:
+            client_key = get_client_key(client_stream)
+            if client_key:
+                try:
+                    await proxy_cache.check_rate_limit(client_key)
+                except RateLimitError:
+                    logger.warning(
+                        "Rate limit exceeded for %s, sending 429 to client...",
+                        client_key,
+                    )
+                    await client_stream.send_all(HTTP_429_TOO_MANY_REQUESTS)
+                    return
         try:
-            dest_stream = await tunnel(client_stream, _connect=_connect)
-        except ValueError, h11.ProtocolError, OSError, trio.TooSlowError:
+            dest_stream = await tunnel(
+                client_stream, _connect=_connect, proxy_cache=proxy_cache
+            )
+        except (
+            ValueError,
+            h11.ProtocolError,
+            OSError,
+            trio.TooSlowError,
+            CircuitBreakerOpen,
+        ):
             # ValueError here covers ProxyProtocolError/RequestTooLargeError
             # (both subclass it). No AssertionError: tunnel() no longer uses
             # assert for request validation, so one reaching here would be a
@@ -227,7 +269,14 @@ async def http_proxy(
             logger.exception("Unexpected exception in connection handler")
 
 
-async def start_server(server=http_proxy, port=PORT, _serve=trio.serve_tcp):
+async def start_server(
+    server=http_proxy,
+    port=PORT,
+    _serve=trio.serve_tcp,
+    proxy_cache: ProxyCache | None = DEFAULT_PROXY_CACHE,
+):
+    if proxy_cache is not None:
+        proxy_cache.start()
     logger.info(
         "* Starting %s on port %s...",
         server.__name__,
@@ -237,6 +286,9 @@ async def start_server(server=http_proxy, port=PORT, _serve=trio.serve_tcp):
         await _serve(server, port)
     except KeyboardInterrupt:
         logger.info("Goodbye for now.")
+    finally:
+        if proxy_cache is not None:
+            proxy_cache.stop()
 
 
 async def tunnel(
@@ -244,6 +296,7 @@ async def tunnel(
     _connect=trio.open_tcp_stream,
     read_timeout=CONNECT_READ_TIMEOUT,
     dest_connect_timeout=DEST_CONNECT_TIMEOUT,
+    proxy_cache: ProxyCache | None = DEFAULT_PROXY_CACHE,
 ):
     """Given a stream from a client containing an HTTP CONNECT request,
     open a connection to the destination server specified in the CONNECT request,
@@ -271,11 +324,41 @@ async def tunnel(
         )
         await client_stream.send_all(HTTP_408_REQUEST_TIMEOUT)
         raise
+
+    if proxy_cache is not None:
+        try:
+            await proxy_cache.check_circuit(desthost, destport)
+        except CircuitBreakerOpen:
+            logger.warning(
+                "Circuit breaker open for %s:%d, sending 502 to client...",
+                desthost,
+                destport,
+            )
+            await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+            raise
+
     logger.info("Got CONNECT request for %s:%d, connecting...", desthost, destport)
+
+    target_host = desthost
+    if proxy_cache is not None:
+        try:
+            target_host = await proxy_cache.resolve_host(desthost)
+        except OSError as exc:
+            if proxy_cache is not None:
+                await proxy_cache.record_connection_result(desthost, destport, exc)
+            logger.exception(
+                "Could not resolve %s, sending 502 to client...",
+                desthost,
+            )
+            await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+            raise
+
     try:
         with trio.fail_after(dest_connect_timeout):
-            dest_stream = await _connect(desthost, destport)
-    except OSError:
+            dest_stream = await _connect(target_host, destport)
+    except OSError as exc:
+        if proxy_cache is not None:
+            await proxy_cache.record_connection_result(desthost, destport, exc)
         logger.exception(
             "Could not connect to %s:%d, sending 502 to client...",
             desthost,
@@ -283,7 +366,9 @@ async def tunnel(
         )
         await client_stream.send_all(HTTP_502_BAD_GATEWAY)
         raise
-    except trio.TooSlowError:
+    except trio.TooSlowError as exc:
+        if proxy_cache is not None:
+            await proxy_cache.record_connection_result(desthost, destport, exc)
         logger.exception(
             "Timed out connecting to %s:%d, sending 504 to client...",
             desthost,
@@ -291,6 +376,10 @@ async def tunnel(
         )
         await client_stream.send_all(HTTP_504_GATEWAY_TIMEOUT)
         raise
+
+    if proxy_cache is not None:
+        await proxy_cache.record_connection_result(desthost, destport, None)
+
     CV_DEST_STREAM.set(dest_stream)
     CV_DESTHOST.set(desthost)
     logger.info("Connected to %s, sending 200 to client...", desthost)
