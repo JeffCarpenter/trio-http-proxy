@@ -268,7 +268,10 @@ class ProxyCache:
                 try:
                     await self.cache.close()
                 finally:
-                    loop.stop()
+                    try:
+                        await loop.shutdown_default_executor()
+                    finally:
+                        loop.stop()
 
             try:
                 loop.call_soon_threadsafe(lambda: loop.create_task(shutdown()))

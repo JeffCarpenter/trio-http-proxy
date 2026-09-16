@@ -147,6 +147,68 @@ async def test_stop_drains_pending_bridge_future_and_closes_captured_loop():
 
 
 @tt.trio_test
+async def test_stop_waits_for_blocked_default_executor_job():
+    started = threading.Event()
+    release = threading.Event()
+    captured_worker: list[threading.Thread] = []
+
+    def blocked_getaddrinfo(*args, **kwargs):
+        captured_worker.append(threading.current_thread())
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("test DNS lookup was not released")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+
+    cache = ProxyCache(cache_url="mem://", dns_cache_ttl="60s")
+    cache.start()
+    loop = cache._loop
+    bridge_thread = cache._thread
+    resolve_dns = cache._resolve_dns_fn
+    assert loop is not None and bridge_thread is not None and resolve_dns is not None
+
+    stop_done = threading.Event()
+    stop_error: list[BaseException] = []
+
+    def stop() -> None:
+        try:
+            cache.stop()
+        except BaseException as exc:  # noqa: BLE001
+            stop_error.append(exc)
+        finally:
+            stop_done.set()
+
+    stop_thread = threading.Thread(target=stop, daemon=True)
+    stop_started = False
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(socket, "getaddrinfo", blocked_getaddrinfo)
+            future = asyncio.run_coroutine_threadsafe(resolve_dns("blocked.test"), loop)
+            assert await trio.to_thread.run_sync(started.wait, 2)
+            stop_started = True
+            stop_thread.start()
+            await trio.sleep(0.1)
+            assert not stop_done.is_set()
+    finally:
+        release.set()
+        if stop_started:
+            stop_thread.join(timeout=3)
+        else:
+            cache.stop()
+
+    assert stop_done.is_set()
+    assert not stop_error
+    assert future.done()
+    assert captured_worker
+    worker = captured_worker[0]
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert not bridge_thread.is_alive()
+    assert loop.is_closed()
+    assert cache._thread is None
+    assert cache._loop is None
+
+
+@tt.trio_test
 async def test_stop_rejects_racing_submissions():
     cache = ProxyCache(cache_url="mem://")
     cache.start()
