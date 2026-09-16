@@ -6,8 +6,11 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import inspect
 import logging
+import re
 from collections.abc import MutableMapping
+from contextlib import nullcontext
 from contextvars import ContextVar
 from functools import partial
 from io import DEFAULT_BUFFER_SIZE
@@ -158,6 +161,10 @@ CV_PIPE_FROM: ContextVar[trio.SocketStream | None] = ContextVar(
 )
 CV_DESTHOST: ContextVar[str | None] = ContextVar("desthost", default=None)
 CV_CONN_ID: ContextVar[int | None] = ContextVar("conn_id", default=None)
+_DEFAULT_PROXY_CACHE_SENTINEL = object()
+CV_PROXY_CACHE: ContextVar[Any] = ContextVar(
+    "proxy_cache", default=_DEFAULT_PROXY_CACHE_SENTINEL
+)
 
 _conn_ids = count(1)
 
@@ -242,24 +249,26 @@ _raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
 
-_DEFAULT_PROXY_CACHE_SENTINEL = object()
-
-
 async def http_proxy(
     client_stream,
     _nextid=_conn_ids.__next__,
     _connect=trio.open_tcp_stream,
     idle_timeout=PIPE_IDLE_TIMEOUT,
     send_timeout=PIPE_SEND_TIMEOUT,
-    limiter=CONN_LIMITER,
+    limiter: trio.CapacityLimiter | None = CONN_LIMITER,
     proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
     if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
-        proxy_cache = DEFAULT_PROXY_CACHE
+        cv_cache = CV_PROXY_CACHE.get()
+        if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
+            proxy_cache = cv_cache
+        else:
+            proxy_cache = DEFAULT_PROXY_CACHE
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
+    limiter_ctx = limiter if limiter is not None else nullcontext()
     try:
-        async with client_stream, limiter:
+        async with client_stream, limiter_ctx:
             if proxy_cache is not None:
                 try:
                     client_key = get_client_key(client_stream)
@@ -273,10 +282,10 @@ async def http_proxy(
                             )
                             try:
                                 await client_stream.send_all(HTTP_429_TOO_MANY_REQUESTS)
-                            except trio.BrokenResourceError, trio.ClosedResourceError:
+                            except (trio.BrokenResourceError, trio.ClosedResourceError):
                                 pass
                             return
-                except trio.BrokenResourceError, trio.ClosedResourceError:
+                except (trio.BrokenResourceError, trio.ClosedResourceError):
                     logger.info("Peer disconnected before rate limit check")
                     return
                 except Exception:
@@ -294,7 +303,7 @@ async def http_proxy(
                 CircuitBreakerOpen,
             ):
                 return
-            except trio.BrokenResourceError, trio.ClosedResourceError:
+            except (trio.BrokenResourceError, trio.ClosedResourceError):
                 logger.info("Peer disconnected during handshake")
                 return
 
@@ -318,39 +327,132 @@ async def http_proxy(
                             send_timeout=send_timeout,
                         )
                     )
-            except* trio.BrokenResourceError, trio.ClosedResourceError:
+            except* (trio.BrokenResourceError, trio.ClosedResourceError):
                 logger.info("Peer disconnected")
             except* trio.TooSlowError:
                 pass  # pipe() already logged the reason before raising
             except* Exception:
                 logger.exception("Unexpected exception in connection handler")
-    except* trio.BrokenResourceError, trio.ClosedResourceError:
+    except* (trio.BrokenResourceError, trio.ClosedResourceError):
         logger.info("Peer disconnected")
     except* Exception:
         logger.exception("Unexpected exception in connection handler")
 
 
+async def _serve_one_listener_gated(
+    listener: trio.SocketListener,
+    handler_nursery: trio.Nursery,
+    handler: Any,
+    limiter: trio.CapacityLimiter,
+) -> None:
+    async with listener:
+        while True:
+            if hasattr(listener, "socket"):
+                await trio.lowlevel.wait_readable(listener.socket)
+            token = object()
+            await limiter.acquire_on_behalf_of(token)
+            try:
+                stream = await listener.accept()
+            except BaseException:
+                limiter.release_on_behalf_of(token)
+                raise
+            handler_nursery.start_soon(
+                _run_gated_handler, stream, handler, limiter, token
+            )
+
+
+async def _run_gated_handler(
+    stream: trio.SocketStream,
+    handler: Any,
+    limiter: trio.CapacityLimiter,
+    token: object,
+) -> None:
+    try:
+        async with stream:
+            await handler(stream)
+    except* (trio.BrokenResourceError, trio.ClosedResourceError):
+        logger.info("Peer disconnected")
+    except* Exception:
+        logger.exception("Unexpected exception in connection handler")
+    finally:
+        limiter.release_on_behalf_of(token)
+
+
+async def _serve_tcp_gated(
+    handler: Any,
+    port: int,
+    *,
+    host: str | bytes | None = None,
+    backlog: int | None = None,
+    limiter: trio.CapacityLimiter = CONN_LIMITER,
+    listeners: list[trio.SocketListener] | None = None,
+    task_status: trio.TaskStatus[list[trio.SocketListener]] = trio.TASK_STATUS_IGNORED,
+) -> None:
+    if listeners is None:
+        listeners = await trio.open_tcp_listeners(port, host=host, backlog=backlog)
+    async with trio.open_nursery() as nursery:
+        for listener in listeners:
+            nursery.start_soon(
+                _serve_one_listener_gated, listener, nursery, handler, limiter
+            )
+        task_status.started(listeners)
+
+
 async def start_server(
     server=http_proxy,
     port=PORT,
-    _serve=trio.serve_tcp,
+    _serve=None,
     proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
+    limiter: trio.CapacityLimiter | None = CONN_LIMITER,
+    task_status: trio.TaskStatus[Any] = trio.TASK_STATUS_IGNORED,
 ):
     if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
         proxy_cache = DEFAULT_PROXY_CACHE
-    if proxy_cache is not None:
+    CV_PROXY_CACHE.set(proxy_cache)
+    if proxy_cache is not None and hasattr(proxy_cache, "start"):
         proxy_cache.start()
     logger.info(
         "* Starting %s on port %s...",
-        server.__name__,
+        getattr(server, "__name__", str(server)),
         port or "(OS-selected port)",
     )
+
+    handler = server
+    if server is http_proxy:
+        handler = partial(
+            http_proxy,
+            limiter=None if _serve is None else limiter,
+            proxy_cache=proxy_cache,
+        )
+    else:
+        try:
+            sig = inspect.signature(server)
+            if "proxy_cache" in sig.parameters:
+                handler = partial(server, proxy_cache=proxy_cache)
+        except (ValueError, TypeError):
+            pass
+
     try:
-        await _serve(server, port)
+        if _serve is not None:
+            try:
+                sig = inspect.signature(_serve)
+                if "task_status" in sig.parameters:
+                    await _serve(handler, port, task_status=task_status)
+                else:
+                    await _serve(handler, port)
+            except (ValueError, TypeError):
+                await _serve(handler, port)
+        else:
+            await _serve_tcp_gated(
+                handler,
+                port,
+                limiter=limiter if limiter is not None else CONN_LIMITER,
+                task_status=task_status,
+            )
     except* KeyboardInterrupt:
         logger.info("Goodbye for now.")
     finally:
-        if proxy_cache is not None:
+        if proxy_cache is not None and hasattr(proxy_cache, "stop"):
             proxy_cache.stop()
 
 
@@ -367,7 +469,11 @@ async def tunnel(
     Return the destination stream.
     """
     if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
-        proxy_cache = DEFAULT_PROXY_CACHE
+        cv_cache = CV_PROXY_CACHE.get()
+        if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
+            proxy_cache = cv_cache
+        else:
+            proxy_cache = DEFAULT_PROXY_CACHE
     try:
         connect_res = await process_as_connect_request(
             client_stream, read_timeout=read_timeout
@@ -383,14 +489,14 @@ async def tunnel(
         )
         try:
             await client_stream.send_all(HTTP_414_URI_TOO_LONG)
-        except trio.BrokenResourceError, trio.ClosedResourceError:
+        except (trio.BrokenResourceError, trio.ClosedResourceError):
             pass
         raise
-    except ProxyProtocolError, h11.ProtocolError:
+    except (ProxyProtocolError, h11.ProtocolError):
         logger.warning("Bad CONNECT request, sending 400 to client...", exc_info=True)
         try:
             await client_stream.send_all(HTTP_400_BAD_REQUEST)
-        except trio.BrokenResourceError, trio.ClosedResourceError:
+        except (trio.BrokenResourceError, trio.ClosedResourceError):
             pass
         raise
     except trio.TooSlowError:
@@ -400,7 +506,7 @@ async def tunnel(
         )
         try:
             await client_stream.send_all(HTTP_408_REQUEST_TIMEOUT)
-        except trio.BrokenResourceError, trio.ClosedResourceError:
+        except (trio.BrokenResourceError, trio.ClosedResourceError):
             pass
         raise
 
@@ -417,7 +523,7 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(HTTP_502_BAD_GATEWAY)
-            except trio.BrokenResourceError, trio.ClosedResourceError:
+            except (trio.BrokenResourceError, trio.ClosedResourceError):
                 pass
             raise
 
@@ -440,15 +546,24 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(HTTP_502_BAD_GATEWAY)
-            except trio.BrokenResourceError, trio.ClosedResourceError:
+            except (trio.BrokenResourceError, trio.ClosedResourceError):
                 pass
             raise
 
     dest_stream = None
     last_exc: OSError | trio.TooSlowError | None = None
-    for host in target_hosts:
+    overall_deadline = trio.current_time() + dest_connect_timeout
+
+    for i, host in enumerate(target_hosts):
+        time_left = overall_deadline - trio.current_time()
+        if time_left <= 0:
+            last_exc = trio.TooSlowError("Overall connect timeout exceeded")
+            break
+        rem = len(target_hosts) - i
+        per_host_timeout = time_left / rem if rem > 1 else time_left
+
         try:
-            with trio.fail_after(dest_connect_timeout):
+            with trio.fail_after(per_host_timeout):
                 dest_stream = await _connect(host, destport)
             break
         except OSError as exc:
@@ -456,7 +571,7 @@ async def tunnel(
             continue
         except trio.TooSlowError as exc:
             last_exc = exc
-            break
+            continue
 
     if dest_stream is None:
         if isinstance(last_exc, trio.TooSlowError):
@@ -469,7 +584,7 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(HTTP_504_GATEWAY_TIMEOUT)
-            except trio.BrokenResourceError, trio.ClosedResourceError:
+            except (trio.BrokenResourceError, trio.ClosedResourceError):
                 pass
             raise last_exc
         else:
@@ -482,22 +597,26 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(HTTP_502_BAD_GATEWAY)
-            except trio.BrokenResourceError, trio.ClosedResourceError:
+            except (trio.BrokenResourceError, trio.ClosedResourceError):
                 pass
             if last_exc is not None:
                 raise last_exc
             raise OSError(f"Failed to connect to {desthost}:{destport}")
 
-    if proxy_cache is not None:
-        await proxy_cache.record_connection_result(desthost, destport, None)
+    try:
+        if proxy_cache is not None:
+            await proxy_cache.record_connection_result(desthost, destport, None)
 
-    CV_DEST_STREAM.set(dest_stream)
-    logger.info("Connected to %s, sending 200 to client...", desthost)
-    await client_stream.send_all(HTTP_200_CONNECTION_ESTABLISHED)
-    if trailing_data:
-        await dest_stream.send_all(trailing_data)
-    logger.info("Sent 200 to client, tunnel established.")
-    return dest_stream
+        CV_DEST_STREAM.set(dest_stream)
+        logger.info("Connected to %s, sending 200 to client...", desthost)
+        await client_stream.send_all(HTTP_200_CONNECTION_ESTABLISHED)
+        if trailing_data:
+            await dest_stream.send_all(trailing_data)
+        logger.info("Sent 200 to client, tunnel established.")
+        return dest_stream
+    except BaseException:
+        await dest_stream.aclose()
+        raise
 
 
 async def process_as_connect_request(
@@ -510,22 +629,48 @@ async def process_as_connect_request(
     seconds -- guards against a slowloris-style client trickling bytes forever.
     """
     logger.debug("Reading...")
-    h11_conn = h11.Connection(our_role=h11.SERVER, max_incomplete_event_size=maxreqsz)
-    total_bytes_read = 0
+    raw_buf = bytearray()
     with trio.fail_after(read_timeout):
-        while (h11_nextevt := h11_conn.next_event()) == h11.NEED_DATA:
-            bytes_read = await stream.receive_some(bufmaxsz)
-            total_bytes_read += len(bytes_read)
-            if total_bytes_read >= maxreqsz:
+        while True:
+            match = re.search(rb"\n\r?\n", raw_buf)
+            if match is not None:
+                header_len = match.end()
+                if header_len > maxreqsz:
+                    raise RequestTooLargeError(
+                        f"Request did not fit in {maxreqsz} bytes"
+                    )
+                break
+            if len(raw_buf) >= maxreqsz:
                 raise RequestTooLargeError(f"Request did not fit in {maxreqsz} bytes")
-            h11_conn.receive_data(bytes_read)
+
+            chunk = await stream.receive_some(bufmaxsz)
+            if not chunk:
+                break
+            raw_buf.extend(chunk)
+
+    h11_conn = h11.Connection(
+        our_role=h11.SERVER, max_incomplete_event_size=max(maxreqsz, len(raw_buf))
+    )
+    h11_conn.receive_data(bytes(raw_buf))
+    if not raw_buf or not re.search(rb"\n\r?\n", raw_buf):
+        h11_conn.receive_data(b"")
+    h11_nextevt = h11_conn.next_event()
+
     if not isinstance(h11_nextevt, h11.Request):
         raise ProxyProtocolError(f"{h11_nextevt=} is not a h11.Request")
     if h11_nextevt.method != HTTP_METHOD_CONNECT:
         raise ProxyProtocolError(f"{h11_nextevt.method=} != CONNECT")
     target = h11_nextevt.target
-    decoded_target = target.decode()
-    parsed = urlsplit(f"//{decoded_target}")
+    try:
+        decoded_target = target.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ProxyProtocolError(f"{target=} contains invalid octets") from exc
+
+    try:
+        parsed = urlsplit(f"//{decoded_target}")
+    except ValueError as exc:
+        raise ProxyProtocolError(f"{target=} is not a valid authority") from exc
+
     if (
         parsed.path
         or parsed.query
@@ -648,6 +793,7 @@ __all__ = [
     "CV_DESTHOST",
     "CV_DEST_STREAM",
     "CV_PIPE_FROM",
+    "CV_PROXY_CACHE",
     "DEFAULT_BUFFER_SIZE",
     "DEFAULT_CONNECT_READ_TIMEOUT",
     "DEFAULT_DEST_CONNECT_TIMEOUT",
