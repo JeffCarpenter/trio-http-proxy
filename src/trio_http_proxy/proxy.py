@@ -26,6 +26,7 @@ import trio
 from .cache import (
     DEFAULT_PROXY_CACHE,
     DEFAULT_RATE_LIMIT_PERIOD,
+    CacheBackendUnavailable,
     CircuitBreakerOpen,
     RateLimitError,
     get_client_key,
@@ -134,6 +135,27 @@ HTTP_503_SERVICE_UNAVAILABLE = b"HTTP/1.1 503 Service Unavailable\r\nConnection:
 HTTP_504_GATEWAY_TIMEOUT = (
     b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
 )
+
+
+def _http_429_response(retry_after: Any = None) -> bytes:
+    """Build a rate-limit response using the rejection's expiry metadata."""
+    for value in (
+        getattr(retry_after, "retry_after_seconds", None),
+        getattr(retry_after, "retry_after", None),
+        retry_after,
+    ):
+        if value is None:
+            continue
+        try:
+            seconds = int(value)
+        except TypeError, ValueError:
+            continue
+        if seconds >= 1:
+            return (
+                f"HTTP/1.1 429 Too Many Requests\r\nRetry-After: {seconds}\r\n"
+                f"Connection: close\r\nContent-Length: 0\r\n\r\n"
+            ).encode()
+    return HTTP_429_TOO_MANY_REQUESTS
 
 
 class ProxyProtocolError(ValueError):
@@ -276,17 +298,26 @@ async def http_proxy(
                     if client_key:
                         try:
                             await proxy_cache.check_rate_limit(client_key)
-                        except RateLimitError:
+                        except RateLimitError as exc:
                             logger.warning(
                                 "Rate limit exceeded for %s, sending 429 to client...",
                                 client_key,
                             )
                             try:
-                                await client_stream.send_all(HTTP_429_TOO_MANY_REQUESTS)
-                            except (trio.BrokenResourceError, trio.ClosedResourceError):
+                                await client_stream.send_all(_http_429_response(exc))
+                            except trio.BrokenResourceError, trio.ClosedResourceError:
                                 pass
                             return
-                except (trio.BrokenResourceError, trio.ClosedResourceError):
+                except CacheBackendUnavailable:
+                    logger.warning(
+                        "Cache backend unavailable during rate limit check, sending 503 to client..."
+                    )
+                    try:
+                        await client_stream.send_all(HTTP_503_SERVICE_UNAVAILABLE)
+                    except trio.BrokenResourceError, trio.ClosedResourceError:
+                        pass
+                    return
+                except trio.BrokenResourceError, trio.ClosedResourceError:
                     logger.info("Peer disconnected before rate limit check")
                     return
                 except Exception:
@@ -296,6 +327,15 @@ async def http_proxy(
                 dest_stream = await tunnel(
                     client_stream, _connect=_connect, proxy_cache=proxy_cache
                 )
+            except CacheBackendUnavailable:
+                logger.warning(
+                    "Cache backend unavailable during tunnel, sending 503 to client..."
+                )
+                try:
+                    await client_stream.send_all(HTTP_503_SERVICE_UNAVAILABLE)
+                except trio.BrokenResourceError, trio.ClosedResourceError:
+                    pass
+                return
             except (
                 ValueError,
                 h11.ProtocolError,
@@ -304,7 +344,7 @@ async def http_proxy(
                 CircuitBreakerOpen,
             ):
                 return
-            except (trio.BrokenResourceError, trio.ClosedResourceError):
+            except trio.BrokenResourceError, trio.ClosedResourceError:
                 logger.info("Peer disconnected during handshake")
                 return
 
@@ -328,13 +368,13 @@ async def http_proxy(
                             send_timeout=send_timeout,
                         )
                     )
-            except* (trio.BrokenResourceError, trio.ClosedResourceError):
+            except* trio.BrokenResourceError, trio.ClosedResourceError:
                 logger.info("Peer disconnected")
             except* trio.TooSlowError:
                 pass  # pipe() already logged the reason before raising
             except* Exception:
                 logger.exception("Unexpected exception in connection handler")
-    except* (trio.BrokenResourceError, trio.ClosedResourceError):
+    except* trio.BrokenResourceError, trio.ClosedResourceError:
         logger.info("Peer disconnected")
     except* Exception:
         logger.exception("Unexpected exception in connection handler")
@@ -395,7 +435,7 @@ async def _run_gated_handler(
     try:
         async with stream:
             await handler(stream)
-    except* (trio.BrokenResourceError, trio.ClosedResourceError):
+    except* trio.BrokenResourceError, trio.ClosedResourceError:
         logger.info("Peer disconnected")
     except* Exception:
         logger.exception("Unexpected exception in connection handler")
@@ -455,7 +495,7 @@ async def start_server(
                 sig = inspect.signature(server)
                 if "proxy_cache" in sig.parameters:
                     handler = partial(server, proxy_cache=proxy_cache)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 pass
 
         try:
@@ -466,7 +506,7 @@ async def start_server(
                         await _serve(handler, port, task_status=task_status)
                     else:
                         await _serve(handler, port)
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     await _serve(handler, port)
             else:
                 await _serve_tcp_gated(
@@ -518,14 +558,14 @@ async def tunnel(
         )
         try:
             await client_stream.send_all(HTTP_414_URI_TOO_LONG)
-        except (trio.BrokenResourceError, trio.ClosedResourceError):
+        except trio.BrokenResourceError, trio.ClosedResourceError:
             pass
         raise
-    except (ProxyProtocolError, h11.ProtocolError):
+    except ProxyProtocolError, h11.ProtocolError:
         logger.warning("Bad CONNECT request, sending 400 to client...", exc_info=True)
         try:
             await client_stream.send_all(HTTP_400_BAD_REQUEST)
-        except (trio.BrokenResourceError, trio.ClosedResourceError):
+        except trio.BrokenResourceError, trio.ClosedResourceError:
             pass
         raise
     except trio.TooSlowError:
@@ -535,7 +575,7 @@ async def tunnel(
         )
         try:
             await client_stream.send_all(HTTP_408_REQUEST_TIMEOUT)
-        except (trio.BrokenResourceError, trio.ClosedResourceError):
+        except trio.BrokenResourceError, trio.ClosedResourceError:
             pass
         raise
 
@@ -552,7 +592,7 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(HTTP_502_BAD_GATEWAY)
-            except (trio.BrokenResourceError, trio.ClosedResourceError):
+            except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             raise
 
@@ -575,7 +615,7 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(HTTP_502_BAD_GATEWAY)
-            except (trio.BrokenResourceError, trio.ClosedResourceError):
+            except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             raise
 
@@ -613,7 +653,7 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(HTTP_504_GATEWAY_TIMEOUT)
-            except (trio.BrokenResourceError, trio.ClosedResourceError):
+            except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             raise last_exc
         else:
@@ -626,7 +666,7 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(HTTP_502_BAD_GATEWAY)
-            except (trio.BrokenResourceError, trio.ClosedResourceError):
+            except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             if last_exc is not None:
                 raise last_exc
@@ -717,9 +757,7 @@ async def process_as_connect_request(
     if desthost is None:
         raise ProxyProtocolError(f"{target=} missing host")
 
-    trailing_data = b""
-    if h11_conn.trailing_data:
-        trailing_data = h11_conn.trailing_data[0]
+    trailing_data, _ = h11_conn.trailing_data
 
     return desthost, destport, trailing_data
 

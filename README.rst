@@ -4,8 +4,7 @@ trio_http_proxy.py
 Simple HTTP CONNECT proxy implemented with
 `Trio <https://trio.readthedocs.io>`__.
 
-Tested with Python 3.12 and Trio 0.25.0
-(but other versions probably work too).
+Requires Python 3.14 or newer.
 
 
 Why
@@ -102,6 +101,28 @@ Instructions
 #. When you're done, just hit Ctrl+C to kill the server.
    Don't forget to restore any proxy settings you changed
    to how they were set before.
+
+
+Configuration
+-------------
+
+Configuration is read from environment variables:
+
+* ``CACHE_FAILURE_POLICY`` accepts ``fail-open`` (the default) and
+  ``fail-closed``.  With ``fail-open``, a cache backend outage disables cache
+  features and proxy operations continue without the cache.  With
+  ``fail-closed``, a cache backend outage is reported to the HTTP client as
+  ``503 Service Unavailable``.
+* When rate limiting rejects a request, ``Retry-After`` reports the live
+  remaining rate-limit expiry.  It is not always the configured
+  ``RATE_LIMIT_PERIOD``; a safe value of at least one second is used when the
+  backend does not provide expiry metadata.
+* ``MAXREQSZ`` (default ``16384``) is an inclusive limit for the complete
+  CONNECT header.  A header exactly this size is accepted.  Only bytes through
+  the header terminator count toward this limit; bytes after the header do not.
+* ``MAXCONNS`` (default ``1000``) gates admission before socket accept when the
+  server starts.  It bounds the accepted client socket and handler population;
+  clients beyond the limit wait before being accepted.
 
 
 For a one-liner test that only requires one shell session, run:
