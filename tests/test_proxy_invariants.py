@@ -1,3 +1,4 @@
+import errno
 from functools import partial
 from typing import Any, cast
 
@@ -62,6 +63,42 @@ async def test_invariant_1_start_server_uses_exact_custom_proxy_cache():
     assert custom_cache.started is True
     assert custom_cache.stopped is True
     assert custom_cache.checked_rate_limit is True
+
+
+@tt.trio_test
+async def test_invariant_1_start_server_resets_cache_context_after_shutdown(monkeypatch):
+    """A stopped custom cache is not reused by later defaulted calls."""
+    custom_cache = type("CustomCache", (), {"start": lambda self: None, "stop": lambda self: None})()
+    fallback_cache: Any = type("FallbackCache", (), {})()
+    checks = []
+
+    async def check_rate_limit(client_key):
+        checks.append(client_key)
+
+    fallback_cache.check_rate_limit = check_rate_limit
+    monkeypatch.setattr(proxy, "DEFAULT_PROXY_CACHE", fallback_cache)
+
+    async def fake_serve(handler, port):
+        return None
+
+    await proxy.start_server(
+        server=proxy.http_proxy,
+        port=0,
+        _serve=fake_serve,
+        proxy_cache=custom_cache,
+    )
+
+    proxy_client, test_client = tt.memory_stream_pair()
+
+    class FakeSocket:
+        def getpeername(self):
+            return ("127.0.0.1", 12345)
+
+    cast(Any, proxy_client).socket = FakeSocket()
+    await test_client.send_all(b"GARBAGE\r\n\r\n")
+    await proxy.http_proxy(proxy_client)
+
+    assert checks == ["127.0.0.1"]
 
 
 @tt.trio_test
@@ -252,6 +289,18 @@ async def test_invariant_6_invalid_target_octets_yields_400():
 
 
 @tt.trio_test
+async def test_invariant_6_non_ascii_target_octet_yields_400():
+    """A literal non-ASCII request-target octet yields deterministic HTTP 400."""
+    proxy_client, test_client = tt.memory_stream_pair()
+
+    await test_client.send_all(connect_request(target=b"\xff:443"))
+    await proxy.http_proxy(proxy_client, proxy_cache=None)
+
+    response = await test_client.receive_some(4096)
+    assert response == proxy.HTTP_400_BAD_REQUEST
+
+
+@tt.trio_test
 async def test_invariant_6_malformed_host_octets_yields_400():
     """Target with invalid brackets or unparseable host yields deterministic HTTP 400."""
     proxy_client, test_client = tt.memory_stream_pair()
@@ -337,3 +386,179 @@ async def test_invariant_7_overall_connect_timeout_bounded(mock_clock):
 
     elapsed = trio.current_time() - start_time
     assert elapsed <= dest_timeout + 0.01
+
+
+@tt.trio_test
+async def test_invariant_2_limiter_token_turns_over_after_handler_finishes():
+    """A completed handler releases admission for the next accepted stream."""
+    limiter = trio.CapacityLimiter(1)
+    streams = [tt.memory_stream_pair()[0] for _ in range(2)]
+    handler_finished = trio.Event()
+
+    class FakeListener:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        async def accept(self):
+            if self.calls >= len(streams):
+                await trio.sleep_forever()
+            stream = streams[self.calls]
+            self.calls += 1
+            return stream
+
+    listener = FakeListener()
+
+    async def handler(stream):
+        await trio.lowlevel.checkpoint()
+        if listener.calls >= 2:
+            handler_finished.set()
+
+    async with trio.open_nursery() as nursery:
+        await nursery.start(
+            partial(
+                proxy._serve_tcp_gated,
+                handler,
+                0,
+                limiter=limiter,
+                listeners=cast(Any, [listener]),
+            )
+        )
+        await handler_finished.wait()
+        assert listener.calls == 2
+        # The loop has admitted the second stream after the first handler
+        # released its token. It is now blocked in the next accept.
+        assert limiter.borrowed_tokens == 1
+        nursery.cancel_scope.cancel()
+
+    assert limiter.borrowed_tokens == 0
+
+
+@tt.trio_test
+async def test_invariant_2_limiter_token_released_when_accept_loop_cancelled():
+    """Shutdown while accept is blocked releases the reserved admission token."""
+    limiter = trio.CapacityLimiter(1)
+    accept_started = trio.Event()
+
+    class FakeListener:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        async def accept(self):
+            accept_started.set()
+            await trio.sleep_forever()
+
+    async def handler(stream):
+        raise AssertionError("no stream should be accepted")
+
+    listener = FakeListener()
+    async with trio.open_nursery() as nursery:
+        await nursery.start(
+            partial(
+                proxy._serve_tcp_gated,
+                handler,
+                0,
+                limiter=limiter,
+                listeners=cast(Any, [listener]),
+            )
+        )
+        await accept_started.wait()
+        assert limiter.borrowed_tokens == 1
+        nursery.cancel_scope.cancel()
+
+    assert limiter.borrowed_tokens == 0
+
+
+@tt.trio_test
+async def test_invariant_2_failed_handler_start_closes_stream_and_releases_token():
+    """A failed handler task admission closes its stream and returns capacity."""
+    limiter = trio.CapacityLimiter(1)
+
+    class FakeStream:
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    class FakeListener:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        async def accept(self):
+            return stream
+
+    class FailingNursery:
+        def start_soon(self, *args):
+            raise RuntimeError("nursery is shutting down")
+
+    stream = FakeStream()
+    with pytest.raises(RuntimeError, match="nursery is shutting down"):
+        await proxy._serve_one_listener_gated(
+            cast(Any, FakeListener()),
+            cast(Any, FailingNursery()),
+            lambda _stream: None,
+            limiter,
+        )
+
+    assert stream.closed is True
+    assert limiter.borrowed_tokens == 0
+
+
+@pytest.mark.parametrize("accept_errno", [errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM])
+@tt.trio_test
+async def test_invariant_2_transient_accept_errors_retry(accept_errno, caplog, mock_clock):
+    """Transient accept resource errors release capacity, sleep, and retry."""
+    limiter = trio.CapacityLimiter(1)
+    stream = tt.memory_stream_pair()[0]
+    accepted = trio.Event()
+
+    class FakeListener:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        async def accept(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError(accept_errno, "temporary resource exhaustion")
+            return stream
+
+    listener = FakeListener()
+
+    async def handler(_stream):
+        accepted.set()
+        await trio.sleep_forever()
+
+    async with trio.open_nursery() as nursery:
+        await nursery.start(
+            partial(
+                proxy._serve_tcp_gated,
+                handler,
+                0,
+                limiter=limiter,
+                listeners=cast(Any, [listener]),
+            )
+        )
+        await accepted.wait()
+        assert listener.calls == 2
+        assert limiter.borrowed_tokens == 1
+        nursery.cancel_scope.cancel()
+
+    assert limiter.borrowed_tokens == 0
+    assert f"accept returned {errno.errorcode[accept_errno]}" in caplog.text
