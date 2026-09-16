@@ -1,0 +1,144 @@
+Testing made easier with ``trio.testing``
+=========================================
+
+.. module:: trio.testing
+
+The :mod:`trio.testing` module provides various utilities to make it
+easier to test Trio code. Unlike the other submodules in the
+:mod:`trio` namespace, :mod:`trio.testing` is *not* automatically
+imported when you do ``import trio``; you must ``import trio.testing``
+explicitly.
+
+
+Test harness integration
+------------------------
+
+.. decorator:: trio_test
+
+
+.. _testing-time:
+
+Time and timeouts
+-----------------
+
+:class:`trio.testing.MockClock` is a :class:`~trio.abc.Clock` with a
+few tricks up its sleeve to help you efficiently test code involving
+timeouts:
+
+* By default, it starts at time 0, and clock time only advances when
+  you explicitly call :meth:`~MockClock.jump`. This provides an
+  extremely controllable clock for testing.
+
+* You can set :attr:`~MockClock.rate` to 1.0 if you want it to start
+  running in real time like a regular clock. You can stop and start
+  the clock within a test. You can set :attr:`~MockClock.rate` to 10.0
+  to make clock time pass at 10x real speed (so e.g. ``await
+  trio.sleep(10)`` returns after 1 second).
+
+* But even more interestingly, you can set
+  :attr:`~MockClock.autojump_threshold` to zero or a small value, and
+  then it will watch the execution of the run loop, and any time
+  things have settled down and everyone's waiting for a timeout, it
+  jumps the clock forward to that timeout. In many cases this allows
+  natural-looking code involving timeouts to be automatically run at
+  near full CPU utilization with no changes. (Thanks to `fluxcapacitor
+  <https://github.com/majek/fluxcapacitor>`__ for this awesome idea.)
+
+* And of course these can be mixed and matched at will.
+
+Regardless of these shenanigans, from "inside" Trio the passage of time
+still seems normal so long as you restrict yourself to Trio's time
+functions (see :ref:`time-and-clocks`). Below is an example
+demonstrating two different ways of making time pass quickly. Notice
+how in both cases, the two tasks keep a consistent view of reality and
+events happen in the expected order, despite being wildly divorced
+from real time: ```python
+# across-realtime.py
+
+import time
+import trio
+import trio.testing
+
+YEAR = 365 * 24 * 60 * 60  # seconds
+
+
+async def task1():
+    start = trio.current_time()
+
+    print("task1: sleeping for 1 year")
+    await trio.sleep(YEAR)
+
+    duration = trio.current_time() - start
+    print(f"task1: woke up; clock says I've slept {duration / YEAR} years")
+
+    print("task1: sleeping for 1 year, 100 times")
+    for _ in range(100):
+        await trio.sleep(YEAR)
+
+    duration = trio.current_time() - start
+    print(f"task1: slept {duration / YEAR} years total")
+
+
+async def task2():
+    start = trio.current_time()
+
+    print("task2: sleeping for 5 years")
+    await trio.sleep(5 * YEAR)
+
+    duration = trio.current_time() - start
+    print(f"task2: woke up; clock says I've slept {duration / YEAR} years")
+
+    print("task2: sleeping for 500 years")
+    await trio.sleep(500 * YEAR)
+
+    duration = trio.current_time() - start
+    print(f"task2: slept {duration / YEAR} years total")
+
+
+async def main():
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(task1)
+        nursery.start_soon(task2)
+
+
+def run_example(clock):
+    real_start = time.perf_counter()
+    trio.run(main, clock=clock)
+    real_duration = time.perf_counter() - real_start
+    print(f"Total real time elapsed: {real_duration} seconds")
+
+
+print("Clock where time passes at 100 years per second:\n")
+run_example(trio.testing.MockClock(rate=100 * YEAR))
+
+print("\nClock where time automatically skips past the boring parts:\n")
+run_example(trio.testing.MockClock(autojump_threshold=0))
+```
+
+Output: ```
+Clock where time passes at 100 years per second:
+
+task2: sleeping for 5 years
+task1: sleeping for 1 year
+task1: woke up; clock says I've slept 1.0365006048232317 years
+task1: sleeping for 1 year, 100 times
+task2: woke up; clock says I've slept 5.0572111969813704 years
+task2: sleeping for 500 years
+task1: slept 104.77677842136472 years total
+task2: slept 505.25014589075 years total
+Total real time elapsed: 5.053582429885864 seconds
+
+Clock where time automatically skips past the boring parts:
+
+task2: sleeping for 5 years
+task1: sleeping for 1 year
+task1: woke up; clock says I've slept 1.0 years
+task1: sleeping for 1 year, 100 times
+task2: woke up; clock says I've slept 5.0 years
+task2: sleeping for 500 years
+task1: slept 101.0 years total
+task2: slept 505.0 years total
+Total real time elapsed: 0.019298791885375977 seconds
+```
+
+Call `pydoc trio.testing.MockClock` for more information
