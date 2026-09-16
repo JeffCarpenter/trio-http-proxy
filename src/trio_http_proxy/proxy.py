@@ -6,6 +6,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import errno
 import inspect
 import logging
 import re
@@ -15,7 +16,7 @@ from contextvars import ContextVar
 from functools import partial
 from io import DEFAULT_BUFFER_SIZE
 from itertools import count
-from os import getenv
+from os import getenv, strerror
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -353,12 +354,36 @@ async def _serve_one_listener_gated(
             await limiter.acquire_on_behalf_of(token)
             try:
                 stream = await listener.accept()
+            except OSError as exc:
+                limiter.release_on_behalf_of(token)
+                if exc.errno in {
+                    errno.EMFILE,
+                    errno.ENFILE,
+                    errno.ENOBUFS,
+                    errno.ENOMEM,
+                }:
+                    logger.exception(
+                        "accept returned %s (%s); retrying in %s seconds",
+                        errno.errorcode[exc.errno],
+                        strerror(exc.errno),
+                        0.1,
+                    )
+                    await trio.sleep(0.1)
+                    continue
+                raise
             except BaseException:
                 limiter.release_on_behalf_of(token)
                 raise
-            handler_nursery.start_soon(
-                _run_gated_handler, stream, handler, limiter, token
-            )
+            try:
+                handler_nursery.start_soon(
+                    _run_gated_handler, stream, handler, limiter, token
+                )
+            except BaseException:
+                try:
+                    await trio.aclose_forcefully(stream)
+                finally:
+                    limiter.release_on_behalf_of(token)
+                raise
 
 
 async def _run_gated_handler(
@@ -408,52 +433,56 @@ async def start_server(
 ):
     if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
         proxy_cache = DEFAULT_PROXY_CACHE
-    CV_PROXY_CACHE.set(proxy_cache)
-    if proxy_cache is not None and hasattr(proxy_cache, "start"):
-        proxy_cache.start()
-    logger.info(
-        "* Starting %s on port %s...",
-        getattr(server, "__name__", str(server)),
-        port or "(OS-selected port)",
-    )
-
-    handler = server
-    if server is http_proxy:
-        handler = partial(
-            http_proxy,
-            limiter=None if _serve is None else limiter,
-            proxy_cache=proxy_cache,
-        )
-    else:
-        try:
-            sig = inspect.signature(server)
-            if "proxy_cache" in sig.parameters:
-                handler = partial(server, proxy_cache=proxy_cache)
-        except (ValueError, TypeError):
-            pass
-
+    cache_token = CV_PROXY_CACHE.set(proxy_cache)
     try:
-        if _serve is not None:
-            try:
-                sig = inspect.signature(_serve)
-                if "task_status" in sig.parameters:
-                    await _serve(handler, port, task_status=task_status)
-                else:
-                    await _serve(handler, port)
-            except (ValueError, TypeError):
-                await _serve(handler, port)
-        else:
-            await _serve_tcp_gated(
-                handler,
-                port,
-                limiter=limiter if limiter is not None else CONN_LIMITER,
-                task_status=task_status,
+        if proxy_cache is not None and hasattr(proxy_cache, "start"):
+            proxy_cache.start()
+        logger.info(
+            "* Starting %s on port %s...",
+            getattr(server, "__name__", str(server)),
+            port or "(OS-selected port)",
+        )
+
+        handler = server
+        if server is http_proxy:
+            handler = partial(
+                http_proxy,
+                limiter=None if _serve is None else limiter,
+                proxy_cache=proxy_cache,
             )
-    except* KeyboardInterrupt:
-        logger.info("Goodbye for now.")
+        else:
+            try:
+                sig = inspect.signature(server)
+                if "proxy_cache" in sig.parameters:
+                    handler = partial(server, proxy_cache=proxy_cache)
+            except (ValueError, TypeError):
+                pass
+
+        try:
+            if _serve is not None:
+                try:
+                    sig = inspect.signature(_serve)
+                    if "task_status" in sig.parameters:
+                        await _serve(handler, port, task_status=task_status)
+                    else:
+                        await _serve(handler, port)
+                except (ValueError, TypeError):
+                    await _serve(handler, port)
+            else:
+                await _serve_tcp_gated(
+                    handler,
+                    port,
+                    limiter=limiter if limiter is not None else CONN_LIMITER,
+                    task_status=task_status,
+                )
+        except* KeyboardInterrupt:
+            logger.info("Goodbye for now.")
     finally:
-        if proxy_cache is not None and hasattr(proxy_cache, "stop"):
-            proxy_cache.stop()
+        try:
+            if proxy_cache is not None and hasattr(proxy_cache, "stop"):
+                proxy_cache.stop()
+        finally:
+            CV_PROXY_CACHE.reset(cache_token)
 
 
 async def tunnel(
