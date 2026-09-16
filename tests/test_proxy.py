@@ -44,6 +44,11 @@ def _enable_log_capture(caplog):
     caplog.set_level(logging.DEBUG)
 
 
+@pytest.fixture(autouse=True)
+def _disable_cache_in_proxy_tests(monkeypatch):
+    monkeypatch.setattr(proxy, "DEFAULT_PROXY_CACHE", None)
+
+
 # ---------------------------------------------------------------------------
 # process_as_connect_request
 # ---------------------------------------------------------------------------
@@ -53,7 +58,7 @@ def _enable_log_capture(caplog):
 async def test_process_as_connect_request_success():
     server, client = tt.memory_stream_pair()
     await client.send_all(connect_request())
-    host, port = await proxy.process_as_connect_request(server)
+    host, port, _ = await proxy.process_as_connect_request(server)
     assert (host, port) == ("example.com", 443)
 
 
@@ -80,7 +85,7 @@ async def test_process_as_connect_request_chunked_across_multiple_reads():
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(trickle)
-        host, port = await proxy.process_as_connect_request(server)
+        host, port, _ = await proxy.process_as_connect_request(server)
 
     assert (host, port) == ("example.com", 443)
     # Confirms the trickle actually forced multiple receive_some() calls,
@@ -134,7 +139,7 @@ async def test_process_as_connect_request_honors_maxreqsz_above_h11_default():
     assert len(req) > 16384 + 100
     await client.send_all(req)
     first_read_size = 16384 + 100  # > h11's default ceiling, still incomplete
-    host, port = await proxy.process_as_connect_request(
+    host, port, _ = await proxy.process_as_connect_request(
         server, bufmaxsz=first_read_size, maxreqsz=20000
     )
     assert (host, port) == (long_host, 443)
@@ -179,8 +184,8 @@ async def test_process_as_connect_request_rejects_partial_then_eof():
 async def test_process_as_connect_request_ignores_trailing_bytes_after_headers():
     server, client = tt.memory_stream_pair()
     await client.send_all(connect_request(extra=b"leftover garbage"))
-    host, port = await proxy.process_as_connect_request(server)
-    assert (host, port) == ("example.com", 443)
+    host, port, trailing = await proxy.process_as_connect_request(server)
+    assert (host, port, trailing) == ("example.com", 443, b"leftover garbage")
 
 
 @tt.trio_test
@@ -190,7 +195,7 @@ async def test_process_as_connect_request_supports_bracketed_ipv6_target():
     # itself, so splitting on the first colon tears the address apart.
     server, client = tt.memory_stream_pair()
     await client.send_all(connect_request(target=b"[::1]:443"))
-    host, port = await proxy.process_as_connect_request(server)
+    host, port, _ = await proxy.process_as_connect_request(server)
     assert (host, port) == ("::1", 443)
 
 
@@ -198,7 +203,7 @@ async def test_process_as_connect_request_supports_bracketed_ipv6_target():
 async def test_process_as_connect_request_supports_full_ipv6_target():
     server, client = tt.memory_stream_pair()
     await client.send_all(connect_request(target=b"[2001:db8::1]:8443"))
-    host, port = await proxy.process_as_connect_request(server)
+    host, port, _ = await proxy.process_as_connect_request(server)
     assert (host, port) == ("2001:db8::1", 8443)
 
 
@@ -290,7 +295,7 @@ async def test_tunnel_bad_request_sends_400_and_raises_without_connecting():
 
     assert called is False
     reply = await test_client.receive_some(4096)
-    assert reply == b"HTTP/1.1 400 Bad Request\r\n\r\n"
+    assert reply == proxy.HTTP_400_BAD_REQUEST
 
 
 @tt.trio_test
@@ -305,7 +310,7 @@ async def test_tunnel_connect_failure_sends_502_and_raises():
         await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     reply = await test_client.receive_some(4096)
-    assert reply == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+    assert reply == proxy.HTTP_502_BAD_GATEWAY
 
 
 @tt.trio_test
@@ -327,7 +332,7 @@ async def test_tunnel_times_out_reading_connect_request_sends_408(mock_clock):
 
     assert called is False
     reply = await test_client.receive_some(4096)
-    assert reply == b"HTTP/1.1 408 Request Timeout\r\n\r\n"
+    assert reply == proxy.HTTP_408_REQUEST_TIMEOUT
 
 
 @tt.trio_test
@@ -346,7 +351,7 @@ async def test_tunnel_times_out_connecting_to_dest_sends_504(mock_clock):
     assert not watchdog.cancelled_caught, "proxy never gave up on the slow destination"
 
     reply = await test_client.receive_some(4096)
-    assert reply == b"HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+    assert reply == proxy.HTTP_504_GATEWAY_TIMEOUT
 
 
 @tt.trio_test
@@ -365,7 +370,7 @@ async def test_tunnel_rejects_non_numeric_port_sends_400():
         await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     reply = await test_client.receive_some(4096)
-    assert reply == b"HTTP/1.1 400 Bad Request\r\n\r\n"
+    assert reply == proxy.HTTP_400_BAD_REQUEST
 
 
 @tt.trio_test
@@ -386,7 +391,7 @@ async def test_tunnel_oversized_request_sends_414_not_bare_400():
         await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     reply = await test_client.receive_some(4096)
-    assert reply == b"HTTP/1.1 414 URI Too Long\r\n\r\n"
+    assert reply == proxy.HTTP_414_URI_TOO_LONG
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +729,7 @@ async def test_http_proxy_bad_request_sends_400_and_closes_quietly():
         )
         await test_client.send_all(b"not a valid request\r\n\r\n")
         reply = await test_client.receive_some(4096)
-        assert reply == b"HTTP/1.1 400 Bad Request\r\n\r\n"
+        assert reply == proxy.HTTP_400_BAD_REQUEST
         remainder = await test_client.receive_some(4096)
         assert remainder == b""
 
@@ -744,7 +749,7 @@ async def test_http_proxy_dest_connect_failure_sends_502_and_closes_quietly():
         )
         await test_client.send_all(connect_request(target=b"example.com:443"))
         reply = await test_client.receive_some(4096)
-        assert reply == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+        assert reply == proxy.HTTP_502_BAD_GATEWAY
         remainder = await test_client.receive_some(4096)
         assert remainder == b""
 
@@ -988,12 +993,12 @@ async def test_http_proxy_releases_limiter_slot_when_connection_completes():
         await test_client2.send_all(connect_request())
 
         reply1 = await test_client1.receive_some(4096)
-        assert reply1 == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+        assert reply1 == proxy.HTTP_502_BAD_GATEWAY
 
         # conn1 released the limiter on its way out, so conn2 -- which was
         # parked waiting for a slot -- can now proceed.
         reply2 = await test_client2.receive_some(4096)
-        assert reply2 == b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+        assert reply2 == proxy.HTTP_502_BAD_GATEWAY
 
     assert connect2_started is True
 
@@ -1319,9 +1324,8 @@ async def test_tunnel_logs_exception_on_dest_connect_failure(caplog):
         await proxy.tunnel(proxy_client, _connect=fake_connect)
 
     rec = next(r for r in caplog.records if "Could not connect to" in r.message)
-    assert rec.levelname == "ERROR"
-    assert rec.exc_info is not None
-    assert rec.exc_info[0] is OSError
+    assert rec.levelname == "WARNING"
+    assert rec.exc_info is None or rec.exc_info is False
 
 
 @tt.trio_test
@@ -1336,8 +1340,8 @@ async def test_tunnel_logs_exception_on_dest_connect_timeout(caplog, mock_clock)
         await proxy.tunnel(proxy_client, _connect=hang, dest_connect_timeout=1)
 
     rec = next(r for r in caplog.records if "Timed out connecting to" in r.message)
-    assert rec.levelname == "ERROR"
-    assert rec.exc_info is not None
+    assert rec.levelname == "WARNING"
+    assert rec.exc_info is None or rec.exc_info is False
 
 
 @tt.trio_test
