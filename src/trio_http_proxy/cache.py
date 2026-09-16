@@ -1,14 +1,16 @@
 import asyncio
 import ipaddress
 import logging
+import math
 import socket
 import threading
 from collections.abc import Callable, Coroutine
 from os import getenv
-from typing import Any, Self, TypeVar
+from typing import Any, Self, TypeVar, cast
 
+import cashews
 import trio
-from cashews import Cache, CircuitBreakerOpen, RateLimitError
+from cashews import Cache, CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,40 @@ DEFAULT_RATE_LIMIT_PERIOD = getenv("RATE_LIMIT_PERIOD", "60s")
 DEFAULT_RATE_LIMIT_TTL = getenv("RATE_LIMIT_TTL", "60s")
 
 
+def _failure_policy(value: str) -> str:
+    value = value.strip().lower()
+    if value not in {"fail-open", "fail-closed"}:
+        raise ValueError(
+            "CACHE_FAILURE_POLICY must be either 'fail-open' or 'fail-closed'"
+        )
+    return value
+
+
+CACHE_FAILURE_POLICY = _failure_policy(getenv("CACHE_FAILURE_POLICY", "fail-open"))
+DEFAULT_CACHE_FAILURE_POLICY = CACHE_FAILURE_POLICY
+
+
+class CacheBackendUnavailable(RuntimeError):
+    """The configured cache backend could not service an operation."""
+
+
+class RateLimitError(cashews.RateLimitError):
+    """Rate-limit rejection with an optional HTTP Retry-After value."""
+
+    def __init__(
+        self,
+        *args: Any,
+        retry_after: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.retry_after = retry_after
+
+    @property
+    def retry_after_seconds(self) -> int | None:
+        return self.retry_after
+
+
 class ProxyCache:
     """Bridges cashews caching, circuit breaking, and rate limiting to Trio.
 
@@ -87,6 +123,8 @@ class ProxyCache:
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_limit_period: str = DEFAULT_RATE_LIMIT_PERIOD,
         rate_limit_ttl: str = DEFAULT_RATE_LIMIT_TTL,
+        failure_policy: str = CACHE_FAILURE_POLICY,
+        cache_failure_policy: str | None = None,
     ) -> None:
         self.cache_url = cache_url
         self.enabled = enabled
@@ -100,6 +138,10 @@ class ProxyCache:
         self.rate_limit = rate_limit
         self.rate_limit_period = rate_limit_period
         self.rate_limit_ttl = rate_limit_ttl
+        if cache_failure_policy is not None:
+            failure_policy = cache_failure_policy
+        self.failure_policy = _failure_policy(failure_policy)
+        self.cache_failure_policy = self.failure_policy
 
         self.cache = Cache(name="trio_http_proxy")
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -108,6 +150,8 @@ class ProxyCache:
         self._lock = threading.Lock()
         self._started = False
         self._stopped = False
+        self._stopping = False
+        self._stop_complete = threading.Event()
 
         self._resolve_dns_fn: Callable[[str], Coroutine[Any, Any, list[str]]] | None = (
             None
@@ -119,10 +163,15 @@ class ProxyCache:
 
     def start(self) -> None:
         """Start the background asyncio bridge thread and configure cashews."""
+        setup_error: Exception | None = None
+        stop_parts: (
+            tuple[asyncio.AbstractEventLoop | None, threading.Thread | None] | None
+        ) = None
         with self._lock:
             if self._started:
                 return
             self._stopped = False
+            self._stopping = False
             if not self.enabled or not self.cache_url:
                 self._started = True
                 return
@@ -146,38 +195,110 @@ class ProxyCache:
             self._ready.wait()
 
             try:
+                # setup is deliberately performed here: tests and callers can
+                # distinguish backend setup failure from lazy backend failures.
                 self.cache.setup(self.cache_url)
                 self._register_decorators()
-            except Exception:
+            except Exception as exc:
+                setup_error = exc
                 logger.exception(
                     "Failed to setup cashews cache with %s", self.cache_url
                 )
-                self._teardown_thread()
-                raise
+                self._stopped = True
+                self._started = False
+                stop_parts = self._begin_stop_locked()
+            else:
+                self._started = True
 
-            self._started = True
+        if setup_error is not None:
+            assert stop_parts is not None
+            self._finish_stop(*stop_parts)
+            if self.cache_failure_policy == "fail-open":
+                self._disable_cache_features()
+                with self._lock:
+                    self._stopped = False
+                    self._started = True
+                return
+            raise CacheBackendUnavailable(
+                f"Unable to setup cache backend {self.cache_url!r}"
+            ) from setup_error
 
     def stop(self) -> None:
-        """Gracefully stop cashews and the background asyncio bridge thread."""
+        """Stop the bridge, draining pending work before closing its loop."""
         with self._lock:
-            if not self._started and not self._stopped:
+            if self._stopping:
+                done = self._stop_complete
+                parts = None
+            elif not self._started and self._loop is None and self._thread is None:
+                self._stopped = True
                 return
-            self._stopped = True
-            self._teardown_thread()
-            self._started = False
+            else:
+                self._stopped = True
+                self._started = False
+                parts = self._begin_stop_locked()
+                done = self._stop_complete
 
-    def _teardown_thread(self) -> None:
-        if self._loop and self._loop.is_running():
+        if parts is None:
+            if not done.wait(2.0):
+                raise RuntimeError("Timed out stopping ProxyCache bridge")
+            return
+        self._finish_stop(*parts)
+
+    def _begin_stop_locked(
+        self,
+    ) -> tuple[asyncio.AbstractEventLoop | None, threading.Thread | None]:
+        self._stopping = True
+        self._stop_complete.clear()
+        return self._loop, self._thread
+
+    def _finish_stop(
+        self, loop: asyncio.AbstractEventLoop | None, thread: threading.Thread | None
+    ) -> None:
+        if loop is not None and not loop.is_closed():
+
+            async def shutdown() -> None:
+                current = asyncio.current_task()
+                pending = [
+                    task for task in asyncio.all_tasks(loop) if task is not current
+                ]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                try:
+                    await self.cache.close()
+                finally:
+                    loop.stop()
+
             try:
-                fut = asyncio.run_coroutine_threadsafe(self.cache.close(), self._loop)
-                fut.result(timeout=2.0)
-            except Exception:
-                logger.debug("Exception closing cashews cache", exc_info=True)
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            if self._thread:
-                self._thread.join(timeout=2.0)
-        self._loop = None
-        self._thread = None
+                loop.call_soon_threadsafe(lambda: loop.create_task(shutdown()))
+            except RuntimeError:
+                pass
+
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        alive = thread is not None and thread.is_alive()
+        open_loop = loop is not None and not loop.is_closed()
+        with self._lock:
+            self._stopping = False
+            if not alive and not open_loop:
+                self._stop_complete.set()
+                if self._thread is thread:
+                    self._thread = None
+                if self._loop is loop:
+                    self._loop = None
+                self._resolve_dns_fn = None
+                self._circuit_probe_fn = None
+                self._rate_limiter_fn = None
+        if alive:
+            # Keep references intact so a later stop can retry; daemon status
+            # does not prove that the bridge terminated.
+            raise RuntimeError("Timed out stopping ProxyCache bridge")
+        if open_loop:
+            raise RuntimeError("ProxyCache bridge loop did not close")
+
+    def _disable_cache_features(self) -> None:
+        self.enabled = False
         self._resolve_dns_fn = None
         self._circuit_probe_fn = None
         self._rate_limiter_fn = None
@@ -193,7 +314,12 @@ class ProxyCache:
         try:
             self._ensure_started()
             with self._lock:
-                if self._stopped or not self._loop or not self._loop.is_running():
+                if (
+                    self._stopped
+                    or self._stopping
+                    or not self._loop
+                    or not self._loop.is_running()
+                ):
                     raise RuntimeError("Asyncio bridge event loop is not running")
                 fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         except Exception:
@@ -212,15 +338,15 @@ class ProxyCache:
         timeout: float = 10.0,
         **kwargs: Any,
     ) -> T:
-        """Execute an asyncio coroutine function on the bridge from within Trio.
-
-        Uses cross-thread signaling via trio.from_thread.run_sync instead of
-        burning a worker thread in Trio's thread pool limiter. Supports clean
-        cancellation and timeouts.
-        """
+        """Execute an asyncio coroutine function on the bridge from within Trio."""
         self._ensure_started()
         with self._lock:
-            if self._stopped or not self._loop or not self._loop.is_running():
+            if (
+                self._stopped
+                or self._stopping
+                or not self._loop
+                or not self._loop.is_running()
+            ):
                 raise RuntimeError("Asyncio bridge event loop is not running")
             coro = coro_fn(*args, **kwargs)
             try:
@@ -258,16 +384,24 @@ class ProxyCache:
             async def _resolve_dns(host: str) -> list[str]:
                 if self._loop is None:
                     raise RuntimeError("Event loop is not initialized")
-                addr_infos = await self._loop.run_in_executor(
-                    None,
-                    socket.getaddrinfo,
-                    host,
-                    None,
-                    socket.AF_UNSPEC,
-                    socket.SOCK_STREAM,
-                )
+                try:
+                    addr_infos = await self._loop.run_in_executor(
+                        None,
+                        socket.getaddrinfo,
+                        host,
+                        None,
+                        socket.AF_UNSPEC,
+                        socket.SOCK_STREAM,
+                    )
+                except OSError as exc:
+                    # Keep destination lookup failures distinguishable from an
+                    # OSError raised by a cache backend.
+                    cast(Any, exc)._trio_http_proxy_dns_error = True
+                    raise
                 if not addr_infos:
-                    raise OSError(f"Name resolution failed for {host}")
+                    exc = OSError(f"Name resolution failed for {host}")
+                    cast(Any, exc)._trio_http_proxy_dns_error = True
+                    raise exc
                 seen: set[str] = set()
                 ips: list[str] = []
                 for info in addr_infos:
@@ -318,29 +452,44 @@ class ProxyCache:
         else:
             self._rate_limiter_fn = None
 
-    async def resolve_hosts(self, host: str) -> list[str]:
-        """Resolve a destination host to a list of IP addresses, with cashews caching.
+    def _backend_error(self, operation: str, exc: Exception) -> CacheBackendUnavailable:
+        return CacheBackendUnavailable(
+            f"Cache backend failed during {operation}: {exc}"
+        )
 
-        If the host is already an IP literal or DNS caching is disabled, returns [host].
-        """
+    def _handle_backend_failure(self, operation: str, exc: Exception) -> None:
+        if self._stopped:
+            raise exc
+        if self.cache_failure_policy == "fail-open":
+            self._disable_cache_features()
+            return
+        raise self._backend_error(operation, exc) from exc
+
+    async def resolve_hosts(self, host: str) -> list[str]:
+        """Resolve a destination host, bypassing cache on fail-open outages."""
         self._ensure_started()
         if not self.enabled or self._resolve_dns_fn is None:
             return [host]
 
-        # Check if already an IP literal
         try:
             ipaddress.ip_address(host.strip("[]"))
             return [host]
         except ValueError:
             pass
 
-        return await self.run(self._resolve_dns_fn, host)
+        try:
+            return await self.run(self._resolve_dns_fn, host)
+        except Exception as exc:
+            if isinstance(exc, OSError) and (
+                isinstance(exc, socket.gaierror)
+                or getattr(exc, "_trio_http_proxy_dns_error", False)
+            ):
+                raise
+            self._handle_backend_failure("DNS resolution", exc)
+            return [host]
 
     async def resolve_host(self, host: str) -> str:
-        """Resolve a destination host to a single IP string, with cashews caching.
-
-        If multiple IPs are resolved, returns the first one.
-        """
+        """Resolve a destination host to one IP string."""
         hosts = await self.resolve_hosts(host)
         return hosts[0] if hosts else host
 
@@ -352,48 +501,69 @@ class ProxyCache:
         )
 
     async def check_circuit(self, host: str, port: int) -> None:
-        """Verify the circuit for (host, port) is not open.
-
-        Inspects the circuit breaker state without registering a call count or
-        falsely recording a success. Raises CircuitBreakerOpen if open.
-        """
+        """Verify that the destination circuit is not open."""
         self._ensure_started()
         if not self.enabled or not self.circuit_breaker_enabled:
             return
-        is_open = await self.run(self._is_circuit_open, host, port)
+        try:
+            is_open = await self.run(self._is_circuit_open, host, port)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_backend_failure("circuit breaker", exc)
+            return
         if is_open:
             raise CircuitBreakerOpen()
 
     async def record_connection_result(
         self, host: str, port: int, exc: Exception | None = None
     ) -> None:
-        """Record success or failure of a connection attempt in the circuit breaker.
-
-        Swallows exceptions so recording never interferes with caller error handling.
-        """
+        """Record a connection result without masking destination errors."""
         self._ensure_started()
         if not self.enabled or self._circuit_probe_fn is None:
             return
         try:
             await self.run(self._circuit_probe_fn, host, port, exc)
-        except Exception, CircuitBreakerOpen:  # noqa: BLE001, S110
+        except CircuitBreakerOpen:
             pass
+        except Exception as backend_exc:  # noqa: BLE001
+            # The exception supplied by the caller is the expected circuit
+            # recording result, not a cache backend outage.
+            if exc is not None and backend_exc is exc:
+                return
+            self._handle_backend_failure("circuit breaker", backend_exc)
 
     async def check_rate_limit(self, key: str) -> None:
-        """Verify the given key has not exceeded the configured rate limit.
-
-        Raises RateLimitError if exceeded.
-        """
+        """Verify a key's quota and attach its exact backend expiry on rejection."""
         self._ensure_started()
         if not self.enabled or self._rate_limiter_fn is None:
             return
-        await self.run(self._rate_limiter_fn, key)
+        try:
+            await self.run(self._rate_limiter_fn, key)
+        except RateLimitError:
+            raise
+        except cashews.RateLimitError as exc:
+            expiry_key = f"rate_limit:rl:{key}"
+            try:
+                expiry = await self.run(self.cache.get_expire, expiry_key)
+            except Exception as backend_exc:  # noqa: BLE001
+                self._handle_backend_failure("rate-limit expiry", backend_exc)
+                return
+            try:
+                retry_after = max(1, math.ceil(float(expiry)))
+            except TypeError, ValueError:
+                retry_after = 1
+            raise RateLimitError(retry_after=retry_after) from exc
+        except Exception as exc:  # noqa: BLE001
+            self._handle_backend_failure("rate limiting", exc)
 
     async def clear(self) -> None:
         """Clear all entries in the cache."""
         self._ensure_started()
-        if self.enabled:
+        if not self.enabled:
+            return
+        try:
             await self.run(self.cache.clear)
+        except Exception as exc:  # noqa: BLE001
+            self._handle_backend_failure("cache clear", exc)
 
     def __enter__(self) -> Self:
         self.start()
@@ -432,7 +602,9 @@ def get_client_key(stream: Any) -> str | None:
 DEFAULT_PROXY_CACHE = ProxyCache()
 
 __all__ = [
+    "CACHE_FAILURE_POLICY",
     "DEFAULT_CACHE_ENABLED",
+    "DEFAULT_CACHE_FAILURE_POLICY",
     "DEFAULT_CACHE_URL",
     "DEFAULT_CIRCUIT_BREAKER_ENABLED",
     "DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE",
@@ -445,6 +617,7 @@ __all__ = [
     "DEFAULT_RATE_LIMIT_ENABLED",
     "DEFAULT_RATE_LIMIT_PERIOD",
     "DEFAULT_RATE_LIMIT_TTL",
+    "CacheBackendUnavailable",
     "CircuitBreakerOpen",
     "ProxyCache",
     "RateLimitError",
