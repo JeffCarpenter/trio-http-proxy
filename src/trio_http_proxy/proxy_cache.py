@@ -1,5 +1,8 @@
+"""ProxyCache implementation bridging cashews, circuit breaking, and rate limiting."""
+
+from __future__ import annotations
+
 import asyncio
-import enum
 import ipaddress
 import logging
 import math
@@ -8,7 +11,6 @@ import re
 import socket
 import threading
 import time
-from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine
 from os import getenv
 from typing import Any, Self, TypeVar, cast
@@ -18,22 +20,18 @@ import trio
 from cashews import Cache, CircuitBreakerOpen
 from cashews.ttl import TTL, ttl_to_seconds
 
-from trio_http_proxy.util import redact_url
+from .cache import LifecycleState
+from .circuit_breaker import (
+    DEFAULT_MAX_DESTINATIONS,
+    CircuitBreakerManager,
+    CircuitPermit,
+)
+from .errors import CacheBackendUnavailable, RateLimitError
+from .util import redact_url
 
 logger = logging.getLogger(__name__)
 
 NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
-
-
-class LifecycleState(enum.Enum):
-    """Lifecycle states of a ProxyCache instance."""
-
-    NEW = "NEW"
-    STARTING = "STARTING"
-    RUNNING = "RUNNING"
-    STOPPING = "STOPPING"
-    STOPPED = "STOPPED"
-
 
 T = TypeVar("T")
 
@@ -109,28 +107,6 @@ CACHE_FAILURE_POLICY = _failure_policy(getenv("CACHE_FAILURE_POLICY", "fail-open
 DEFAULT_CACHE_FAILURE_POLICY = CACHE_FAILURE_POLICY
 DEFAULT_PROBE_INTERVAL: float = 30.0
 
-
-class CacheBackendUnavailable(RuntimeError):
-    """The configured cache backend could not service an operation."""
-
-
-class RateLimitError(cashews.RateLimitError):
-    """Rate-limit rejection with an optional HTTP Retry-After value."""
-
-    def __init__(
-        self,
-        *args: Any,
-        retry_after: int | None = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.retry_after = retry_after
-
-    @property
-    def retry_after_seconds(self) -> float | None:
-        return float(self.retry_after) if self.retry_after is not None else None
-
-
 BACKEND_EXCEPTIONS: tuple[type[Exception], ...] = (
     cashews.exceptions.CacheError,
     ConnectionError,
@@ -138,378 +114,6 @@ BACKEND_EXCEPTIONS: tuple[type[Exception], ...] = (
     OSError,
     socket.error,
 )
-
-
-class CircuitState(str, enum.Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
-def canonicalize_destination(host: str, port: int) -> tuple[str, int]:
-    """Normalize destination host and port for circuit breaker identity mapping."""
-    dest_host = host.strip().rstrip(".").lower()
-    clean_host = dest_host.strip("[]")
-    try:
-        ip = ipaddress.ip_address(clean_host)
-        dest_host = ip.compressed
-    except ValueError:
-        pass
-    return dest_host, int(port)
-
-
-class CircuitPermit:
-    """Tokenized lease representing admission into a destination circuit breaker."""
-
-    def __init__(
-        self,
-        breaker: DestinationCircuitBreaker,
-        epoch: int,
-        permit_id: int,
-        is_probe: bool = False,
-    ) -> None:
-        self.breaker = breaker
-        self.epoch = epoch
-        self.permit_id = permit_id
-        self.is_probe = is_probe
-        self.was_aborted: bool = False
-        self.was_completed: bool = False
-        self._lock = threading.Lock()
-
-    def abort(self) -> None:
-        """Abort this lease, releasing any probe reservation immediately."""
-        with self._lock:
-            if self.was_aborted or self.was_completed:
-                return
-            self.was_aborted = True
-        self.breaker._abort_permit(self)
-
-    def mark_completed(self) -> bool:
-        with self._lock:
-            if self.was_aborted or self.was_completed:
-                return False
-            self.was_completed = True
-            return True
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: object,
-    ) -> None:
-        with self._lock:
-            if not self.was_completed and not self.was_aborted:
-                self.was_aborted = True
-                should_abort = True
-            else:
-                should_abort = False
-        if should_abort:
-            self.breaker._abort_permit(self)
-
-
-class DestinationCircuitBreaker:
-    """Explicit Trio-native circuit breaker for a destination (host, port).
-
-    Implements:
-    - Tokenized lease admission via CircuitPermit preventing pre-open completion theft.
-    - Strict half-open single-probe discipline with probe lease tracking.
-    - Deadlock recovery for dropped probe permits after TTL expiration.
-    - O(1) amortized sliding window via collections.deque and rolling error counts.
-    - Strict breaker and epoch identity checking on completion recording.
-    """
-
-    def __init__(
-        self,
-        errors_rate: int = 50,
-        period: float = 60.0,
-        ttl: float = 30.0,
-        min_calls: int = 3,
-        epoch: int = 0,
-    ) -> None:
-        self.errors_rate = errors_rate
-        self.period = period
-        self.ttl = ttl
-        self.min_calls = min_calls
-        self.state: CircuitState = CircuitState.CLOSED
-        self.opened_at: float | None = None
-        self.epoch: int = epoch
-        self._permit_seq: int = 0
-        self._half_open_in_flight: bool = False
-        self._active_probe_id: int | None = None
-        self._probe_started_at: float | None = None
-        self._calls: deque[tuple[float, bool]] = deque()
-        self._window_error_count: int = 0
-        self._lock = threading.Lock()
-
-    def _prune_calls(self, now: float) -> None:
-        cutoff = now - self.period
-        while self._calls and self._calls[0][0] < cutoff:
-            _, old_err = self._calls.popleft()
-            if old_err:
-                self._window_error_count -= 1
-
-    def acquire_permit(self, now: float | None = None) -> CircuitPermit | None:
-        if now is None:
-            now = time.monotonic()
-        with self._lock:
-            if self.state == CircuitState.OPEN:
-                opened_at = self.opened_at
-                if opened_at is not None and now - opened_at >= self.ttl:
-                    self.state = CircuitState.HALF_OPEN
-                    self._half_open_in_flight = False
-                    self._active_probe_id = None
-                    self._probe_started_at = None
-                else:
-                    return None
-
-            if self.state == CircuitState.HALF_OPEN:
-                if self._half_open_in_flight:
-                    # Check for dropped probe lease timeout recovery (§6.9)
-                    if (
-                        self._probe_started_at is not None
-                        and now - self._probe_started_at >= self.ttl
-                    ):
-                        logger.warning(
-                            "Probe lease %s timed out after %ss in HALF_OPEN; admitting new probe",
-                            self._active_probe_id,
-                            self.ttl,
-                        )
-                        self._half_open_in_flight = False
-                        self._active_probe_id = None
-                    else:
-                        return None
-                self._half_open_in_flight = True
-                self._permit_seq += 1
-                self._active_probe_id = self._permit_seq
-                self._probe_started_at = now
-                return CircuitPermit(
-                    breaker=self,
-                    epoch=self.epoch,
-                    permit_id=self._permit_seq,
-                    is_probe=True,
-                )
-
-            # CircuitState.CLOSED
-            self._permit_seq += 1
-            return CircuitPermit(
-                breaker=self,
-                epoch=self.epoch,
-                permit_id=self._permit_seq,
-                is_probe=False,
-            )
-
-    def can_execute(self, now: float | None = None) -> bool:
-        """Legacy check returning boolean (does not track permit identity)."""
-        if now is None:
-            now = time.monotonic()
-        with self._lock:
-            if self.state == CircuitState.OPEN:
-                opened_at = self.opened_at
-                if opened_at is not None and now - opened_at >= self.ttl:
-                    self.state = CircuitState.HALF_OPEN
-                    self._half_open_in_flight = False
-                    self._active_probe_id = None
-                    self._probe_started_at = None
-                else:
-                    return False
-
-            if self.state == CircuitState.HALF_OPEN:
-                if self._half_open_in_flight:
-                    if (
-                        self._probe_started_at is not None
-                        and now - self._probe_started_at >= self.ttl
-                    ):
-                        self._half_open_in_flight = False
-                        self._active_probe_id = None
-                    else:
-                        return False
-                self._half_open_in_flight = True
-                self._probe_started_at = now
-                return True
-
-            return True
-
-    def _abort_permit(self, permit: CircuitPermit) -> None:
-        with self._lock:
-            if (
-                permit.breaker is self
-                and permit.epoch == self.epoch
-                and self.state == CircuitState.HALF_OPEN
-                and permit.is_probe
-                and (
-                    self._active_probe_id is None
-                    or self._active_probe_id == permit.permit_id
-                )
-            ):
-                self._half_open_in_flight = False
-                self._active_probe_id = None
-                self._probe_started_at = None
-
-    def record_result(
-        self,
-        exc: Exception | None,
-        now: float | None = None,
-        permit: CircuitPermit | None = None,
-    ) -> None:
-        if now is None:
-            now = time.monotonic()
-        is_error = exc is not None
-        with self._lock:
-            # 1. Invalidation checks: breaker identity, epoch, and abort status (§6.6)
-            if permit is not None:
-                if permit.breaker is not self:
-                    return
-                if permit.epoch != self.epoch:
-                    return
-                if not permit.mark_completed():
-                    return
-
-            # 2. State-specific transitions (§6.7, §6.8)
-            if self.state == CircuitState.HALF_OPEN:
-                # Permitless callers or non-probe leases cannot transition HALF_OPEN
-                if permit is None or not permit.is_probe:
-                    logger.warning(
-                        "DestinationCircuitBreaker received record_result in HALF_OPEN without a valid probe permit (permit=%r); ignoring",
-                        permit,
-                    )
-                    return
-                if (
-                    self._active_probe_id is not None
-                    and permit.permit_id != self._active_probe_id
-                ):
-                    return
-
-                self._half_open_in_flight = False
-                self._active_probe_id = None
-                self._probe_started_at = None
-                if is_error:
-                    self.state = CircuitState.OPEN
-                    self.opened_at = now
-                    self.epoch += 1
-                else:
-                    self.state = CircuitState.CLOSED
-                    self.epoch += 1
-                    self._calls.clear()
-                    self._window_error_count = 0
-                    self.opened_at = None
-            elif self.state == CircuitState.CLOSED:
-                self._calls.append((now, is_error))
-                if is_error:
-                    self._window_error_count += 1
-                self._prune_calls(now)
-                if len(self._calls) >= self.min_calls:
-                    rate = (self._window_error_count / len(self._calls)) * 100.0
-                    if rate >= self.errors_rate:
-                        self.state = CircuitState.OPEN
-                        self.opened_at = now
-                        self.epoch += 1
-                        self._calls.clear()
-                        self._window_error_count = 0
-
-
-DEFAULT_MAX_DESTINATIONS: int = 10_000
-
-
-class CircuitBreakerManager:
-    """Manages DestinationCircuitBreaker instances per canonicalized (host, port)."""
-
-    def __init__(
-        self,
-        errors_rate: int = 50,
-        period: float = 60.0,
-        ttl: float = 30.0,
-        min_calls: int = 3,
-        max_destinations: int = DEFAULT_MAX_DESTINATIONS,
-    ) -> None:
-        self.errors_rate = errors_rate
-        self.period = period
-        self.ttl = ttl
-        self.min_calls = min_calls
-        self.max_destinations = max_destinations
-        self._breakers: OrderedDict[tuple[str, int], DestinationCircuitBreaker] = (
-            OrderedDict()
-        )
-        self._epoch_counter: int = 0
-        self._lock = threading.Lock()
-
-    def get_breaker(self, host: str, port: int) -> DestinationCircuitBreaker:
-        key = canonicalize_destination(host, port)
-        with self._lock:
-            breaker = self._breakers.get(key)
-            if breaker is not None:
-                self._breakers.move_to_end(key)
-                return breaker
-
-            if len(self._breakers) >= self.max_destinations:
-                self._evict_one_locked()
-
-            self._epoch_counter += 1
-            breaker = DestinationCircuitBreaker(
-                errors_rate=self.errors_rate,
-                period=self.period,
-                ttl=self.ttl,
-                min_calls=self.min_calls,
-                epoch=self._epoch_counter,
-            )
-            self._breakers[key] = breaker
-            return breaker
-
-    def _evict_one_locked(self) -> None:
-        """Evict an idle CLOSED breaker or oldest entry if none idle."""
-        now = time.monotonic()
-        # 1. Look for idle CLOSED breaker with empty calls (after pruning) and no in-flight probe (§6.14)
-        for k, b in self._breakers.items():
-            with b._lock:
-                if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
-                    b._prune_calls(now)
-                    if len(b._calls) == 0:
-                        del self._breakers[k]
-                        return
-
-        # 2. Fallback: any CLOSED breaker without active probe
-        for k, b in self._breakers.items():
-            with b._lock:
-                if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
-                    del self._breakers[k]
-                    return
-
-        # 3. Last resort: evict oldest entry
-        self._breakers.popitem(last=False)
-
-    def acquire_permit(
-        self, host: str, port: int, now: float | None = None
-    ) -> CircuitPermit | None:
-        return self.get_breaker(host, port).acquire_permit(now=now)
-
-    def can_execute(self, host: str, port: int, now: float | None = None) -> bool:
-        return self.get_breaker(host, port).can_execute(now=now)
-
-    def record_result(
-        self,
-        host: str,
-        port: int,
-        exc: Exception | None,
-        now: float | None = None,
-        permit: CircuitPermit | None = None,
-    ) -> None:
-        self.get_breaker(host, port).record_result(exc, now=now, permit=permit)
-
-    def clear(self) -> None:
-        with self._lock:
-            for breaker in self._breakers.values():
-                with breaker._lock:
-                    breaker.epoch += 1
-                    breaker.state = CircuitState.CLOSED
-                    breaker._half_open_in_flight = False
-                    breaker._active_probe_id = None
-                    breaker._probe_started_at = None
-                    breaker._calls.clear()
-                    breaker._window_error_count = 0
-            self._epoch_counter += 10
-            self._breakers.clear()
 
 
 class ProxyCache:
@@ -587,7 +191,7 @@ class ProxyCache:
         )
         try:
             parsed_period = ttl_to_seconds(self.rate_limit_period)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             parsed_period = None
         if parsed_period is None or parsed_period <= 0:
             raise ValueError(
@@ -597,7 +201,7 @@ class ProxyCache:
 
         try:
             parsed_ttl = ttl_to_seconds(self.rate_limit_ttl)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             parsed_ttl = None
         if parsed_ttl is None or parsed_ttl <= 0:
             raise ValueError(
@@ -607,10 +211,12 @@ class ProxyCache:
 
         try:
             parsed_dns_ttl = ttl_to_seconds(self.dns_cache_ttl)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             parsed_dns_ttl = None
         self.dns_cache_ttl_sec = (
-            float(parsed_dns_ttl) if parsed_dns_ttl is not None and parsed_dns_ttl > 0 else 0.0
+            float(parsed_dns_ttl)
+            if parsed_dns_ttl is not None and parsed_dns_ttl > 0
+            else 0.0
         )
         if cache_failure_policy is not None:
             failure_policy = cache_failure_policy
@@ -677,8 +283,7 @@ class ProxyCache:
         """True if the cache is active, healthy, and not stopped or degraded."""
         with self._lock:
             return (
-                self._lifecycle_state == LifecycleState.RUNNING
-                and not self._degraded
+                self._lifecycle_state == LifecycleState.RUNNING and not self._degraded
             )
 
     @property
@@ -696,7 +301,10 @@ class ProxyCache:
         with self._lock:
             if self._lifecycle_state == LifecycleState.STOPPED:
                 raise RuntimeError("ProxyCache cannot be restarted once stopped")
-            if self._lifecycle_state in (LifecycleState.STARTING, LifecycleState.RUNNING):
+            if self._lifecycle_state in (
+                LifecycleState.STARTING,
+                LifecycleState.RUNNING,
+            ):
                 return
             self._lifecycle_state = LifecycleState.STARTING
             self._stopped = False
@@ -979,7 +587,7 @@ class ProxyCache:
             with trio.fail_after(timeout):
                 await event.wait()
             return fut.result(timeout=0)
-        except (trio.Cancelled, trio.TooSlowError):
+        except trio.Cancelled, trio.TooSlowError:
             fut.cancel()
             raise
 
@@ -1217,7 +825,7 @@ def get_client_key(stream: Any) -> str | None:
             peer = sock.getpeername()
             if isinstance(peer, tuple) and len(peer) >= 1:
                 return str(peer[0])
-    except (OSError, AttributeError):
+    except OSError, AttributeError:
         pass
     return None
 
@@ -1225,6 +833,7 @@ def get_client_key(stream: Any) -> str | None:
 DEFAULT_PROXY_CACHE = ProxyCache()
 
 __all__ = [
+    "BACKEND_EXCEPTIONS",
     "CACHE_FAILURE_POLICY",
     "DEFAULT_CACHE_ENABLED",
     "DEFAULT_CACHE_FAILURE_POLICY",
@@ -1236,17 +845,16 @@ __all__ = [
     "DEFAULT_CIRCUIT_BREAKER_PERIOD",
     "DEFAULT_CIRCUIT_BREAKER_TTL",
     "DEFAULT_DNS_CACHE_TTL",
+    "DEFAULT_PROBE_INTERVAL",
     "DEFAULT_PROXY_CACHE",
     "DEFAULT_RATE_LIMIT",
     "DEFAULT_RATE_LIMIT_ENABLED",
     "DEFAULT_RATE_LIMIT_PERIOD",
     "DEFAULT_RATE_LIMIT_TTL",
-    "CacheBackendUnavailable",
-    "CircuitBreakerOpen",
-    "CircuitPermit",
-    "CircuitState",
-    "DestinationCircuitBreaker",
+    "NAMESPACE_PATTERN",
     "ProxyCache",
-    "RateLimitError",
+    "_bool_env",
+    "_failure_policy",
+    "_int_env",
     "get_client_key",
 ]

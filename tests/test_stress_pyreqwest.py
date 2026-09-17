@@ -145,7 +145,7 @@ async def _handle_origin_request(
                 b"Connection: close\r\n\r\n" + resp_body
             )
             await tls_stream.send_all(resp)
-    except (trio.BrokenResourceError, trio.ClosedResourceError, ssl.SSLError):
+    except trio.BrokenResourceError, trio.ClosedResourceError, ssl.SSLError:
         pass
     finally:
         with trio.move_on_after(0.2):
@@ -159,7 +159,7 @@ async def _tls_origin_server(
     try:
         tls_stream = trio.SSLStream(stream, ssl_context, server_side=True)
         await tls_stream.do_handshake()
-    except (trio.BrokenResourceError, trio.ClosedResourceError, ssl.SSLError):
+    except trio.BrokenResourceError, trio.ClosedResourceError, ssl.SSLError:
         return
 
     await _handle_origin_request(tls_stream)
@@ -175,7 +175,9 @@ async def spawn_proxy_and_origin(
     """Spawns an HTTPS origin server and a Trio HTTP proxy server concurrently."""
     async with trio.open_nursery() as nursery:
         origin_handler = partial(_tls_origin_server, ssl_context)
-        origin_listeners = await nursery.start(partial(trio.serve_tcp, origin_handler, 0))
+        origin_listeners = await nursery.start(
+            partial(trio.serve_tcp, origin_handler, 0)
+        )
         origin_port = origin_listeners[0].socket.getsockname()[1]
 
         proxy_handler = partial(
@@ -217,6 +219,7 @@ async def test_pyreqwest_stress_high_concurrency_stampede(
     concurrency = 500
 
     async with spawn_proxy_and_origin(server_ssl_context) as (proxy_port, dest_port):
+
         def run_asyncio_load() -> tuple[list[int], float]:
             async def amain() -> tuple[list[int], float]:
                 client = build_pyreqwest_client(proxy_port, max_conns=concurrency)
@@ -224,7 +227,9 @@ async def test_pyreqwest_stress_high_concurrency_stampede(
 
                 async def fetch(idx: int) -> int:
                     async with sem:
-                        req = client.get(f"https://127.0.0.1:{dest_port}/ping/{idx}").build()
+                        req = client.get(
+                            f"https://127.0.0.1:{dest_port}/ping/{idx}"
+                        ).build()
                         resp = await req.send()
                         text = await resp.text()
                         assert text == "OK"
@@ -256,6 +261,7 @@ async def test_pyreqwest_stress_sustained_heavy_throughput(
     total_expected = waves * wave_size
 
     async with spawn_proxy_and_origin(server_ssl_context) as (proxy_port, dest_port):
+
         def run_asyncio_waves() -> int:
             async def amain() -> int:
                 client = build_pyreqwest_client(proxy_port, max_conns=wave_size)
@@ -296,6 +302,7 @@ async def test_pyreqwest_stress_large_payload_saturation(
     expected_digests = [hashlib.sha256(p).hexdigest() for p in payloads]
 
     async with spawn_proxy_and_origin(server_ssl_context) as (proxy_port, dest_port):
+
         def run_asyncio_uploads() -> list[str]:
             async def amain() -> list[str]:
                 client = build_pyreqwest_client(proxy_port, timeout_sec=40.0)
@@ -331,6 +338,7 @@ async def test_pyreqwest_stress_streaming_deep_buffer_drain(
     concurrency = 5
 
     async with spawn_proxy_and_origin(server_ssl_context) as (proxy_port, dest_port):
+
         def run_asyncio_stream() -> list[int]:
             async def amain() -> list[int]:
                 client = build_pyreqwest_client(proxy_port, timeout_sec=30.0)
@@ -359,18 +367,25 @@ async def test_pyreqwest_stress_heavy_limiter_queue_contention(
 ) -> None:
     """Heavily constrain connection capacity (limiter=10) and flood with 150 concurrent requests."""
     concurrency = 150
-    limiter = trio.CapacityLimiter(10)  # Only 10 concurrent proxy tunnels admitted at once
+    limiter = trio.CapacityLimiter(
+        10
+    )  # Only 10 concurrent proxy tunnels admitted at once
 
     async with spawn_proxy_and_origin(server_ssl_context, limiter=limiter) as (
         proxy_port,
         dest_port,
     ):
+
         def run_asyncio_gated() -> list[int]:
             async def amain() -> list[int]:
-                client = build_pyreqwest_client(proxy_port, timeout_sec=30.0, max_conns=concurrency)
+                client = build_pyreqwest_client(
+                    proxy_port, timeout_sec=30.0, max_conns=concurrency
+                )
 
                 async def fetch(idx: int) -> int:
-                    req = client.get(f"https://127.0.0.1:{dest_port}/gated/{idx}").build()
+                    req = client.get(
+                        f"https://127.0.0.1:{dest_port}/gated/{idx}"
+                    ).build()
                     resp = await req.send()
                     text = await resp.text()
                     assert text == "OK"
@@ -421,12 +436,15 @@ async def test_pyreqwest_stress_massive_rate_limit_stampede(
         proxy_port,
         dest_port,
     ):
+
         def run_asyncio_rate_limit_load() -> list[int]:
             async def amain() -> list[int]:
                 client = build_pyreqwest_client(proxy_port, max_conns=total_requests)
 
                 async def fetch(idx: int) -> int:
-                    req = client.get(f"https://127.0.0.1:{dest_port}/rate/{idx}").build()
+                    req = client.get(
+                        f"https://127.0.0.1:{dest_port}/rate/{idx}"
+                    ).build()
                     try:
                         resp = await req.send()
                         return resp.status
@@ -472,12 +490,15 @@ async def test_pyreqwest_stress_circuit_breaker_storm(
     async with spawn_proxy_and_origin(
         server_ssl_context, proxy_cache=TrippedCircuitCache()
     ) as (proxy_port, dest_port):
+
         def run_asyncio_circuit_stress() -> list[int]:
             async def amain() -> list[int]:
                 client = build_pyreqwest_client(proxy_port, max_conns=total_requests)
 
                 async def fetch(idx: int) -> int:
-                    req = client.get(f"https://127.0.0.1:{dest_port}/circuit/{idx}").build()
+                    req = client.get(
+                        f"https://127.0.0.1:{dest_port}/circuit/{idx}"
+                    ).build()
                     try:
                         resp = await req.send()
                         return resp.status
@@ -503,14 +524,19 @@ async def test_pyreqwest_stress_abrupt_disconnect_avalanche(
     churn_count = 150
 
     async with spawn_proxy_and_origin(server_ssl_context) as (proxy_port, dest_port):
+
         def run_asyncio_churn() -> None:
             async def amain() -> None:
                 # Abruptly abort connections mid-stream using a 30ms timeout
-                client = build_pyreqwest_client(proxy_port, timeout_sec=0.03, max_conns=churn_count)
+                client = build_pyreqwest_client(
+                    proxy_port, timeout_sec=0.03, max_conns=churn_count
+                )
 
                 async def fetch_and_drop(idx: int) -> None:
                     try:
-                        req = client.get(f"https://127.0.0.1:{dest_port}/slow_disconnect?id={idx}").build()
+                        req = client.get(
+                            f"https://127.0.0.1:{dest_port}/slow_disconnect?id={idx}"
+                        ).build()
                         await req.send()
                     except PyreqwestError:
                         pass

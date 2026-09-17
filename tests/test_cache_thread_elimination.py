@@ -11,14 +11,22 @@ async def test_thread_leak_eliminated_when_cache_disabled_explicitly() -> None:
     cache.start()
 
     try:
-        assert cache._thread is None, "Background OS thread was leaked when cache was explicitly disabled"
-        assert cache._loop is None, "Asyncio event loop was leaked when cache was explicitly disabled"
-        assert cache.is_running is True, "ProxyCache should report is_running=True once started even when cache is disabled"
+        assert cache._thread is None, (
+            "Background OS thread was leaked when cache was explicitly disabled"
+        )
+        assert cache._loop is None, (
+            "Asyncio event loop was leaked when cache was explicitly disabled"
+        )
+        assert cache.is_running is True, (
+            "ProxyCache should report is_running=True once started even when cache is disabled"
+        )
 
         # Verify in-memory circuit breaker functions normally without thread or loop
         permit = await cache.check_circuit("example.com", 443)
         assert permit is not None
-        await cache.record_connection_result("example.com", 443, exc=None, permit=permit)
+        await cache.record_connection_result(
+            "example.com", 443, exc=None, permit=permit
+        )
 
         # Verify circuit breaker can trip on repeated failures even when cache is explicitly disabled
         host = "disabled-cache-circuit.test"
@@ -26,15 +34,21 @@ async def test_thread_leak_eliminated_when_cache_disabled_explicitly() -> None:
         for _ in range(3):
             p = await cache.check_circuit(host, port)
             assert p is not None
-            await cache.record_connection_result(host, port, exc=OSError("connection failed"), permit=p)
+            await cache.record_connection_result(
+                host, port, exc=OSError("connection failed"), permit=p
+            )
 
         with pytest.raises(CircuitBreakerOpen):
             await cache.check_circuit(host, port)
     finally:
         cache.stop()
 
-    assert cache.is_stopped is True, "ProxyCache should report is_stopped=True after stop()"
-    assert cache.is_running is False, "ProxyCache should report is_running=False after stop()"
+    assert cache.is_stopped is True, (
+        "ProxyCache should report is_stopped=True after stop()"
+    )
+    assert cache.is_running is False, (
+        "ProxyCache should report is_running=False after stop()"
+    )
     assert cache._thread is None
     assert cache._loop is None
 
@@ -46,9 +60,15 @@ async def test_thread_leak_eliminated_when_cache_url_empty() -> None:
     cache.start()
 
     try:
-        assert cache._thread is None, "Background OS thread was leaked when cache_url was empty"
-        assert cache._loop is None, "Asyncio event loop was leaked when cache_url was empty"
-        assert cache.is_running is True, "ProxyCache should report is_running=True once started when cache_url is empty"
+        assert cache._thread is None, (
+            "Background OS thread was leaked when cache_url was empty"
+        )
+        assert cache._loop is None, (
+            "Asyncio event loop was leaked when cache_url was empty"
+        )
+        assert cache.is_running is True, (
+            "ProxyCache should report is_running=True once started when cache_url is empty"
+        )
 
         permit = await cache.check_circuit("example.com", 80)
         assert permit is not None
@@ -60,7 +80,9 @@ async def test_thread_leak_eliminated_when_cache_url_empty() -> None:
         for _ in range(3):
             p = await cache.check_circuit(host, port)
             assert p is not None
-            await cache.record_connection_result(host, port, exc=OSError("connection failed"), permit=p)
+            await cache.record_connection_result(
+                host, port, exc=OSError("connection failed"), permit=p
+            )
 
         with pytest.raises(CircuitBreakerOpen):
             await cache.check_circuit(host, port)
@@ -74,7 +96,9 @@ async def test_thread_leak_eliminated_when_cache_url_empty() -> None:
 
 
 @tt.trio_test
-async def test_thread_leak_eliminated_when_no_backend_features_enabled_sync_start() -> None:
+async def test_thread_leak_eliminated_when_no_backend_features_enabled_sync_start() -> (
+    None
+):
     """A background thread leak occurs if an event loop or OS thread is spawned when no backend features are enabled."""
     cache = ProxyCache(
         enabled=True,
@@ -87,9 +111,15 @@ async def test_thread_leak_eliminated_when_no_backend_features_enabled_sync_star
     cache.start()
 
     try:
-        assert cache._thread is None, "Background OS thread was leaked when no backend features were enabled"
-        assert cache._loop is None, "Asyncio event loop was leaked when no backend features were enabled"
-        assert cache.is_running is True, "ProxyCache should report is_running=True once started"
+        assert cache._thread is None, (
+            "Background OS thread was leaked when no backend features were enabled"
+        )
+        assert cache._loop is None, (
+            "Asyncio event loop was leaked when no backend features were enabled"
+        )
+        assert cache.is_running is True, (
+            "ProxyCache should report is_running=True once started"
+        )
 
         # In-memory circuit breaker operations must function normally and be able to trip
         host = "tripping-service.test"
@@ -97,13 +127,19 @@ async def test_thread_leak_eliminated_when_no_backend_features_enabled_sync_star
         for _ in range(3):
             permit = await cache.check_circuit(host, port)
             assert permit is not None
-            await cache.record_connection_result(host, port, exc=OSError("connection failed"), permit=permit)
+            await cache.record_connection_result(
+                host, port, exc=OSError("connection failed"), permit=permit
+            )
 
         with pytest.raises(CircuitBreakerOpen):
             await cache.check_circuit(host, port)
 
-        assert cache._thread is None, "Thread was unexpectedly spawned during circuit breaker operations"
-        assert cache._loop is None, "Loop was unexpectedly spawned during circuit breaker operations"
+        assert cache._thread is None, (
+            "Thread was unexpectedly spawned during circuit breaker operations"
+        )
+        assert cache._loop is None, (
+            "Loop was unexpectedly spawned during circuit breaker operations"
+        )
     finally:
         cache.stop()
 
@@ -114,7 +150,9 @@ async def test_thread_leak_eliminated_when_no_backend_features_enabled_sync_star
 
 
 @tt.trio_test
-async def test_thread_leak_eliminated_when_no_backend_features_enabled_ensure_started() -> None:
+async def test_thread_leak_eliminated_when_no_backend_features_enabled_ensure_started() -> (
+    None
+):
     """A background thread leak occurs if _ensure_started() spawns an event loop or OS thread when features are disabled."""
     cache = ProxyCache(
         enabled=True,
@@ -126,13 +164,19 @@ async def test_thread_leak_eliminated_when_no_backend_features_enabled_ensure_st
     cache._ensure_started()
 
     try:
-        assert cache._thread is None, "Background OS thread was leaked by _ensure_started() when no backend features enabled"
-        assert cache._loop is None, "Asyncio event loop was leaked by _ensure_started() when no backend features enabled"
+        assert cache._thread is None, (
+            "Background OS thread was leaked by _ensure_started() when no backend features enabled"
+        )
+        assert cache._loop is None, (
+            "Asyncio event loop was leaked by _ensure_started() when no backend features enabled"
+        )
         assert cache.is_running is True
 
         permit = await cache.check_circuit("example.com", 443)
         assert permit is not None
-        await cache.record_connection_result("example.com", 443, exc=None, permit=permit)
+        await cache.record_connection_result(
+            "example.com", 443, exc=None, permit=permit
+        )
     finally:
         cache.stop()
 
@@ -143,7 +187,9 @@ async def test_thread_leak_eliminated_when_no_backend_features_enabled_ensure_st
 
 
 @tt.trio_test
-async def test_thread_leak_eliminated_in_async_context_manager_when_backend_features_disabled() -> None:
+async def test_thread_leak_eliminated_in_async_context_manager_when_backend_features_disabled() -> (
+    None
+):
     """A background thread leak occurs if async context manager spawns an event loop or thread when features are disabled."""
     cache = ProxyCache(
         enabled=True,
@@ -152,8 +198,12 @@ async def test_thread_leak_eliminated_in_async_context_manager_when_backend_feat
         rate_limit_enabled=False,
     )
     async with cache:
-        assert cache._thread is None, "Background OS thread was leaked inside async context manager"
-        assert cache._loop is None, "Asyncio event loop was leaked inside async context manager"
+        assert cache._thread is None, (
+            "Background OS thread was leaked inside async context manager"
+        )
+        assert cache._loop is None, (
+            "Asyncio event loop was leaked inside async context manager"
+        )
         assert cache.is_running is True
 
         permit = await cache.check_circuit("10.0.0.1", 80)
@@ -177,8 +227,12 @@ def test_bridge_thread_spawned_when_dns_cache_feature_enabled_control() -> None:
     cache.start()
 
     try:
-        assert cache._thread is not None, "Expected bridge thread to be spawned when dns_cache_ttl > 0s"
-        assert cache._thread.is_alive() is True, "Bridge thread should be active and running"
+        assert cache._thread is not None, (
+            "Expected bridge thread to be spawned when dns_cache_ttl > 0s"
+        )
+        assert cache._thread.is_alive() is True, (
+            "Bridge thread should be active and running"
+        )
         assert cache._loop is not None, "Expected asyncio event loop to be initialized"
         assert cache.is_running is True
     finally:
@@ -202,8 +256,12 @@ def test_bridge_thread_spawned_when_rate_limit_feature_enabled_control() -> None
     cache.start()
 
     try:
-        assert cache._thread is not None, "Expected bridge thread to be spawned when rate_limit_enabled is True"
-        assert cache._thread.is_alive() is True, "Bridge thread should be active and running"
+        assert cache._thread is not None, (
+            "Expected bridge thread to be spawned when rate_limit_enabled is True"
+        )
+        assert cache._thread.is_alive() is True, (
+            "Bridge thread should be active and running"
+        )
         assert cache._loop is not None, "Expected asyncio event loop to be initialized"
         assert cache.is_running is True
     finally:

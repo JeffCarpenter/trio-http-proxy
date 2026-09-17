@@ -36,10 +36,5 @@ def redact_url(url: str) -> str:
                     (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
                 )
         return url
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         return url
-
-
-
-
-

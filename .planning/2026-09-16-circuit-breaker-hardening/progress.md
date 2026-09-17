@@ -130,6 +130,28 @@
     - Code intelligence: **0 diagnostics** reported across all project files (`mcpls:get_diagnostics`).
     - Linting & type checking: **0 Ruff errors**, **0 Pyright issues**.
 - Ready for Tranche 5: Verification, Invariant Tests & mcpls Diagnostics.
+- **Tranche 5 Progress & Rigorous Class-to-Module Refactor**:
+  - **Class-to-Module Extraction Completed**:
+    - Extracted all 12 classes across `src/trio_http_proxy/` into dedicated single-responsibility modules:
+      1. [`LifecycleState`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/lifecycle_state.py) -> [lifecycle_state.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/lifecycle_state.py)
+      2. [`CacheBackendUnavailable`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache_backend_unavailable.py) -> [cache_backend_unavailable.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache_backend_unavailable.py)
+      3. [`RateLimitError`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/rate_limit_error.py) -> [rate_limit_error.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/rate_limit_error.py)
+      4. [`CircuitState`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/circuit_state.py) -> [circuit_state.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/circuit_state.py)
+      5. [`CircuitPermit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/circuit_permit.py) -> [circuit_permit.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/circuit_permit.py)
+      6. [`DestinationCircuitBreaker`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/destination_circuit_breaker.py) -> [destination_circuit_breaker.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/destination_circuit_breaker.py)
+      7. [`CircuitBreakerManager`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/circuit_breaker_manager.py) -> [circuit_breaker_manager.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/circuit_breaker_manager.py)
+      8. [`ProxyCache`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy_cache.py) -> [proxy_cache.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy_cache.py)
+      9. [`ProxyProtocolError`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy_protocol_error.py) -> [proxy_protocol_error.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy_protocol_error.py)
+      10. [`RequestTooLargeError`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/request_too_large_error.py) -> [request_too_large_error.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/request_too_large_error.py)
+      11. [`ConnectionFilter`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/connection_filter.py) -> [connection_filter.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/connection_filter.py)
+      12. [`ConnectionLoggerAdapter`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/connection_logger_adapter.py) -> [connection_logger_adapter.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/connection_logger_adapter.py)
+    - Extracted connection context helpers and context variables to [connection_context.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/connection_context.py) with zero circular dependencies.
+    - Updated [cache.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py), [proxy.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py), and [__init__.py](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/__init__.py) to cleanly re-export all symbols for 100% backward compatibility.
+  - **Verification**:
+    - Full test suite: **222/222 passed in 6.39s** (`uv run pytest`).
+    - Linter check: **0 Ruff errors, clean formatting** (`uv run ruff check .`).
+    - Type check: **0 Pyright errors, 0 warnings, 0 informations** (`uv run pyright`).
+    - MCP LSP compiler-grade diagnostics: **0 mcpls diagnostics across all project files** (`mcpls:get_diagnostics`).
 
 
 

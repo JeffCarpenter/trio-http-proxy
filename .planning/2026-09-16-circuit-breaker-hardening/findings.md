@@ -234,7 +234,12 @@
 * **Resolution & Hardened Contract**:
   - Enforce strict lease validation in `HALF_OPEN`:
     ```python
-    if permit is None or not permit.is_probe or permit.breaker is not self or permit.epoch != self.epoch:
+    if (
+        permit is None
+        or not permit.is_probe
+        or permit.breaker is not self
+        or permit.epoch != self.epoch
+    ):
         return
     ```
   - Only the designated probe lease holder for the current epoch is permitted to transition `HALF_OPEN -> CLOSED` or `HALF_OPEN -> OPEN`.
