@@ -6,7 +6,7 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy import proxy
+from trio_http_proxy import http, proxy
 from trio_http_proxy.cache import ProxyCache
 
 
@@ -285,7 +285,7 @@ async def test_invariant_6_invalid_target_octets_yields_400():
     await proxy.http_proxy(proxy_client, proxy_cache=None)
 
     response = await test_client.receive_some(4096)
-    assert response == proxy.HTTP_400_BAD_REQUEST
+    assert response == http.http_400_bad_request
 
 
 @tt.trio_test
@@ -297,7 +297,7 @@ async def test_invariant_6_non_ascii_target_octet_yields_400():
     await proxy.http_proxy(proxy_client, proxy_cache=None)
 
     response = await test_client.receive_some(4096)
-    assert response == proxy.HTTP_400_BAD_REQUEST
+    assert response == http.http_400_bad_request
 
 
 @tt.trio_test
@@ -311,7 +311,7 @@ async def test_invariant_6_malformed_host_octets_yields_400():
     await proxy.http_proxy(proxy_client, proxy_cache=None)
 
     response = await test_client.receive_some(4096)
-    assert response == proxy.HTTP_400_BAD_REQUEST
+    assert response == http.http_400_bad_request
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy import proxy
+from trio_http_proxy import http, proxy
 from trio_http_proxy.cache import CircuitBreakerOpen, ProxyCache
 
 
@@ -256,13 +256,13 @@ def test_repro_tier3_bufmaxsz_zero_invalid():
 def test_repro_tier3_error_responses_headers():
     """Error responses must contain Connection: close and Content-Length: 0."""
     for resp in (
-        proxy.HTTP_400_BAD_REQUEST,
-        proxy.HTTP_408_REQUEST_TIMEOUT,
-        proxy.HTTP_414_URI_TOO_LONG,
-        proxy.HTTP_429_TOO_MANY_REQUESTS,
-        proxy.HTTP_502_BAD_GATEWAY,
-        proxy.HTTP_503_SERVICE_UNAVAILABLE,
-        proxy.HTTP_504_GATEWAY_TIMEOUT,
+        http.http_400_bad_request,
+        http.http_408_request_timeout,
+        http.http_414_uri_too_long,
+        http.http_429_too_many_requests,
+        http.http_502_bad_gateway,
+        http.http_503_service_unavailable,
+        http.http_504_gateway_timeout,
     ):
         assert b"Connection: close\r\n" in resp
         assert b"Content-Length: 0\r\n" in resp

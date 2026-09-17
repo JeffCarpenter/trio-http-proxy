@@ -9,7 +9,7 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy import proxy
+from trio_http_proxy import http, proxy
 
 
 def run_isolated(fn, *args, **kwargs):
@@ -295,7 +295,7 @@ async def test_tunnel_bad_request_sends_400_and_raises_without_connecting():
 
     assert called is False
     reply = await test_client.receive_some(4096)
-    assert reply == proxy.HTTP_400_BAD_REQUEST
+    assert reply == http.http_400_bad_request
 
 
 @tt.trio_test
@@ -310,7 +310,7 @@ async def test_tunnel_connect_failure_sends_502_and_raises():
         await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     reply = await test_client.receive_some(4096)
-    assert reply == proxy.HTTP_502_BAD_GATEWAY
+    assert reply == http.http_502_bad_gateway
 
 
 @tt.trio_test
@@ -332,7 +332,7 @@ async def test_tunnel_times_out_reading_connect_request_sends_408(mock_clock):
 
     assert called is False
     reply = await test_client.receive_some(4096)
-    assert reply == proxy.HTTP_408_REQUEST_TIMEOUT
+    assert reply == http.http_408_request_timeout
 
 
 @tt.trio_test
@@ -351,7 +351,7 @@ async def test_tunnel_times_out_connecting_to_dest_sends_504(mock_clock):
     assert not watchdog.cancelled_caught, "proxy never gave up on the slow destination"
 
     reply = await test_client.receive_some(4096)
-    assert reply == proxy.HTTP_504_GATEWAY_TIMEOUT
+    assert reply == http.http_504_gateway_timeout
 
 
 @tt.trio_test
@@ -370,7 +370,7 @@ async def test_tunnel_rejects_non_numeric_port_sends_400():
         await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     reply = await test_client.receive_some(4096)
-    assert reply == proxy.HTTP_400_BAD_REQUEST
+    assert reply == http.http_400_bad_request
 
 
 @tt.trio_test
@@ -391,7 +391,7 @@ async def test_tunnel_oversized_request_sends_414_not_bare_400():
         await proxy.tunnel(proxy_client, _connect=fake_open_tcp_stream)
 
     reply = await test_client.receive_some(4096)
-    assert reply == proxy.HTTP_414_URI_TOO_LONG
+    assert reply == http.http_414_uri_too_long
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +729,7 @@ async def test_http_proxy_bad_request_sends_400_and_closes_quietly():
         )
         await test_client.send_all(b"not a valid request\r\n\r\n")
         reply = await test_client.receive_some(4096)
-        assert reply == proxy.HTTP_400_BAD_REQUEST
+        assert reply == http.http_400_bad_request
         remainder = await test_client.receive_some(4096)
         assert remainder == b""
 
@@ -749,7 +749,7 @@ async def test_http_proxy_dest_connect_failure_sends_502_and_closes_quietly():
         )
         await test_client.send_all(connect_request(target=b"example.com:443"))
         reply = await test_client.receive_some(4096)
-        assert reply == proxy.HTTP_502_BAD_GATEWAY
+        assert reply == http.http_502_bad_gateway
         remainder = await test_client.receive_some(4096)
         assert remainder == b""
 
@@ -993,12 +993,12 @@ async def test_http_proxy_releases_limiter_slot_when_connection_completes():
         await test_client2.send_all(connect_request())
 
         reply1 = await test_client1.receive_some(4096)
-        assert reply1 == proxy.HTTP_502_BAD_GATEWAY
+        assert reply1 == http.http_502_bad_gateway
 
         # conn1 released the limiter on its way out, so conn2 -- which was
         # parked waiting for a slot -- can now proceed.
         reply2 = await test_client2.receive_some(4096)
-        assert reply2 == proxy.HTTP_502_BAD_GATEWAY
+        assert reply2 == http.http_502_bad_gateway
 
     assert connect2_started is True
 
