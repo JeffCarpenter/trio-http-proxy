@@ -23,6 +23,7 @@ from ..config import (
     RateLimitSettings,
     Settings,
     get_settings,
+    load_settings,
     normalize_failure_policy,
     validate_namespace,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "get_client_key",
     "get_default_proxy_cache",
     "get_settings",
+    "load_settings",
     "normalize_failure_policy",
     "validate_namespace",
 ]

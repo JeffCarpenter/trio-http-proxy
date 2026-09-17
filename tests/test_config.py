@@ -11,6 +11,7 @@ from trio_http_proxy.config import (
     RateLimitSettings,
     Settings,
     get_settings,
+    load_settings,
     reset_settings_cache,
 )
 from trio_http_proxy.proxy_cache import ProxyCache
@@ -175,34 +176,58 @@ class TestRateLimitSettings:
 
 
 class TestCompositeSettings:
-    """Tests for unified Settings model."""
+    """Tests for the explicit, typed Settings composite."""
 
-    def test_defaults(self):
-        settings = Settings()
-        assert settings.port == 8080
-        assert settings.cache_url == "mem://"
-        assert settings.circuit_breaker_enabled is True
-        assert settings.rate_limit_enabled is False
-        assert settings.circuit_breaker_period == "60s"
+    def test_load_defaults(self):
+        settings = load_settings(env_file=None)
+        assert settings.proxy.port == 8080
+        assert settings.cache.cache_url == "mem://"
+        assert settings.circuit_breaker.circuit_breaker_enabled is True
+        assert settings.rate_limit.rate_limit_enabled is False
+        assert settings.circuit_breaker.circuit_breaker_period == "60s"
 
-    def test_kwarg_distribution(self):
+    def test_explicit_group_construction(self):
         settings = Settings(
-            port=9191,
-            cache_url="redis://localhost",
-            circuit_breaker_errors_rate=75,
-            rate_limit=100,
+            proxy=ProxySettings(port=9191),
+            cache=CacheSettings(cache_url="redis://localhost"),
+            circuit_breaker=CircuitBreakerSettings(circuit_breaker_errors_rate=75),
+            rate_limit=RateLimitSettings(rate_limit=100),
         )
-        assert settings.port == 9191
         assert settings.proxy.port == 9191
         assert settings.cache.cache_url == "redis://localhost"
         assert settings.circuit_breaker.circuit_breaker_errors_rate == 75
         assert settings.rate_limit.rate_limit == 100
 
+    def test_scalar_cannot_replace_rate_limit_group(self):
+        groups = {
+            "proxy": ProxySettings(),
+            "cache": CacheSettings(),
+            "circuit_breaker": CircuitBreakerSettings(),
+            "rate_limit": 100,
+        }
+        with pytest.raises(ValidationError, match="rate_limit"):
+            Settings.model_validate(groups)
+
+    def test_model_round_trip_preserves_groups(self):
+        settings = Settings(
+            proxy=ProxySettings(port=9191),
+            cache=CacheSettings(),
+            circuit_breaker=CircuitBreakerSettings(),
+            rate_limit=RateLimitSettings(rate_limit=100),
+        )
+        assert Settings.model_validate(settings.model_dump()) == settings
+        assert Settings.model_validate_json(settings.model_dump_json()) == settings
+
+    def test_flat_accessors_are_not_exposed(self):
+        settings = load_settings(env_file=None)
+        assert not hasattr(settings, "port")
+        assert not hasattr(settings, "rate_limit_count")
+
     def test_get_settings_cached(self):
         reset_settings_cache()
         settings = get_settings()
         assert isinstance(settings, Settings)
-        assert settings.port == 8080
+        assert settings.proxy.port == 8080
         assert get_settings() is settings
         reset_settings_cache()
         assert get_settings() is not settings
@@ -212,13 +237,13 @@ class TestCompositeSettings:
         monkeypatch.setenv("TRIO_HTTP_PROXY_PORT", "2222")
         monkeypatch.setenv("PORT", "1111")
         assert ProxySettings().port == 2222
-        assert Settings().port == 2222
+        assert load_settings(env_file=None).proxy.port == 2222
 
     def test_env_file_forwarded_to_groups(self, tmp_path, monkeypatch):
         env_file = tmp_path / "test.env"
         env_file.write_text("MAXREQSZ=424242\nUNRELATED_VAR=zzz\n")
         monkeypatch.delenv("MAXREQSZ", raising=False)
-        settings = Settings(_env_file=str(env_file))
+        settings = load_settings(env_file=env_file)
         assert settings.proxy.maxreqsz == 424242
         assert settings.cache.cache_url == "mem://"
 
@@ -226,34 +251,37 @@ class TestCompositeSettings:
         env_file = tmp_path / "override.env"
         env_file.write_text("MAXREQSZ=424242\n")
         monkeypatch.delenv("MAXREQSZ", raising=False)
-        assert Settings(_env_file=None).proxy.maxreqsz == 16384
+        assert load_settings(env_file=None).proxy.maxreqsz == 16384
 
     def test_settings_are_frozen(self):
-        settings = Settings()
+        settings = load_settings(env_file=None)
         with pytest.raises(ValidationError):
             settings.proxy.port = 1
+        group_name = "proxy"
+        with pytest.raises(ValidationError):
+            setattr(settings, group_name, ProxySettings(port=1))
 
-    def test_unknown_kwarg_rejected_with_hint(self):
-        with pytest.raises(ValueError, match="Unknown settings fields.*potr"):
-            Settings(potr=1)
+    def test_unknown_kwarg_rejected_by_pydantic(self):
+        groups = {
+            "proxy": ProxySettings(),
+            "cache": CacheSettings(),
+            "circuit_breaker": CircuitBreakerSettings(),
+            "rate_limit": RateLimitSettings(),
+        }
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            Settings.model_validate({**groups, "potr": 1})
 
-    def test_flat_kwarg_and_group_collision_rejected(self):
-        with pytest.raises(ValueError, match="Conflicting settings for group 'proxy'"):
-            Settings(port=1, proxy=ProxySettings(port=2))
-
-    def test_stray_group_env_vars_do_not_crash_composite(self, monkeypatch):
-        # PROXY/CACHE name no settings field, so the env source ignores them.
+    def test_stray_group_env_vars_do_not_crash_loader(self, monkeypatch):
         monkeypatch.setenv("PROXY", "not-a-settings-object")
         monkeypatch.setenv("CACHE", "banana")
         monkeypatch.setenv("RATE_LIMIT", "7")
-        settings = Settings()
-        assert settings.port == 8080
+        settings = load_settings(env_file=None)
+        assert settings.proxy.port == 8080
         assert settings.rate_limit.rate_limit == 7
-        # an invalid value for a real field fails fast at construction, but
-        # importing the package (module import time) never reads the env.
+
         monkeypatch.setenv("RATE_LIMIT", "banana")
         with pytest.raises(ValidationError):
-            Settings()
+            load_settings(env_file=None)
 
     def test_import_with_invalid_env_does_not_crash(self):
         import subprocess
@@ -295,11 +323,16 @@ class TestIntegration:
 
     def test_proxy_cache_accepts_settings(self):
         custom_settings = Settings(
-            cache_url="mem://custom",
-            cache_namespace="custom_ns",
-            circuit_breaker_errors_rate=60,
-            rate_limit=50,
-            rate_limit_period="30s",
+            proxy=ProxySettings(),
+            cache=CacheSettings(
+                cache_url="mem://custom",
+                cache_namespace="custom_ns",
+            ),
+            circuit_breaker=CircuitBreakerSettings(circuit_breaker_errors_rate=60),
+            rate_limit=RateLimitSettings(
+                rate_limit=50,
+                rate_limit_period="30s",
+            ),
         )
         cache = ProxyCache(settings=custom_settings)
         assert cache.cache_url == "mem://custom"

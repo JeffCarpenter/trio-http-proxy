@@ -38,6 +38,7 @@ from trio_http_proxy.config import (
     RateLimitSettings,
     Settings,
     get_settings,
+    load_settings,
     reset_settings_cache,
 )
 from trio_http_proxy.proxy import reset_conn_limiter
@@ -96,7 +97,7 @@ def rate_limit_settings() -> RateLimitSettings:
 @pytest.fixture
 def settings() -> Settings:
     """Fresh composite Settings (env isolated by _clean_config_env)."""
-    return Settings()
+    return load_settings(env_file=None)
 
 
 @pytest.fixture

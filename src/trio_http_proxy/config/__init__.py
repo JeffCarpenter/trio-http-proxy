@@ -6,6 +6,7 @@ Exports strongly typed, environment- and .env-aware configuration models:
 - CircuitBreakerSettings: Error rate thresholds, periods, TTLs, min calls, destination caps.
 - RateLimitSettings: Enabling, rate limit thresholds, periods, TTLs.
 - Settings: Unified root settings composing all sub-configurations.
+- load_settings(): coordinated environment/dotenv loading for every group.
 - get_settings()/reset_settings_cache(): lazy process-wide settings access.
 
 Every field accepts the canonical ``TRIO_HTTP_PROXY_<FIELD>`` env var (wins)
@@ -28,7 +29,7 @@ from .cache_settings import (
 from .circuit_breaker_settings import CircuitBreakerSettings
 from .proxy_settings import ProxySettings
 from .rate_limit_settings import RateLimitSettings
-from .settings import Settings, get_settings, reset_settings_cache
+from .settings import Settings, get_settings, load_settings, reset_settings_cache
 
 __all__ = [
     "ENV_PREFIX",
@@ -40,6 +41,7 @@ __all__ = [
     "RateLimitSettings",
     "Settings",
     "get_settings",
+    "load_settings",
     "normalize_failure_policy",
     "normalize_optional_duration",
     "parse_duration_seconds",
