@@ -248,9 +248,13 @@ def test_repro_r5_no_mock_clock_in_cache():
 # Tier 3 Nits
 # ---------------------------------------------------------------------------
 def test_repro_tier3_bufmaxsz_zero_invalid():
-    """BUFMAXSZ=0 must fail validation with ValueError."""
-    with pytest.raises(ValueError, match="BUFMAXSZ must be >= 1"):
-        proxy._validate_bufmaxsz(0)
+    """BUFMAXSZ=0 must fail validation with ValidationError."""
+    from pydantic import ValidationError
+
+    from trio_http_proxy.config import ProxySettings
+
+    with pytest.raises(ValidationError):
+        ProxySettings(bufmaxsz=0)
 
 
 def test_repro_tier3_error_responses_headers():

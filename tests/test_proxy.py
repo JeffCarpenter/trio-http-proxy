@@ -1218,66 +1218,31 @@ async def test_start_server_swallows_keyboard_interrupt(caplog):
 
 
 # ---------------------------------------------------------------------------
-# module-level PORT configuration
+# ProxySettings configuration
 # ---------------------------------------------------------------------------
 
 
 def test_port_defaults_to_8080_when_env_unset():
-    assert (
-        proxy._int_env(
-            "PORT", proxy.DEFAULT_PORT, _getenv=lambda _name, default: default
-        )
-        == 8080
-    )
+    assert proxy.ProxySettings().port == 8080
 
 
-def test_port_reads_from_env_var():
-    assert (
-        proxy._int_env(
-            "PORT", proxy.DEFAULT_PORT, _getenv=lambda _name, _default: "9191"
-        )
-        == 9191
-    )
-
-
-# ---------------------------------------------------------------------------
-# _int_env (backs BUFMAXSZ / MAXREQSZ)
-# ---------------------------------------------------------------------------
-
-
-def test_int_env_uses_default_when_var_unset():
-    assert proxy._int_env("X", 42, _getenv=lambda _name, default: default) == 42
-
-
-def test_int_env_reads_value_from_env():
-    assert proxy._int_env("X", 42, _getenv=lambda _name, _default: "4096") == 4096
-
-
-# ---------------------------------------------------------------------------
-# MAXCONNS / connection cap
-# ---------------------------------------------------------------------------
+def test_port_reads_from_env_var(monkeypatch):
+    monkeypatch.setenv("PORT", "9191")
+    assert proxy.ProxySettings().port == 9191
 
 
 def test_maxconns_defaults_to_1000_when_env_unset():
-    assert (
-        proxy._int_env(
-            "MAXCONNS", proxy.DEFAULT_MAXCONNS, _getenv=lambda _name, default: default
-        )
-        == 1000
-    )
+    assert proxy.ProxySettings().maxconns == 1000
 
 
-# ---------------------------------------------------------------------------
-# _float_env (backs CONNECT_READ_TIMEOUT / DEST_CONNECT_TIMEOUT / PIPE_IDLE_TIMEOUT)
-# ---------------------------------------------------------------------------
+def test_maxconns_reads_from_env_var(monkeypatch):
+    monkeypatch.setenv("MAXCONNS", "2000")
+    assert proxy.ProxySettings().maxconns == 2000
 
 
-def test_float_env_uses_default_when_var_unset():
-    assert proxy._float_env("X", 4.2, _getenv=lambda _name, default: default) == 4.2
-
-
-def test_float_env_reads_value_from_env():
-    assert proxy._float_env("X", 4.2, _getenv=lambda _name, _default: "1.5") == 1.5
+def test_timeouts_read_from_env(monkeypatch):
+    monkeypatch.setenv("CONNECT_READ_TIMEOUT", "1.5")
+    assert proxy.ProxySettings().connect_read_timeout == 1.5
 
 
 # ---------------------------------------------------------------------------

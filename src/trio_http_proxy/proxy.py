@@ -14,7 +14,7 @@ import re
 from contextlib import nullcontext
 from functools import partial
 from io import DEFAULT_BUFFER_SIZE
-from os import getenv, strerror
+from os import strerror
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -31,6 +31,7 @@ from .cache import (
     RateLimitError,
     get_client_key,
 )
+from .config import DEFAULT_SETTINGS, ProxySettings
 from .connection import (
     _DEFAULT_PROXY_CACHE_SENTINEL,
     CV_CLIENT_STREAM,
@@ -45,61 +46,31 @@ from .connection import (
     format_conn_prefix,
 )
 from .errors import ProxyProtocolError, RequestTooLargeError
-from .util import _float_env, _retry_after_seconds
+from .util import _retry_after_seconds
 
-
-def _int_env(
-    name: str,
-    default: int,
-    min_val: int | None = None,
-    max_val: int | None = None,
-    _getenv: Any = getenv,
-) -> int:
-    try:
-        val = _getenv(name, default)
-    except TypeError:
-        val = _getenv(name)
-    if val is None or (isinstance(val, str) and not val.strip()):
-        res = default
-    else:
-        try:
-            res = int(val)
-        except ValueError:
-            raise ValueError(f"Invalid integer for {name}: {val!r}") from None
-    if min_val is not None and res < min_val:
-        raise ValueError(f"{name} must be >= {min_val}, got {res}")
-    if max_val is not None and res > max_val:
-        raise ValueError(f"{name} must be <= {max_val}, got {res}")
-    return res
-
-
-def _validate_bufmaxsz(val: int) -> int:
-    if val < 1:
-        raise ValueError(f"BUFMAXSZ must be >= 1, got {val}")
-    return val
-
+DEFAULT_PROXY_SETTINGS = DEFAULT_SETTINGS.proxy
 
 DEFAULT_PORT = 8080
-PORT = _int_env("PORT", DEFAULT_PORT, min_val=0, max_val=65535)
+PORT = DEFAULT_PROXY_SETTINGS.port
 
-BUFMAXSZ = _validate_bufmaxsz(_int_env("BUFMAXSZ", DEFAULT_BUFFER_SIZE, min_val=1))
+BUFMAXSZ = DEFAULT_PROXY_SETTINGS.bufmaxsz
 DEFAULT_MAXREQSZ = 16384
-MAXREQSZ = _int_env("MAXREQSZ", DEFAULT_MAXREQSZ, min_val=1)
+MAXREQSZ = DEFAULT_PROXY_SETTINGS.maxreqsz
 
 # Slowloris-shaped resource-exhaustion protection: without these, a slow or
 # stalled client/destination can hold a task open forever (see
 # .planning/known-shortcomings/findings.md).
 DEFAULT_CONNECT_READ_TIMEOUT = 10.0
-CONNECT_READ_TIMEOUT = _float_env("CONNECT_READ_TIMEOUT", DEFAULT_CONNECT_READ_TIMEOUT)
+CONNECT_READ_TIMEOUT = DEFAULT_PROXY_SETTINGS.connect_read_timeout
 
 DEFAULT_DEST_CONNECT_TIMEOUT = 10.0
-DEST_CONNECT_TIMEOUT = _float_env("DEST_CONNECT_TIMEOUT", DEFAULT_DEST_CONNECT_TIMEOUT)
+DEST_CONNECT_TIMEOUT = DEFAULT_PROXY_SETTINGS.dest_connect_timeout
 
 DEFAULT_PIPE_IDLE_TIMEOUT = 300.0
-PIPE_IDLE_TIMEOUT = _float_env("PIPE_IDLE_TIMEOUT", DEFAULT_PIPE_IDLE_TIMEOUT)
+PIPE_IDLE_TIMEOUT = DEFAULT_PROXY_SETTINGS.pipe_idle_timeout
 
 DEFAULT_PIPE_SEND_TIMEOUT = 30.0
-PIPE_SEND_TIMEOUT = _float_env("PIPE_SEND_TIMEOUT", DEFAULT_PIPE_SEND_TIMEOUT)
+PIPE_SEND_TIMEOUT = DEFAULT_PROXY_SETTINGS.pipe_send_timeout
 
 RETRY_AFTER_SECS = _retry_after_seconds(DEFAULT_RATE_LIMIT_PERIOD)
 
@@ -108,11 +79,11 @@ RETRY_AFTER_SECS = _retry_after_seconds(DEFAULT_RATE_LIMIT_PERIOD)
 # descriptors, as connections exceeding the limit wait in the limiter's
 # acquire queue holding their open client socket until a slot frees up.
 DEFAULT_MAXCONNS = 1000
-MAXCONNS = _int_env("MAXCONNS", DEFAULT_MAXCONNS, min_val=1)
+MAXCONNS = DEFAULT_PROXY_SETTINGS.maxconns
 CONN_LIMITER = trio.CapacityLimiter(MAXCONNS)
 
 DEFAULT_LOG_LEVEL = "INFO"
-LOG_LEVEL = getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
+LOG_LEVEL = DEFAULT_PROXY_SETTINGS.log_level
 
 
 def _http_429_response(retry_after: Any = None) -> bytes:
@@ -787,6 +758,7 @@ __all__ = [
     "DEFAULT_PIPE_IDLE_TIMEOUT",
     "DEFAULT_PIPE_SEND_TIMEOUT",
     "DEFAULT_PORT",
+    "DEFAULT_PROXY_SETTINGS",
     "DEST_CONNECT_TIMEOUT",
     "LOG_LEVEL",
     "MAXCONNS",
@@ -797,6 +769,7 @@ __all__ = [
     "ConnectionFilter",
     "ConnectionLoggerAdapter",
     "ProxyProtocolError",
+    "ProxySettings",
     "RequestTooLargeError",
     "format_conn_prefix",
     "http_proxy",
