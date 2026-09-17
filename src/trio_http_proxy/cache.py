@@ -91,6 +91,7 @@ def _failure_policy(value: str) -> str:
 
 CACHE_FAILURE_POLICY = _failure_policy(getenv("CACHE_FAILURE_POLICY", "fail-open"))
 DEFAULT_CACHE_FAILURE_POLICY = CACHE_FAILURE_POLICY
+DEFAULT_PROBE_INTERVAL: float = 30.0
 
 
 class CacheBackendUnavailable(RuntimeError):
@@ -512,7 +513,7 @@ class ProxyCache:
         cache_url: str = DEFAULT_CACHE_URL,
         enabled: bool = DEFAULT_CACHE_ENABLED,
         namespace: str = DEFAULT_CACHE_NAMESPACE,
-        dns_cache_ttl: str = DEFAULT_DNS_CACHE_TTL,
+        dns_cache_ttl: str | None = None,
         circuit_breaker_enabled: bool = DEFAULT_CIRCUIT_BREAKER_ENABLED,
         circuit_breaker_errors_rate: int = DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE,
         circuit_breaker_period: str = DEFAULT_CIRCUIT_BREAKER_PERIOD,
@@ -546,7 +547,11 @@ class ProxyCache:
         self.cache_url = cache_url
         self.enabled = enabled
         self.namespace = namespace.strip()
-        self.dns_cache_ttl: TTL = dns_cache_ttl
+        self._explicit_dns_cache_ttl = dns_cache_ttl is not None
+        actual_dns_ttl = (
+            dns_cache_ttl if dns_cache_ttl is not None else DEFAULT_DNS_CACHE_TTL
+        )
+        self.dns_cache_ttl: TTL = actual_dns_ttl
         self.circuit_breaker_enabled = circuit_breaker_enabled
         self.circuit_breaker_errors_rate = circuit_breaker_errors_rate
         self.circuit_breaker_period: TTL = circuit_breaker_period
@@ -590,6 +595,8 @@ class ProxyCache:
         self._stopping = False
         self._stop_complete = threading.Event()
         self._degraded = False
+        self._last_probe_time: float = 0.0
+        self._probe_lock = threading.Lock()
 
         cb_period = ttl_to_seconds(self.circuit_breaker_period)
         cb_ttl = ttl_to_seconds(self.circuit_breaker_ttl)
@@ -604,6 +611,18 @@ class ProxyCache:
         self._resolve_dns_fn: Callable[[str], Coroutine[Any, Any, list[str]]] | None = (
             None
         )
+
+    def _has_backend_features(self) -> bool:
+        """True if remote backend caching features are active and not explicitly disabled."""
+        if not self.enabled or not bool(self.cache_url and self.cache_url.strip()):
+            return False
+        if (
+            self._explicit_dns_cache_ttl
+            and self.dns_cache_ttl_sec <= 0
+            and not self.rate_limit_enabled
+        ):
+            return False
+        return True
 
     @property
     def configured_disabled(self) -> bool:
@@ -642,7 +661,7 @@ class ProxyCache:
             self._stopped = False
             self._stopping = False
             self._degraded = False
-            if not self.enabled or not self.cache_url:
+            if not self._has_backend_features():
                 self._started = True
                 return
 
@@ -691,28 +710,41 @@ class ProxyCache:
                 # ProxyCache is the sole owner of fail-open vs fail-closed policy.
                 self.cache.setup(self.cache_url, suppress=False)
                 self._register_decorators()
+                fut = asyncio.run_coroutine_threadsafe(self.cache.ping(), self._loop)
+                fut.result(timeout=self.startup_timeout)
             except Exception as exc:
                 setup_error = exc
-                logger.exception(
-                    "Failed to setup cashews cache with %s", self.cache_url
+                logger.warning(
+                    "Failed to setup cashews cache or startup ping failed with %s: %s",
+                    self.cache_url,
+                    exc,
                 )
-                self._stopped = True
-                self._started = False
-                stop_parts = self._begin_stop_locked()
+                if self.cache_failure_policy == "fail-closed":
+                    self._stopped = True
+                    self._started = False
+                    self._degraded = False
+                    stop_parts = self._begin_stop_locked()
+                else:
+                    self._degraded = True
+                    self._last_probe_time = time.monotonic()
+                    self._started = True
             else:
                 self._started = True
+                self._degraded = False
+                self._last_probe_time = time.monotonic()
 
         if setup_error is not None:
-            assert stop_parts is not None
-            self._finish_stop(*stop_parts)
+            if stop_parts is not None:
+                self._finish_stop(*stop_parts)
             if self.cache_failure_policy == "fail-open":
                 self._degraded = True
+                self._last_probe_time = time.monotonic()
                 with self._lock:
                     self._stopped = False
                     self._started = True
                 return
             raise CacheBackendUnavailable(
-                f"Unable to setup cache backend {self.cache_url!r}"
+                f"Unable to setup cache backend {self.cache_url!r}: {setup_error}"
             ) from setup_error
 
     def stop(self) -> None:
@@ -721,6 +753,10 @@ class ProxyCache:
             if self._stopping:
                 done = self._stop_complete
                 parts = None
+            elif self._loop is None and self._thread is None:
+                self._stopped = True
+                self._started = False
+                return
             elif not self._started and self._loop is None and self._thread is None:
                 self._stopped = True
                 return
@@ -792,6 +828,9 @@ class ProxyCache:
         if self._stopped:
             raise RuntimeError("ProxyCache has been stopped")
         if not self._started:
+            if not self._has_backend_features():
+                self._started = True
+                return
             self.start()
 
     def run_coroutine(self, coro: Coroutine[Any, Any, T], timeout: float = 10.0) -> T:
@@ -925,12 +964,40 @@ class ProxyCache:
                 exc,
             )
             self._degraded = True
+            self._last_probe_time = time.monotonic()
             return
         raise self._backend_error(operation, exc) from exc
+
+    async def _maybe_probe_backend(self) -> None:
+        """Periodically probe degraded backend to recover health when ping succeeds."""
+        if (
+            not self._degraded
+            or not self._has_backend_features()
+            or self._stopped
+            or self._stopping
+            or self._loop is None
+        ):
+            return
+
+        now = time.monotonic()
+        with self._probe_lock:
+            if now - self._last_probe_time < DEFAULT_PROBE_INTERVAL:
+                return
+            self._last_probe_time = now
+
+        try:
+            await self.run(self.cache.ping, timeout=5.0)
+        except Exception as exc:
+            logger.debug("Cache backend probe ping failed: %s", exc)
+        else:
+            logger.info("Cache backend recovered; restored normal operations")
+            self._degraded = False
 
     async def resolve_hosts(self, host: str) -> list[str]:
         """Resolve a destination host, bypassing cache on fail-open outages or degraded state."""
         self._ensure_started()
+        if self._degraded:
+            await self._maybe_probe_backend()
         if not self.enabled or self._degraded or self._resolve_dns_fn is None:
             return [host]
 
@@ -959,7 +1026,7 @@ class ProxyCache:
     async def check_circuit(self, host: str, port: int) -> CircuitPermit | None:
         """Verify that the destination circuit is not open and acquire a permit."""
         self._ensure_started()
-        if not self.enabled or self._degraded or not self.circuit_breaker_enabled:
+        if not self.circuit_breaker_enabled:
             return None
         permit = self._circuit_manager.acquire_permit(host, port)
         if permit is None:
@@ -975,13 +1042,15 @@ class ProxyCache:
     ) -> None:
         """Record a connection result in the Trio-native circuit breaker."""
         self._ensure_started()
-        if not self.enabled or self._degraded or not self.circuit_breaker_enabled:
+        if not self.circuit_breaker_enabled:
             return
         self._circuit_manager.record_result(host, port, exc, permit=permit)
 
     async def check_rate_limit(self, key: str) -> None:
         """Verify a key's quota and attach backend expiry on rejection."""
         self._ensure_started()
+        if self._degraded:
+            await self._maybe_probe_backend()
         if (
             not self.enabled
             or self._degraded

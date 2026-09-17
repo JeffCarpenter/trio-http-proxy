@@ -326,4 +326,61 @@
   - This surfaced an essential architectural invariant: `DestinationCircuitBreaker` encapsulates solely the local finite-state machine (counters, deque window, leases, state transitions) without holding destination identity. Target identity `(host, port)` is strictly owned by `CircuitBreakerManager` as dictionary keys.
   - Compiler-grade LSP diagnostics prevented an architectural abstraction leak before tests or runtime execution were ever dispatched.
 
+### 6.21 Local Circuit Breaker Coupling to Cache Degradation (P1 - Shipped Defect)
+* **Germane Symbols**:
+  * Gateway Methods: `ProxyCache.check_circuit`, `ProxyCache.record_connection_result`
+  * State Flag: `ProxyCache._degraded: bool`
+* **Defect**: `ProxyCache.check_circuit` and `record_connection_result` checked `if not self.enabled or self._degraded or not self.circuit_breaker_enabled: return None` / `return`. When the remote Redis backend went down in fail-open mode, `_degraded = True` bypassed local circuit breaker enforcement completely. Upstream connection errors were discarded, destinations were prevented from tripping to `OPEN`, and failing hosts were admitted without restriction during a Redis outage.
+* **Hardened Contract**:
+  - Local circuit breakers are in-memory state owned by `CircuitBreakerManager` with zero remote backend dependencies.
+  - Remove `self._degraded` bypass from both `check_circuit` and `record_connection_result`.
+  - Destination failure tracking, sliding window accounting, and circuit admission continue to operate at full capacity during backend outages.
+
+### 6.22 Conflation of Cache `enabled` with `circuit_breaker_enabled` (P1)
+* **Germane Symbols**:
+  * Configuration: `ProxyCache.enabled: bool`, `ProxyCache.circuit_breaker_enabled: bool`
+  * Gateway Methods: `ProxyCache.check_circuit`, `ProxyCache.record_connection_result`
+* **Defect**: In `ProxyCache.check_circuit`: `if not self.enabled ...: return None`. When caching was disabled (`CACHE_ENABLED=false` or `ProxyCache(enabled=False)`), the local in-memory circuit breaker was disabled as a side effect, even when `circuit_breaker_enabled=True`.
+* **Hardened Contract**:
+  - Disabling the remote cache backend must not disable the local circuit breaker.
+  - In `check_circuit` and `record_connection_result`, gate solely on `self.circuit_breaker_enabled`.
+  - In `clear()`, `_circuit_manager.clear()` resets in-memory breakers regardless of whether the cache backend is enabled.
+
+### 6.23 Unconditional Bridge Thread Spawning vs. True Zero-Overhead Mode (P1/P2)
+* **Germane Symbols**:
+  * Lifecycle: `ProxyCache.start`, `ProxyCache._ensure_started`
+  * Threading: `ProxyCache._thread: threading.Thread | None`, `ProxyCache._loop: asyncio.AbstractEventLoop | None`
+  * Features: `dns_cache_ttl_sec`, `rate_limit_enabled`
+* **Defect**: `ProxyCache.start()` spawned an asyncio event loop and a background OS thread (`cashews-trio-bridge`) whenever `self.enabled and self.cache_url`. With default configuration (`CACHE_URL="mem://"`, `DNS_CACHE_TTL="0s"`, `RATE_LIMIT_ENABLED=false`), zero backend features (DNS caching or rate limiting) were active, yet a background thread and loop were always created, leaking background resources.
+* **Hardened Contract**:
+  - When `not self.enabled` or `not self.cache_url`: no bridge thread or loop is spawned.
+  - When no backend features requiring Cashews are enabled (`dns_cache_ttl_sec <= 0` and `not self.rate_limit_enabled`), `start()` and `_ensure_started()` must not spawn a bridge thread (`_thread is None`, `_loop is None`).
+  - `ProxyCache.run` and `run_coroutine` lazily start the bridge thread on demand when called on an enabled cache, preserving compatibility with unit tests and general cache calls.
+
+### 6.24 Lazy Startup Illusion and Missing Startup Health Gating (P1)
+* **Germane Symbols**:
+  * Startup: `ProxyCache.start`
+  * Probing: `cashews.Cache.ping`
+  * Failure Policy: `ProxyCache.cache_failure_policy: str` (`"fail-closed"` vs `"fail-open"`)
+  * Exception: `CacheBackendUnavailable`
+* **Defect**: Cashews `setup()` merely configures the adapter without attempting a network handshake. An unreachable Redis server reported `is_running=True` at proxy boot, passing health checks and publishing ready status until the first user request failed.
+* **Hardened Contract**:
+  - When backend features are enabled, `cache.start()` executes an immediate `cache.cache.ping()` probe within `startup_timeout`.
+  - Under `cache_failure_policy == "fail-closed"`: transport failure or timeout during startup ping raises `CacheBackendUnavailable` immediately and cleanly stops the loop and joins the thread (`is_running=False`, `is_stopped=True`).
+  - Under `cache_failure_policy == "fail-open"`: transport failure transitions into degraded mode (`is_degraded=True`, `is_running=False`) without raising, keeping the loop alive for periodic recovery.
+  - On ping success: marks `is_running=True`, `is_degraded=False`.
+
+### 6.25 Sticky Degradation and Non-Throttled Health Probing (P1)
+* **Germane Symbols**:
+  * Flags: `ProxyCache._degraded: bool`, `ProxyCache._last_probe_at: float`
+  * Probe Method: `ProxyCache._maybe_probe_backend()`
+  * Recovery: `cashews.Cache.ping`
+* **Defect**: Once `_degraded = True` was set in fail-open mode, degradation was sticky and never recovered. A transient 100ms network blip permanently disabled rate limiting and DNS caching until proxy restart. Conversely, naively probing on every request during an outage would cause ping stampedes against a struggling backend.
+* **Hardened Contract**:
+  - Implement `_maybe_probe_backend()` with deterministic 30s probe throttling (`now - self._last_probe_at >= 30.0`).
+  - If throttled: return immediately without pinging.
+  - If window elapsed: attempt `cache.cache.ping()`.
+    - If ping succeeds: clear `_degraded = False`, set `is_running = True`, restoring rate limiting and DNS caching immediately.
+    - If ping fails: keep `_degraded = True` without raising exceptions or disrupting traffic.
+
 

@@ -626,3 +626,34 @@ def test_circuit_permit_context_manager_auto_abort():
     assert probe2 is not None
     assert breaker._half_open_in_flight
 
+
+@tt.trio_test
+async def test_circuit_breaker_functions_during_backend_outage():
+    """Verify that circuit breaker admission and recording function during backend outage (degraded)."""
+    async with ProxyCache(
+        cache_url="mem://",
+        circuit_breaker_enabled=True,
+        circuit_breaker_min_calls=2,
+        circuit_breaker_errors_rate=50,
+        cache_failure_policy="fail-open",
+    ) as cache:
+        # Simulate backend degradation (e.g. remote Redis outage in fail-open mode)
+        cache._degraded = True
+        assert cache.is_degraded is True
+
+        # Circuit breaker must not bypass: recording failures must still trip the breaker
+        permit1 = await cache.check_circuit("upstream.example.com", 80)
+        await cache.record_connection_result(
+            "upstream.example.com", 80, exc=ConnectionRefusedError("fail 1"), permit=permit1
+        )
+
+        permit2 = await cache.check_circuit("upstream.example.com", 80)
+        await cache.record_connection_result(
+            "upstream.example.com", 80, exc=ConnectionRefusedError("fail 2"), permit=permit2
+        )
+
+        # Circuit breaker must be OPEN and reject traffic even when backend is degraded
+        with pytest.raises(CircuitBreakerOpen):
+            await cache.check_circuit("upstream.example.com", 80)
+
+
