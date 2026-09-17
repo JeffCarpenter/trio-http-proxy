@@ -383,4 +383,30 @@
     - If ping succeeds: clear `_degraded = False`, set `is_running = True`, restoring rate limiting and DNS caching immediately.
     - If ping fails: keep `_degraded = True` without raising exceptions or disrupting traffic.
 
+### 6.26 `_ensure_started()` LifecycleState Synchronization (P1)
+* **Germane Symbols**:
+  * Lifecycle: `ProxyCache._ensure_started`, `ProxyCache.lifecycle_state`, `ProxyCache.is_running`
+  * State: `LifecycleState.RUNNING`
+* **Defect**: When lazily starting a cache where remote backend features are disabled (`enabled=False`, empty `cache_url`, or zero-TTL without rate limiting), `_ensure_started()` previously set `self._started = True` but left `self._lifecycle_state` at `LifecycleState.NEW`. Because `is_running` inspects `self._lifecycle_state == LifecycleState.RUNNING`, `cache.is_running` returned `False` despite the cache being fully operational.
+* **Hardened Contract**:
+  - In `_ensure_started()`, when starting without backend features, atomically set `self._started = True` and `self._lifecycle_state = LifecycleState.RUNNING` under `self._lock`.
+
+### 6.27 Strict Namespace Regex Validation with Backwards-Compatible Message Contracts (P2)
+* **Germane Symbols**:
+  * Validator: `ProxyCache.__init__`, `NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")`
+* **Defect**: Arbitrary characters (colons, spaces, regex metacharacters `*`, `?`, `[`) could be passed in `namespace`, risking key collisions or unintended wildcard eviction in Cashews `delete_match()`. However, completely replacing empty string checking with a single regex match broke the historical exception message contract `"Cache namespace must be a non-empty string"`.
+* **Hardened Contract**:
+  - First validate `isinstance(namespace, str) and namespace.strip()`, raising `"Cache namespace must be a non-empty string"` on empty/whitespace inputs.
+  - Next validate `NAMESPACE_PATTERN.match(namespace)`, raising `"Cache namespace must match '^[a-zA-Z0-9_-]+$', got {namespace!r}"` on illegal characters.
+
+### 6.28 URL Credential Redaction Across Exceptions and Telemetry (P2)
+* **Germane Symbols**:
+  * Sanitizer: `trio_http_proxy.util.redact_url`
+  * Call Sites: `CacheBackendUnavailable`, `logger.warning(...)` in `ProxyCache.start()`
+* **Defect**: Connection strings containing user credentials (`redis://user:secret@host:port`) were interpolated into `CacheBackendUnavailable` exception messages and logged directly to stderr when startup ping failed.
+* **Hardened Contract**:
+  - `redact_url(url: str) -> str` parses URLs via `urllib.parse.urlsplit` and masks the password portion with `***` (`redis://user:***@host:port`), preserving scheme, username, host, and port.
+  - All exception messages and loggers in `cache.py` pass `self.cache_url` through `redact_url()`.
+
+
 
