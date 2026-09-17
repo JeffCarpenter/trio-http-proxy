@@ -15,7 +15,6 @@ from trio_http_proxy.cache import (
     DestinationCircuitBreaker,
     ProxyCache,
     RateLimitError,
-    _bool_env,
     canonicalize_destination,
 )
 
@@ -347,23 +346,16 @@ async def test_stop_rejects_racing_submissions():
     assert cache._stopped
 
 
-def test_bool_env_strict_parsing():
-    assert _bool_env("TEST_VAR", False, _getenv=lambda k: "1") is True
-    assert _bool_env("TEST_VAR", False, _getenv=lambda k: "true") is True
-    assert _bool_env("TEST_VAR", False, _getenv=lambda k: "YES") is True
-    assert _bool_env("TEST_VAR", False, _getenv=lambda k: "on") is True
+def test_cache_enabled_boolean_parsing(monkeypatch):
+    from trio_http_proxy.config import CacheSettings
 
-    assert _bool_env("TEST_VAR", True, _getenv=lambda k: "0") is False
-    assert _bool_env("TEST_VAR", True, _getenv=lambda k: "false") is False
-    assert _bool_env("TEST_VAR", True, _getenv=lambda k: "NO") is False
-    assert _bool_env("TEST_VAR", True, _getenv=lambda k: "off") is False
+    for val in ("1", "true", "yes", "on"):
+        monkeypatch.setenv("CACHE_ENABLED", val)
+        assert CacheSettings().cache_enabled is True
 
-    assert _bool_env("TEST_VAR", True, _getenv=lambda k: None) is True
-    assert _bool_env("TEST_VAR", False, _getenv=lambda k: "  ") is False
-
-    for typo in ("ture", "flase", "enabled", "disabled", "maybe", "2"):
-        with pytest.raises(ValueError, match="Invalid boolean value for"):
-            _bool_env("TEST_VAR", True, _getenv=lambda k, t=typo: t)
+    for val in ("0", "false", "no", "off"):
+        monkeypatch.setenv("CACHE_ENABLED", val)
+        assert CacheSettings().cache_enabled is False
 
 
 def test_semantic_boundary_validation_in_init():

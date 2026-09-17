@@ -7,6 +7,9 @@ import threading
 import time
 from collections import OrderedDict
 
+from cashews.ttl import ttl_to_seconds
+
+from ..config import CircuitBreakerSettings
 from .circuit_permit import CircuitPermit
 from .circuit_state import CircuitState
 from .destination_circuit_breaker import DestinationCircuitBreaker
@@ -36,7 +39,20 @@ class CircuitBreakerManager:
         ttl: float = 30.0,
         min_calls: int = 3,
         max_destinations: int = DEFAULT_MAX_DESTINATIONS,
+        settings: CircuitBreakerSettings | None = None,
     ) -> None:
+        if settings is not None:
+            errors_rate = settings.circuit_breaker_errors_rate
+            parsed_period = ttl_to_seconds(settings.circuit_breaker_period)
+            if parsed_period is not None:
+                period = float(parsed_period)
+            parsed_ttl = ttl_to_seconds(settings.circuit_breaker_ttl)
+            if parsed_ttl is not None:
+                ttl = float(parsed_ttl)
+            min_calls = settings.circuit_breaker_min_calls
+            max_destinations = settings.circuit_breaker_max_destinations
+
+        self.settings = settings
         self.errors_rate = errors_rate
         self.period = period
         self.ttl = ttl
