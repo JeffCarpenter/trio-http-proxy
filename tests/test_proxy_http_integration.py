@@ -112,3 +112,30 @@ async def test_http_proxy_post_connect_cache_failure_closes_destination() -> Non
     with pytest.raises(trio.ClosedResourceError):
         await destination_stream.send_all(b"must not tunnel")
     await destination_peer.aclose()
+
+
+async def test_http_proxy_tunnels_to_real_destination_server(
+    dest_server_port: int,
+) -> None:
+    proxy_stream, client_stream = tt.memory_stream_pair()
+    attach_peer(proxy_stream)
+
+    target = f"127.0.0.1:{dest_server_port}".encode()
+    await client_stream.send_all(connect_request(target))
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(proxy.http_proxy, proxy_stream)
+
+        assert (
+            await client_stream.receive_some(4096)
+            == http.http_200_connection_established
+        )
+
+        await client_stream.send_all(b"GET / HTTP/1.1\r\n")
+        response = await client_stream.receive_some(4096)
+        # Without this, the client->dest pipe direction has no EOF to find and
+        # blocks the nursery exit for the full PIPE_IDLE_TIMEOUT (300s default).
+        await client_stream.aclose()
+
+    assert response.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert response.endswith(b"GET / HTTP/1.1")
