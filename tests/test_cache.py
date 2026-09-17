@@ -51,12 +51,15 @@ class StreamWithSocket:
 @tt.trio_test
 async def test_proxy_cache_basic_get_set():
     async with ProxyCache(cache_url="mem://") as pc:
-        await pc.run(pc.cache.set, "test-key", "test-val", expire="10s")
-        val = await pc.run(pc.cache.get, "test-key")
+        key = f"{pc.namespace}:test-key"
+        await pc.run(pc.cache.set, key, "test-val", expire="10s")
+        val = await pc.run(pc.cache.get, key)
         assert val == "test-val"
+        await pc.run(pc.cache.set, "unrelated:key", "keep-me")
         await pc.clear()
-        val_after_clear = await pc.run(pc.cache.get, "test-key")
+        val_after_clear = await pc.run(pc.cache.get, key)
         assert val_after_clear is None
+        assert await pc.run(pc.cache.get, "unrelated:key") == "keep-me"
 
 
 @tt.trio_test

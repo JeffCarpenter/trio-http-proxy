@@ -1,0 +1,8 @@
+Goal: Audit custom proxy_cache propagation through start_server and whether MAXCONNS + N idle accepted clients keep file-descriptor and task population bounded.
+Scope: Read-only inspection of src/trio_http_proxy/proxy.py, tests/, README*, CLAUDE.md, and pyproject.toml. You may run read-only test/listing commands. Write nothing.
+Context: Repository: /home/jeff/code/fork/trio_http_proxy
+This is an HTTP CONNECT proxy using Trio, h11, and cashews. Current HEAD is 463df1b. The repository is clean. Existing tests are in tests/test_proxy.py, tests/test_cache.py, and tests/test_findings_repro.py. This is DESIGN/AUDIT ONLY: do not edit any file.
+
+Accept: For each of the two invariants, cite exact current code paths and existing tests, state PASS/FAIL/UNTESTED, identify root cause if deficient, and propose a deterministic test plus minimal design options. Distinguish tunnel concurrency from accepted socket/task bounding.
+Constraints: You do NOT have permission to delegate: do not spawn or invoke any other agent/worker. Do not edit, create, delete, or format repository files. If out-of-scope work is needed, STOP and report BLOCKED. Treat current docs/code as evidence, not assumed truth. Report only after checking the actual repository.
+Report format: RESULT: DONE|BLOCKED|SPLIT; then Findings; Evidence (commands and results); Proposed acceptance test/design; Files changed (must be none).

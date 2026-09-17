@@ -1,0 +1,8 @@
+Goal: Audit CONNECT parsing size boundaries, preservation of trailing bytes, behavior for a header exactly at MAXREQSZ, and invalid request-target octets.
+Scope: Read-only inspection of src/trio_http_proxy/proxy.py, tests/, README*, CLAUDE.md, and installed h11 behavior. You may run throwaway Python commands but may not create or edit repository files.
+Context: Repository: /home/jeff/code/fork/trio_http_proxy
+This is an HTTP CONNECT proxy using Trio, h11, and cashews. Current HEAD is 463df1b. The repository is clean. Existing tests are in tests/test_proxy.py, tests/test_cache.py, and tests/test_findings_repro.py. This is DESIGN/AUDIT ONLY: do not edit any file.
+
+Accept: Give byte-precise findings for header < max with total read > max, header exactly at limit, and invalid target octets. State current behavior and whether deterministic. Propose explicit documented semantics and focused tests, citing h11/proxy behavior.
+Constraints: You do NOT have permission to delegate: do not spawn or invoke any other agent/worker. Do not edit, create, delete, or format repository files. If out-of-scope work is needed, STOP and report BLOCKED. Treat current docs/code as evidence, not assumed truth. Report only after checking the actual repository.
+Report format: RESULT: DONE|BLOCKED|SPLIT; then Findings; Evidence (commands and results); Proposed acceptance test/design; Files changed (must be none).
