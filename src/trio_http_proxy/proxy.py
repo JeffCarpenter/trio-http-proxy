@@ -12,8 +12,7 @@ import inspect
 import logging
 import re
 from contextlib import nullcontext
-from functools import partial
-from io import DEFAULT_BUFFER_SIZE
+from functools import cache, partial
 from os import strerror
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,15 +22,13 @@ import trio
 
 from . import http
 from .cache import (
-    DEFAULT_PROXY_CACHE,
-    DEFAULT_RATE_LIMIT_PERIOD,
     CacheBackendUnavailable,
     CircuitBreakerOpen,
     CircuitPermit,
     RateLimitError,
     get_client_key,
 )
-from .config import DEFAULT_SETTINGS, ProxySettings
+from .config import ProxySettings, get_settings
 from .connection import (
     _DEFAULT_PROXY_CACHE_SENTINEL,
     CV_CLIENT_STREAM,
@@ -46,44 +43,16 @@ from .connection import (
     format_conn_prefix,
 )
 from .errors import ProxyProtocolError, RequestTooLargeError
-from .util import _retry_after_seconds
+from .proxy_cache import get_default_proxy_cache
 
-DEFAULT_PROXY_SETTINGS = DEFAULT_SETTINGS.proxy
 
-DEFAULT_PORT = 8080
-PORT = DEFAULT_PROXY_SETTINGS.port
+@cache
+def get_conn_limiter() -> trio.CapacityLimiter:
+    """Shared connection-capacity limiter, sized from current settings (MAXCONNS)."""
+    return trio.CapacityLimiter(get_settings().proxy.maxconns)
 
-BUFMAXSZ = DEFAULT_PROXY_SETTINGS.bufmaxsz
-DEFAULT_MAXREQSZ = 16384
-MAXREQSZ = DEFAULT_PROXY_SETTINGS.maxreqsz
 
-# Slowloris-shaped resource-exhaustion protection: without these, a slow or
-# stalled client/destination can hold a task open forever (see
-# .planning/known-shortcomings/findings.md).
-DEFAULT_CONNECT_READ_TIMEOUT = 10.0
-CONNECT_READ_TIMEOUT = DEFAULT_PROXY_SETTINGS.connect_read_timeout
-
-DEFAULT_DEST_CONNECT_TIMEOUT = 10.0
-DEST_CONNECT_TIMEOUT = DEFAULT_PROXY_SETTINGS.dest_connect_timeout
-
-DEFAULT_PIPE_IDLE_TIMEOUT = 300.0
-PIPE_IDLE_TIMEOUT = DEFAULT_PROXY_SETTINGS.pipe_idle_timeout
-
-DEFAULT_PIPE_SEND_TIMEOUT = 30.0
-PIPE_SEND_TIMEOUT = DEFAULT_PROXY_SETTINGS.pipe_send_timeout
-
-RETRY_AFTER_SECS = _retry_after_seconds(DEFAULT_RATE_LIMIT_PERIOD)
-
-# Connection cap: bounds how many active proxy tunnels run concurrently.
-# Note: this limits active tunnels/sessions, not raw accepted socket file
-# descriptors, as connections exceeding the limit wait in the limiter's
-# acquire queue holding their open client socket until a slot frees up.
-DEFAULT_MAXCONNS = 1000
-MAXCONNS = DEFAULT_PROXY_SETTINGS.maxconns
-CONN_LIMITER = trio.CapacityLimiter(MAXCONNS)
-
-DEFAULT_LOG_LEVEL = "INFO"
-LOG_LEVEL = DEFAULT_PROXY_SETTINGS.log_level
+reset_conn_limiter = get_conn_limiter.cache_clear
 
 
 def _http_429_response(retry_after: Any = None) -> bytes:
@@ -118,17 +87,25 @@ async def http_proxy(
     client_stream,
     _nextid=_conn_ids.__next__,
     _connect=trio.open_tcp_stream,
-    idle_timeout=PIPE_IDLE_TIMEOUT,
-    send_timeout=PIPE_SEND_TIMEOUT,
-    limiter: trio.CapacityLimiter | None = CONN_LIMITER,
+    idle_timeout: float | None = None,
+    send_timeout: float | None = None,
+    limiter: trio.CapacityLimiter | None = None,
     proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
+    _proxy_cfg = get_settings().proxy
+    idle_timeout = (
+        idle_timeout if idle_timeout is not None else _proxy_cfg.pipe_idle_timeout
+    )
+    send_timeout = (
+        send_timeout if send_timeout is not None else _proxy_cfg.pipe_send_timeout
+    )
+    limiter = limiter if limiter is not None else get_conn_limiter()
     if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
         cv_cache = CV_PROXY_CACHE.get()
         if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
             proxy_cache = cv_cache
         else:
-            proxy_cache = DEFAULT_PROXY_CACHE
+            proxy_cache = get_default_proxy_cache()
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
     limiter_ctx = limiter if limiter is not None else nullcontext()
@@ -291,10 +268,12 @@ async def _serve_tcp_gated(
     *,
     host: str | bytes | None = None,
     backlog: int | None = None,
-    limiter: trio.CapacityLimiter = CONN_LIMITER,
+    limiter: trio.CapacityLimiter | None = None,
     listeners: list[trio.SocketListener] | None = None,
     task_status: trio.TaskStatus[list[trio.SocketListener]] = trio.TASK_STATUS_IGNORED,
 ) -> None:
+    if limiter is None:
+        limiter = get_conn_limiter()
     if listeners is None:
         listeners = await trio.open_tcp_listeners(port, host=host, backlog=backlog)
     async with trio.open_nursery() as nursery:
@@ -307,14 +286,23 @@ async def _serve_tcp_gated(
 
 async def start_server(
     server=http_proxy,
-    port=PORT,
+    port: int | None = None,
     _serve=None,
     proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
-    limiter: trio.CapacityLimiter | None = CONN_LIMITER,
+    limiter: trio.CapacityLimiter | None = None,
     task_status: trio.TaskStatus[Any] = trio.TASK_STATUS_IGNORED,
 ):
+    if port is None:
+        port = get_settings().proxy.port
+    if limiter is None:
+        limiter = get_conn_limiter()
     if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
-        proxy_cache = DEFAULT_PROXY_CACHE
+        cv_cache = CV_PROXY_CACHE.get()
+        proxy_cache = (
+            cv_cache
+            if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL
+            else get_default_proxy_cache()
+        )
     cache_token = CV_PROXY_CACHE.set(proxy_cache)
     try:
         if proxy_cache is not None and hasattr(proxy_cache, "start"):
@@ -354,7 +342,7 @@ async def start_server(
                 await _serve_tcp_gated(
                     handler,
                     port,
-                    limiter=limiter if limiter is not None else CONN_LIMITER,
+                    limiter=limiter,
                     task_status=task_status,
                 )
         except* KeyboardInterrupt:
@@ -389,8 +377,8 @@ async def _record_connection_result(
 async def tunnel(
     client_stream,
     _connect=trio.open_tcp_stream,
-    read_timeout=CONNECT_READ_TIMEOUT,
-    dest_connect_timeout=DEST_CONNECT_TIMEOUT,
+    read_timeout: float | None = None,
+    dest_connect_timeout: float | None = None,
     proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
     """Given a stream from a client containing an HTTP CONNECT request,
@@ -398,12 +386,17 @@ async def tunnel(
     and notify the client when the end-to-end connection has been established.
     Return the destination stream.
     """
+    if read_timeout is None:
+        read_timeout = get_settings().proxy.connect_read_timeout
+    if dest_connect_timeout is None:
+        dest_connect_timeout = get_settings().proxy.dest_connect_timeout
+
     if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
         cv_cache = CV_PROXY_CACHE.get()
         if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
             proxy_cache = cv_cache
         else:
-            proxy_cache = DEFAULT_PROXY_CACHE
+            proxy_cache = get_default_proxy_cache()
     try:
         connect_res = await process_as_connect_request(
             client_stream, read_timeout=read_timeout
@@ -577,7 +570,10 @@ async def tunnel(
 
 
 async def process_as_connect_request(
-    stream, bufmaxsz=BUFMAXSZ, maxreqsz=MAXREQSZ, read_timeout=CONNECT_READ_TIMEOUT
+    stream,
+    bufmaxsz: int | None = None,
+    maxreqsz: int | None = None,
+    read_timeout: float | None = None,
 ):
     """Read a stream expected to contain a valid HTTP CONNECT request to desthost:destport.
     Parse and return (destination host, port, trailing_bytes). Validate (lightly) and raise if request invalid.
@@ -585,6 +581,12 @@ async def process_as_connect_request(
     Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout
     seconds -- guards against a slowloris-style client trickling bytes forever.
     """
+    _proxy_cfg = get_settings().proxy
+    bufmaxsz = bufmaxsz if bufmaxsz is not None else _proxy_cfg.bufmaxsz
+    maxreqsz = maxreqsz if maxreqsz is not None else _proxy_cfg.maxreqsz
+    read_timeout = (
+        read_timeout if read_timeout is not None else _proxy_cfg.connect_read_timeout
+    )
     logger.debug("Reading...")
     raw_buf = bytearray()
     with trio.fail_after(read_timeout):
@@ -651,7 +653,7 @@ async def process_as_connect_request(
 
 
 async def pipe(
-    from_stream, to_stream, bufmaxsz=BUFMAXSZ, on_receive=None, on_send=None
+    from_stream, to_stream, bufmaxsz: int | None = None, on_receive=None, on_send=None
 ):
     """Forward chunks from from_stream to to_stream until EOF.
     on_receive and on_send, when given, are called with no arguments right
@@ -662,6 +664,8 @@ async def pipe(
     which keeps a reusable function like this one oblivious to them.
     On EOF, calls to_stream.send_eof() if supported to signal half-close.
     """
+    if bufmaxsz is None:
+        bufmaxsz = get_settings().proxy.bufmaxsz
     CV_PIPE_FROM.set(from_stream)
     while True:
         chunk = await from_stream.receive_some(bufmaxsz)
@@ -684,9 +688,9 @@ async def pipe(
 async def pipe_with_timeout(
     from_stream,
     to_stream,
-    bufmaxsz=BUFMAXSZ,
-    idle_timeout=PIPE_IDLE_TIMEOUT,
-    send_timeout=PIPE_SEND_TIMEOUT,
+    bufmaxsz: int | None = None,
+    idle_timeout: float | None = None,
+    send_timeout: float | None = None,
 ):
     """Run pipe(from_stream, to_stream), raising trio.TooSlowError if
     idle_timeout seconds pass with no data received, or send_timeout
@@ -696,6 +700,13 @@ async def pipe_with_timeout(
     caller, and nudges its deadline from pipe()'s on_receive/on_send hooks
     rather than making pipe() take a timeout= parameter of its own.
     """
+    _proxy_cfg = get_settings().proxy
+    if bufmaxsz is None:
+        bufmaxsz = _proxy_cfg.bufmaxsz
+    if idle_timeout is None:
+        idle_timeout = _proxy_cfg.pipe_idle_timeout
+    if send_timeout is None:
+        send_timeout = _proxy_cfg.pipe_send_timeout
     phase = "idle"
 
     def on_receive():
@@ -729,7 +740,7 @@ def main(args: list[str] | None = None) -> None:
         print("Usage: trio_http_proxy [PORT]")
         return
     logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        level=getattr(logging, get_settings().proxy.log_level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
     trio.run(start_server)
@@ -740,43 +751,26 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "BUFMAXSZ",
-    "CONNECT_READ_TIMEOUT",
-    "CONN_LIMITER",
     "CV_CLIENT_STREAM",
     "CV_CONN_ID",
     "CV_DESTHOST",
     "CV_DEST_STREAM",
     "CV_PIPE_FROM",
     "CV_PROXY_CACHE",
-    "DEFAULT_BUFFER_SIZE",
-    "DEFAULT_CONNECT_READ_TIMEOUT",
-    "DEFAULT_DEST_CONNECT_TIMEOUT",
-    "DEFAULT_LOG_LEVEL",
-    "DEFAULT_MAXCONNS",
-    "DEFAULT_MAXREQSZ",
-    "DEFAULT_PIPE_IDLE_TIMEOUT",
-    "DEFAULT_PIPE_SEND_TIMEOUT",
-    "DEFAULT_PORT",
-    "DEFAULT_PROXY_SETTINGS",
-    "DEST_CONNECT_TIMEOUT",
-    "LOG_LEVEL",
-    "MAXCONNS",
-    "MAXREQSZ",
-    "PIPE_IDLE_TIMEOUT",
-    "PIPE_SEND_TIMEOUT",
-    "PORT",
     "ConnectionFilter",
     "ConnectionLoggerAdapter",
     "ProxyProtocolError",
     "ProxySettings",
     "RequestTooLargeError",
     "format_conn_prefix",
+    "get_conn_limiter",
+    "get_default_proxy_cache",
     "http_proxy",
     "main",
     "pipe",
     "pipe_with_timeout",
     "process_as_connect_request",
+    "reset_conn_limiter",
     "start_server",
     "tunnel",
 ]

@@ -1,7 +1,6 @@
 """Circuit breaker implementation for destination-based fault isolation."""
 
 from .circuit_breaker_manager import (
-    DEFAULT_MAX_DESTINATIONS,
     CircuitBreakerManager,
     canonicalize_destination,
 )
@@ -10,7 +9,6 @@ from .circuit_state import CircuitState
 from .destination_circuit_breaker import DestinationCircuitBreaker
 
 __all__ = [
-    "DEFAULT_MAX_DESTINATIONS",
     "CircuitBreakerManager",
     "CircuitPermit",
     "CircuitState",

@@ -7,7 +7,6 @@ import ipaddress
 import logging
 import math
 import queue
-import re
 import socket
 import threading
 import time
@@ -17,11 +16,9 @@ from typing import Any, Self, TypeVar, cast
 import cashews
 import trio
 from cashews import Cache, CircuitBreakerOpen
-from cashews.ttl import TTL, ttl_to_seconds
 
 from .cache.lifecycle_state import LifecycleState
 from .circuit_breaker import (
-    DEFAULT_MAX_DESTINATIONS,
     CircuitBreakerManager,
     CircuitPermit,
 )
@@ -30,39 +27,28 @@ from .util import redact_url
 
 logger = logging.getLogger(__name__)
 
-NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
-
 T = TypeVar("T")
 
 from .config import (
-    DEFAULT_SETTINGS,
+    NAMESPACE_PATTERN,
     CacheSettings,
-    CircuitBreakerSettings,
-    RateLimitSettings,
     Settings,
+    get_settings,
+    normalize_failure_policy,
+    parse_duration_seconds,
+    validate_namespace,
 )
 
-DEFAULT_CACHE_SETTINGS = DEFAULT_SETTINGS.cache
-DEFAULT_CB_SETTINGS = DEFAULT_SETTINGS.circuit_breaker
-DEFAULT_RL_SETTINGS = DEFAULT_SETTINGS.rate_limit
 
-DEFAULT_CACHE_URL = DEFAULT_CACHE_SETTINGS.cache_url
-DEFAULT_CACHE_ENABLED = DEFAULT_CACHE_SETTINGS.cache_enabled
-DEFAULT_CACHE_NAMESPACE = DEFAULT_CACHE_SETTINGS.cache_namespace
-DEFAULT_DNS_CACHE_TTL = DEFAULT_CACHE_SETTINGS.dns_cache_ttl
-DEFAULT_CIRCUIT_BREAKER_ENABLED = DEFAULT_CB_SETTINGS.circuit_breaker_enabled
-DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE = DEFAULT_CB_SETTINGS.circuit_breaker_errors_rate
-DEFAULT_CIRCUIT_BREAKER_PERIOD = DEFAULT_CB_SETTINGS.circuit_breaker_period
-DEFAULT_CIRCUIT_BREAKER_TTL = DEFAULT_CB_SETTINGS.circuit_breaker_ttl
-DEFAULT_CIRCUIT_BREAKER_MIN_CALLS = DEFAULT_CB_SETTINGS.circuit_breaker_min_calls
-DEFAULT_RATE_LIMIT_ENABLED = DEFAULT_RL_SETTINGS.rate_limit_enabled
-DEFAULT_RATE_LIMIT = DEFAULT_RL_SETTINGS.rate_limit
-DEFAULT_RATE_LIMIT_PERIOD = DEFAULT_RL_SETTINGS.rate_limit_period
-DEFAULT_RATE_LIMIT_TTL = DEFAULT_RL_SETTINGS.rate_limit_ttl
+def normalize_optional_duration_local(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped == "0s":
+        return None
+    parse_duration_seconds(stripped, field="rate_limit_ttl")
+    return stripped
 
-CACHE_FAILURE_POLICY = DEFAULT_CACHE_SETTINGS.cache_failure_policy
-DEFAULT_CACHE_FAILURE_POLICY = CACHE_FAILURE_POLICY
-DEFAULT_PROBE_INTERVAL: float = DEFAULT_CACHE_SETTINGS.probe_interval
 
 BACKEND_EXCEPTIONS: tuple[type[Exception], ...] = (
     cashews.exceptions.CacheError,
@@ -87,92 +73,94 @@ class ProxyCache:
 
     def __init__(
         self,
-        cache_url: str = DEFAULT_CACHE_URL,
-        enabled: bool = DEFAULT_CACHE_ENABLED,
-        namespace: str = DEFAULT_CACHE_NAMESPACE,
+        cache_url: str | None = None,
+        enabled: bool | None = None,
+        namespace: str | None = None,
         dns_cache_ttl: str | None = None,
-        circuit_breaker_enabled: bool = DEFAULT_CIRCUIT_BREAKER_ENABLED,
-        circuit_breaker_errors_rate: int = DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE,
-        circuit_breaker_period: str = DEFAULT_CIRCUIT_BREAKER_PERIOD,
-        circuit_breaker_ttl: str = DEFAULT_CIRCUIT_BREAKER_TTL,
-        circuit_breaker_min_calls: int = DEFAULT_CIRCUIT_BREAKER_MIN_CALLS,
-        circuit_breaker_max_destinations: int = DEFAULT_MAX_DESTINATIONS,
-        rate_limit_enabled: bool = DEFAULT_RATE_LIMIT_ENABLED,
-        rate_limit: int = DEFAULT_RATE_LIMIT,
-        rate_limit_period: str = DEFAULT_RATE_LIMIT_PERIOD,
-        rate_limit_ttl: str | None = DEFAULT_RATE_LIMIT_TTL,
-        failure_policy: str = CACHE_FAILURE_POLICY,
+        circuit_breaker_enabled: bool | None = None,
+        circuit_breaker_errors_rate: int | None = None,
+        circuit_breaker_period: str | None = None,
+        circuit_breaker_ttl: str | None = None,
+        circuit_breaker_min_calls: int | None = None,
+        circuit_breaker_max_destinations: int | None = None,
+        rate_limit_enabled: bool | None = None,
+        rate_limit: int | None = None,
+        rate_limit_period: str | None = None,
+        rate_limit_ttl: str | None = None,
+        failure_policy: str | None = None,
         cache_failure_policy: str | None = None,
-        startup_timeout: float = 5.0,
+        startup_timeout: float | None = None,
         settings: Settings | CacheSettings | None = None,
     ) -> None:
-        if settings is not None:
-            if isinstance(settings, Settings):
-                if cache_url == DEFAULT_CACHE_URL:
-                    cache_url = settings.cache.cache_url
-                if enabled == DEFAULT_CACHE_ENABLED:
-                    enabled = settings.cache.cache_enabled
-                if namespace == DEFAULT_CACHE_NAMESPACE:
-                    namespace = settings.cache.cache_namespace
-                if dns_cache_ttl is None:
-                    dns_cache_ttl = settings.cache.dns_cache_ttl
-                if circuit_breaker_enabled == DEFAULT_CIRCUIT_BREAKER_ENABLED:
-                    circuit_breaker_enabled = (
-                        settings.circuit_breaker.circuit_breaker_enabled
-                    )
-                if circuit_breaker_errors_rate == DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE:
-                    circuit_breaker_errors_rate = (
-                        settings.circuit_breaker.circuit_breaker_errors_rate
-                    )
-                if circuit_breaker_period == DEFAULT_CIRCUIT_BREAKER_PERIOD:
-                    circuit_breaker_period = (
-                        settings.circuit_breaker.circuit_breaker_period
-                    )
-                if circuit_breaker_ttl == DEFAULT_CIRCUIT_BREAKER_TTL:
-                    circuit_breaker_ttl = settings.circuit_breaker.circuit_breaker_ttl
-                if circuit_breaker_min_calls == DEFAULT_CIRCUIT_BREAKER_MIN_CALLS:
-                    circuit_breaker_min_calls = (
-                        settings.circuit_breaker.circuit_breaker_min_calls
-                    )
-                if circuit_breaker_max_destinations == DEFAULT_MAX_DESTINATIONS:
-                    circuit_breaker_max_destinations = (
-                        settings.circuit_breaker.circuit_breaker_max_destinations
-                    )
-                if rate_limit_enabled == DEFAULT_RATE_LIMIT_ENABLED:
-                    rate_limit_enabled = settings.rate_limit.rate_limit_enabled
-                if rate_limit == DEFAULT_RATE_LIMIT:
-                    rate_limit = settings.rate_limit.rate_limit
-                if rate_limit_period == DEFAULT_RATE_LIMIT_PERIOD:
-                    rate_limit_period = settings.rate_limit.rate_limit_period
-                if rate_limit_ttl == DEFAULT_RATE_LIMIT_TTL:
-                    rate_limit_ttl = settings.rate_limit.rate_limit_ttl
-                if failure_policy == CACHE_FAILURE_POLICY:
-                    failure_policy = settings.cache.cache_failure_policy
-                if startup_timeout == 5.0:
-                    startup_timeout = settings.cache.startup_timeout
-            elif isinstance(settings, CacheSettings):
-                if cache_url == DEFAULT_CACHE_URL:
-                    cache_url = settings.cache_url
-                if enabled == DEFAULT_CACHE_ENABLED:
-                    enabled = settings.cache_enabled
-                if namespace == DEFAULT_CACHE_NAMESPACE:
-                    namespace = settings.cache_namespace
-                if dns_cache_ttl is None:
-                    dns_cache_ttl = settings.dns_cache_ttl
-                if failure_policy == CACHE_FAILURE_POLICY:
-                    failure_policy = settings.cache_failure_policy
-                if startup_timeout == 5.0:
-                    startup_timeout = settings.startup_timeout
+        _explicit_dns_cache_ttl = dns_cache_ttl is not None
+        base = settings if isinstance(settings, Settings) else get_settings()
+        cache_group = settings if isinstance(settings, CacheSettings) else base.cache
+        cb_group = base.circuit_breaker
+        rl_group = base.rate_limit
+
+        cache_url = cache_url if cache_url is not None else cache_group.cache_url
+        enabled = enabled if enabled is not None else cache_group.cache_enabled
+        namespace = namespace if namespace is not None else cache_group.cache_namespace
+        dns_cache_ttl = (
+            dns_cache_ttl if dns_cache_ttl is not None else cache_group.dns_cache_ttl
+        )
+        circuit_breaker_enabled = (
+            circuit_breaker_enabled
+            if circuit_breaker_enabled is not None
+            else cb_group.circuit_breaker_enabled
+        )
+        circuit_breaker_errors_rate = (
+            circuit_breaker_errors_rate
+            if circuit_breaker_errors_rate is not None
+            else cb_group.circuit_breaker_errors_rate
+        )
+        circuit_breaker_period = (
+            circuit_breaker_period
+            if circuit_breaker_period is not None
+            else cb_group.circuit_breaker_period
+        )
+        circuit_breaker_ttl = (
+            circuit_breaker_ttl
+            if circuit_breaker_ttl is not None
+            else cb_group.circuit_breaker_ttl
+        )
+        circuit_breaker_min_calls = (
+            circuit_breaker_min_calls
+            if circuit_breaker_min_calls is not None
+            else cb_group.circuit_breaker_min_calls
+        )
+        circuit_breaker_max_destinations = (
+            circuit_breaker_max_destinations
+            if circuit_breaker_max_destinations is not None
+            else cb_group.circuit_breaker_max_destinations
+        )
+        rate_limit_enabled = (
+            rate_limit_enabled
+            if rate_limit_enabled is not None
+            else rl_group.rate_limit_enabled
+        )
+        rate_limit = rate_limit if rate_limit is not None else rl_group.rate_limit
+        rate_limit_period = (
+            rate_limit_period
+            if rate_limit_period is not None
+            else rl_group.rate_limit_period
+        )
+        rate_limit_ttl = (
+            rate_limit_ttl if rate_limit_ttl is not None else rl_group.rate_limit_ttl
+        )
+        if cache_failure_policy is not None:
+            failure_policy = cache_failure_policy
+        if failure_policy is None:
+            failure_policy = cache_group.cache_failure_policy
+        startup_timeout = (
+            startup_timeout
+            if startup_timeout is not None
+            else cache_group.startup_timeout
+        )
 
         self.settings: Settings | CacheSettings | None = settings
         # Semantic boundary validation in constructor
-        if not isinstance(namespace, str) or not namespace.strip():
-            raise ValueError("Cache namespace must be a non-empty string")
-        _stripped_namespace = namespace.strip()
-        if not NAMESPACE_PATTERN.match(_stripped_namespace):
-            raise ValueError(
-                f"Cache namespace must match '^[a-zA-Z0-9_-]+$', got {namespace!r}"
-            )
+        _stripped_namespace = validate_namespace(namespace)
         if not 1 <= circuit_breaker_errors_rate <= 99:
             raise ValueError(
                 f"circuit_breaker_errors_rate must be between 1 and 99, got {circuit_breaker_errors_rate}"
@@ -189,65 +177,44 @@ class ProxyCache:
         self.cache_url = cache_url
         self.enabled = enabled
         self.namespace = _stripped_namespace
-        self._explicit_dns_cache_ttl = dns_cache_ttl is not None
-        actual_dns_ttl = (
-            dns_cache_ttl if dns_cache_ttl is not None else DEFAULT_DNS_CACHE_TTL
-        )
-        self.dns_cache_ttl: TTL = actual_dns_ttl
+        self._explicit_dns_cache_ttl = _explicit_dns_cache_ttl
+        self.dns_cache_ttl: str = dns_cache_ttl
         self.circuit_breaker_enabled = circuit_breaker_enabled
         self.circuit_breaker_errors_rate = circuit_breaker_errors_rate
-        self.circuit_breaker_period: TTL = circuit_breaker_period
-        self.circuit_breaker_ttl: TTL = circuit_breaker_ttl
+        self.circuit_breaker_period: str = circuit_breaker_period
+        self.circuit_breaker_ttl: str = circuit_breaker_ttl
         self.circuit_breaker_min_calls = circuit_breaker_min_calls
         self.circuit_breaker_max_destinations = circuit_breaker_max_destinations
         self.rate_limit_enabled = rate_limit_enabled
         self.rate_limit = rate_limit
-        self.rate_limit_period: TTL = rate_limit_period
-        self.rate_limit_ttl: TTL = (
-            rate_limit_ttl if rate_limit_ttl is not None else self.rate_limit_period
+        self.rate_limit_period: str = rate_limit_period
+        _rl_ttl = normalize_optional_duration_local(rate_limit_ttl)
+        self.rate_limit_ttl: str | None = (
+            _rl_ttl if _rl_ttl is not None else self.rate_limit_period
         )
-        try:
-            parsed_period = ttl_to_seconds(self.rate_limit_period)
-        except ValueError, TypeError:
-            parsed_period = None
-        if parsed_period is None or parsed_period <= 0:
-            raise ValueError(
-                f"rate_limit_period must evaluate to > 0 seconds, got {rate_limit_period!r}"
-            )
-        self.rate_limit_period_sec = float(parsed_period)
-
-        try:
-            parsed_ttl = ttl_to_seconds(self.rate_limit_ttl)
-        except ValueError, TypeError:
-            parsed_ttl = None
-        if parsed_ttl is None or parsed_ttl <= 0:
-            raise ValueError(
-                f"rate_limit_ttl must evaluate to > 0 seconds, got {rate_limit_ttl!r}"
-            )
-        self.rate_limit_ttl_sec = float(parsed_ttl)
-
-        try:
-            parsed_dns_ttl = ttl_to_seconds(self.dns_cache_ttl)
-        except ValueError, TypeError:
-            parsed_dns_ttl = None
-        self.dns_cache_ttl_sec = (
-            float(parsed_dns_ttl)
-            if parsed_dns_ttl is not None and parsed_dns_ttl > 0
-            else 0.0
+        self.rate_limit_period_sec = parse_duration_seconds(
+            self.rate_limit_period, field="rate_limit_period"
         )
+        self.rate_limit_ttl_sec = parse_duration_seconds(
+            self.rate_limit_ttl, field="rate_limit_ttl"
+        )
+        self.dns_cache_ttl_sec = parse_duration_seconds(
+            self.dns_cache_ttl, field="dns_cache_ttl", allow_zero=True
+        )
+        self.failure_policy = normalize_failure_policy(failure_policy)
+        self.cache_failure_policy = self.failure_policy
+        self.probe_interval: float = cache_group.probe_interval
+        self.startup_timeout: float = startup_timeout
         if cache_failure_policy is not None:
             failure_policy = cache_failure_policy
-        norm_policy = (
-            failure_policy.strip().lower()
-            if isinstance(failure_policy, str)
-            else str(failure_policy)
+        if failure_policy is None:
+            failure_policy = cache_group.cache_failure_policy
+        startup_timeout = (
+            startup_timeout
+            if startup_timeout is not None
+            else cache_group.startup_timeout
         )
-        if norm_policy not in {"fail-open", "fail-closed"}:
-            raise ValueError(
-                "CACHE_FAILURE_POLICY must be either 'fail-open' or 'fail-closed'"
-            )
-        self.failure_policy = norm_policy
-        self.cache_failure_policy = self.failure_policy
+
         self.startup_timeout = startup_timeout
 
         self.cache = Cache(name="trio_http_proxy")
@@ -264,12 +231,14 @@ class ProxyCache:
         self._last_probe_time: float = 0.0
         self._probe_lock = threading.Lock()
 
-        cb_period = ttl_to_seconds(self.circuit_breaker_period)
-        cb_ttl = ttl_to_seconds(self.circuit_breaker_ttl)
         self._circuit_manager = CircuitBreakerManager(
             errors_rate=self.circuit_breaker_errors_rate,
-            period=float(cb_period) if cb_period is not None else 60.0,
-            ttl=float(cb_ttl) if cb_ttl is not None else 30.0,
+            period=parse_duration_seconds(
+                self.circuit_breaker_period, field="circuit_breaker_period"
+            ),
+            ttl=parse_duration_seconds(
+                self.circuit_breaker_ttl, field="circuit_breaker_ttl"
+            ),
             min_calls=self.circuit_breaker_min_calls,
             max_destinations=self.circuit_breaker_max_destinations,
         )
@@ -691,12 +660,12 @@ class ProxyCache:
 
         now = time.monotonic()
         with self._probe_lock:
-            if now - self._last_probe_time < DEFAULT_PROBE_INTERVAL:
+            if now - self._last_probe_time < self.probe_interval:
                 return
             self._last_probe_time = now
 
         try:
-            await self.run(self.cache.ping, timeout=5.0)
+            await self.run(self.cache.ping, timeout=self.startup_timeout)
         except BACKEND_EXCEPTIONS as exc:
             logger.debug("Cache backend probe ping failed: %s", exc)
         else:
@@ -770,10 +739,12 @@ class ProxyCache:
             return
 
         rate_key = f"{self.namespace}:rate:{key}"
-        parsed_period = ttl_to_seconds(self.rate_limit_period)
-        period_sec = int(parsed_period) if parsed_period is not None else 60
+        parsed_period = parse_duration_seconds(
+            self.rate_limit_period, field="rate_limit_period"
+        )
+        period_sec = int(parsed_period)
         parsed_ttl = (
-            ttl_to_seconds(self.rate_limit_ttl)
+            parse_duration_seconds(self.rate_limit_ttl, field="rate_limit_ttl")
             if self.rate_limit_ttl is not None
             else None
         )
@@ -856,35 +827,27 @@ def get_client_key(stream: Any) -> str | None:
     return None
 
 
-DEFAULT_PROXY_CACHE = ProxyCache()
+_DEFAULT_PROXY_CACHE_INSTANCE: ProxyCache | None = None
+_DEFAULT_PROXY_CACHE_LOCK = threading.Lock()
+
+
+def get_default_proxy_cache() -> ProxyCache:
+    """Lazily construct the shared default ProxyCache (no import-time env reads)."""
+    global _DEFAULT_PROXY_CACHE_INSTANCE
+    with _DEFAULT_PROXY_CACHE_LOCK:
+        if _DEFAULT_PROXY_CACHE_INSTANCE is None:
+            _DEFAULT_PROXY_CACHE_INSTANCE = ProxyCache()
+        return _DEFAULT_PROXY_CACHE_INSTANCE
+
 
 __all__ = [
     "BACKEND_EXCEPTIONS",
-    "CACHE_FAILURE_POLICY",
-    "DEFAULT_CACHE_ENABLED",
-    "DEFAULT_CACHE_FAILURE_POLICY",
-    "DEFAULT_CACHE_NAMESPACE",
-    "DEFAULT_CACHE_SETTINGS",
-    "DEFAULT_CACHE_URL",
-    "DEFAULT_CB_SETTINGS",
-    "DEFAULT_CIRCUIT_BREAKER_ENABLED",
-    "DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE",
-    "DEFAULT_CIRCUIT_BREAKER_MIN_CALLS",
-    "DEFAULT_CIRCUIT_BREAKER_PERIOD",
-    "DEFAULT_CIRCUIT_BREAKER_TTL",
-    "DEFAULT_DNS_CACHE_TTL",
-    "DEFAULT_PROBE_INTERVAL",
-    "DEFAULT_PROXY_CACHE",
-    "DEFAULT_RATE_LIMIT",
-    "DEFAULT_RATE_LIMIT_ENABLED",
-    "DEFAULT_RATE_LIMIT_PERIOD",
-    "DEFAULT_RATE_LIMIT_TTL",
-    "DEFAULT_RL_SETTINGS",
     "NAMESPACE_PATTERN",
-    "CacheSettings",
-    "CircuitBreakerSettings",
+    "LifecycleState",
     "ProxyCache",
-    "RateLimitSettings",
-    "Settings",
     "get_client_key",
+    "get_default_proxy_cache",
+    "normalize_failure_policy",
+    "normalize_optional_duration_local",
+    "validate_namespace",
 ]

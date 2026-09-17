@@ -7,14 +7,10 @@ import threading
 import time
 from collections import OrderedDict
 
-from cashews.ttl import ttl_to_seconds
-
-from ..config import CircuitBreakerSettings
+from ..config import CircuitBreakerSettings, get_settings
 from .circuit_permit import CircuitPermit
 from .circuit_state import CircuitState
 from .destination_circuit_breaker import DestinationCircuitBreaker
-
-DEFAULT_MAX_DESTINATIONS: int = 10_000
 
 
 def canonicalize_destination(host: str, port: int) -> tuple[str, int]:
@@ -34,23 +30,27 @@ class CircuitBreakerManager:
 
     def __init__(
         self,
-        errors_rate: int = 50,
-        period: float = 60.0,
-        ttl: float = 30.0,
-        min_calls: int = 3,
-        max_destinations: int = DEFAULT_MAX_DESTINATIONS,
+        errors_rate: int | None = None,
+        period: float | None = None,
+        ttl: float | None = None,
+        min_calls: int | None = None,
+        max_destinations: int | None = None,
         settings: CircuitBreakerSettings | None = None,
     ) -> None:
-        if settings is not None:
-            errors_rate = settings.circuit_breaker_errors_rate
-            parsed_period = ttl_to_seconds(settings.circuit_breaker_period)
-            if parsed_period is not None:
-                period = float(parsed_period)
-            parsed_ttl = ttl_to_seconds(settings.circuit_breaker_ttl)
-            if parsed_ttl is not None:
-                ttl = float(parsed_ttl)
-            min_calls = settings.circuit_breaker_min_calls
-            max_destinations = settings.circuit_breaker_max_destinations
+        base = settings if settings is not None else get_settings().circuit_breaker
+        errors_rate = (
+            errors_rate if errors_rate is not None else base.circuit_breaker_errors_rate
+        )
+        period = period if period is not None else base.circuit_breaker_period_seconds
+        ttl = ttl if ttl is not None else base.circuit_breaker_ttl_seconds
+        min_calls = (
+            min_calls if min_calls is not None else base.circuit_breaker_min_calls
+        )
+        max_destinations = (
+            max_destinations
+            if max_destinations is not None
+            else base.circuit_breaker_max_destinations
+        )
 
         self.settings = settings
         self.errors_rate = errors_rate
@@ -142,7 +142,6 @@ class CircuitBreakerManager:
 
 
 __all__ = [
-    "DEFAULT_MAX_DESTINATIONS",
     "CircuitBreakerManager",
     "canonicalize_destination",
 ]

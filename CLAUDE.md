@@ -31,9 +31,10 @@ uv run trio_http_proxy & sleep 1; curl -x http://127.0.0.1:8080 https://canhazip
 ## Architecture
 
 Everything lives in `src/trio_http_proxy/`:
+- `config/`: Typed configuration via pydantic-settings. `Settings` is a frozen, init-only composite of `ProxySettings`, `CacheSettings`, `CircuitBreakerSettings`, and `RateLimitSettings`. Resolution order: explicit init kwargs > `TRIO_HTTP_PROXY_*` env vars > `.env` file > defaults (legacy unprefixed names like `PORT`/`BUFMAXSZ` are still accepted as aliases). Access via `get_settings()` (cached singleton; `reset_settings_cache()` clears it) — never at import time. Helpers: `parse_duration_seconds`, `normalize_failure_policy`, `validate_namespace`. Parsed-once `*_seconds` properties are exposed as pydantic PrivateAttrs on the group models. There are **no module-level config constants** (no `PORT`, `LOG_LEVEL`, `DEFAULT_*`); consumers take `None`-defaulted params and resolve `get_settings()` at call time. The default shared connection limiter is `get_conn_limiter()` (memoized; `reset_conn_limiter()` for tests), and the default cache is the lazy `get_default_proxy_cache()` singleton. The `CV_PROXY_CACHE` ContextVar overrides the default cache for a whole call tree (set `None` to disable caching).
 - `proxy.py`: Core HTTP CONNECT protocol handling, socket tunneling, bidirectional piping, connection-aware logging, and server lifecycle.
-- `cache.py`: `ProxyCache` bridging `cashews` async operations to Trio via a dedicated background asyncio thread runner, providing destination DNS resolution caching, circuit breaker fail-fast protection for unhealthy upstream hosts, and client rate limiting.
-- `__init__.py`: Re-exports public symbols from `.proxy` and `.cache`.
+- `proxy_cache.py` + `cache/`: `ProxyCache` bridging `cashews` async operations to Trio via a dedicated background asyncio thread runner, providing destination DNS resolution caching, circuit breaker fail-fast protection for unhealthy upstream hosts, and client rate limiting. `circuit_breaker_manager.py` holds the per-destination breaker registry.
+- `__init__.py`: Re-exports public symbols from `.config`, `.proxy`, `.cache`, and `.errors`.
 
 - `start_server` calls `trio.serve_tcp(http_proxy, port)` and manages the `proxy_cache` lifecycle. Each inbound TCP connection spawns `http_proxy` as its own Trio task.
 - `http_proxy(client_stream, proxy_cache=...)` is the per-connection entry point: it checks client rate limits, calls `tunnel()` to complete the CONNECT handshake, then runs two `pipe_with_timeout()` tasks concurrently in a nursery — one for each direction of the tunnel — so data flows client→dest and dest→client simultaneously until either side closes or stalls.
@@ -45,10 +46,12 @@ Everything lives in `src/trio_http_proxy/`:
 
 ## Configuration (Environment Variables)
 
+All variables may be written with the canonical prefix (`TRIO_HTTP_PROXY_PORT`, ...) or unprefixed legacy names (`PORT`, ...). Duration values accept `30`, `30s`, `5m`, `1h`; `0s` or empty string means **disabled** (falls back or bypasses the feature).
+
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | Proxy listen port |
-| `BUFMAXSZ` | `8192` | Maximum chunk read buffer size (bytes) |
+| `BUFMAXSZ` | `131072` | Maximum chunk read buffer size (bytes) |
 | `MAXREQSZ` | `16384` | Maximum CONNECT request header size (bytes) |
 | `CONNECT_READ_TIMEOUT` | `10.0` | Maximum time (seconds) to wait for complete CONNECT request |
 | `DEST_CONNECT_TIMEOUT` | `10.0` | Maximum time (seconds) to wait for destination TCP connect |
@@ -58,13 +61,18 @@ Everything lives in `src/trio_http_proxy/`:
 | `LOG_LEVEL` | `INFO` | Minimum log level (DEBUG, INFO, WARNING, ERROR) |
 | `CACHE_URL` | `mem://` | Cashews cache backend (`mem://`, `disk://...`, `redis://...`) |
 | `CACHE_ENABLED` | `true` | Enable or disable cashews caching entirely |
-| `DNS_CACHE_TTL` | `0s` | TTL for destination DNS resolution caching (`0s` = pass through to trio) |
+| `CACHE_NAMESPACE` | `trio_http_proxy` | Key namespace for all cache entries |
+| `DNS_CACHE_TTL` | `0s` | TTL for destination DNS resolution caching (`0s` = disabled, pass through to trio) |
+| `CACHE_FAILURE_POLICY` | `fail-open` | Backend-outage behavior (`fail-open` / `fail-closed`) |
+| `PROBE_INTERVAL` | `30.0` | Seconds between backend health probes while degraded |
+| `STARTUP_TIMEOUT` | `5.0` | Seconds to wait for cache backend startup ping |
 | `CIRCUIT_BREAKER_ENABLED` | `true` | Enable circuit breaking for destination hosts |
 | `CIRCUIT_BREAKER_ERRORS_RATE`| `50` | Error percentage threshold to trip circuit |
 | `CIRCUIT_BREAKER_PERIOD` | `60s` | Circuit breaker sliding window period |
 | `CIRCUIT_BREAKER_TTL` | `30s` | Circuit open cooldown duration |
 | `CIRCUIT_BREAKER_MIN_CALLS` | `3` | Minimum connection attempts before circuit can trip |
+| `CIRCUIT_BREAKER_MAX_DESTINATIONS` | `10000` | Cap on tracked per-destination breakers |
 | `RATE_LIMIT_ENABLED` | `false`| Enable client connection rate limiting |
 | `RATE_LIMIT` | `0` | Requests allowed per client IP within `RATE_LIMIT_PERIOD` (0 = unlimited) |
 | `RATE_LIMIT_PERIOD` | `60s` | Window for client rate limiting |
-| `RATE_LIMIT_TTL` | `60s` | Key expiry TTL for rate limiter in cashews |
+| `RATE_LIMIT_TTL` | unset | Ban TTL after exceeding the limit (unset or `0s` = same as `RATE_LIMIT_PERIOD`) |

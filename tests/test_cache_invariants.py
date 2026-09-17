@@ -7,7 +7,6 @@ import trio
 import trio.testing as tt
 
 from trio_http_proxy.cache import (
-    CACHE_FAILURE_POLICY,
     CacheBackendUnavailable,
     CircuitBreakerManager,
     CircuitBreakerOpen,
@@ -19,8 +18,8 @@ from trio_http_proxy.cache import (
 )
 
 
-def test_failure_policy_default_and_validation():
-    assert CACHE_FAILURE_POLICY == "fail-open"
+def test_failure_policy_default_and_validation(cache_settings):
+    assert cache_settings.cache_failure_policy == "fail-open"
     assert (
         ProxyCache(cache_failure_policy="fail-open").cache_failure_policy == "fail-open"
     )
@@ -491,8 +490,8 @@ def test_rate_limit_zero_duration_rejection():
         ProxyCache(rate_limit_period="0s")
     with pytest.raises(ValueError, match="rate_limit_ttl must evaluate to > 0"):
         ProxyCache(rate_limit_ttl="0")
-    with pytest.raises(ValueError, match="rate_limit_ttl must evaluate to > 0"):
-        ProxyCache(rate_limit_ttl="0s")
+    # "0s"/"" now uniformly mean disabled: rate-limit TTL falls back to period
+    assert ProxyCache(rate_limit_ttl="0s").rate_limit_ttl_sec > 0
 
 
 @tt.trio_test
