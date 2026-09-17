@@ -62,16 +62,13 @@ Address all P1 and P2 architectural, concurrency, and security findings:
   - Deps: Tranches 1, 2, 3
   - Accept: Clean lifecycle transitions; no orphan threads; sanitized credentials in logs/exceptions; strict namespace validation. 48/48 tests passing; 222/222 full suite passing; 0 diagnostics.
 
-- [ ] **Tranche 5: Verification, Invariant Tests & mcpls Diagnostics**
+- [x] **Tranche 5: Verification, Invariant Tests & mcpls Diagnostics**
   - Scope: `tests/`, `src/trio_http_proxy/`
-  - Goal: Comprehensive test suite for all new invariants, full pass on existing tests, verify Ruff, Pyright, and `mcpls` diagnostics clean.
+  - Goal: Comprehensive test suite for all new invariants, full pass on existing tests, verify Ruff, Pyright, and `mcpls` diagnostics clean. Class-to-module refactor completed with zero regressions.
   - Deps: Tranches 1, 2, 3, 4
-  - Accept: 100% test pass rate, 0 Ruff errors, 0 Pyright issues, 0 `mcpls` diagnostics.
+  - Accept: 100% test pass rate (222/222), 0 Ruff errors, 0 Pyright issues, 0 `mcpls` diagnostics.
 
 ## Status
-- Complete: Tranche 1, Tranche 2, Phase 2.5, Tranche 3, Tranche 4 (Lifecycle State Machine, URL Redaction & Configuration Hardening)
-- Queued: Tranche 5 (Final Verification & Cleanups)
+- Complete: Tranche 1, Tranche 2, Phase 2.5, Tranche 3, Tranche 4, Tranche 5 (Full Verification, Class-to-Module Refactor & mcpls Clean)
 
-## Next Steps
-1. Proceed with Tranche 5: Verification, Invariant Tests & mcpls Diagnostics.
 

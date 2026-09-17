@@ -97,7 +97,9 @@ class TestUrlCredentialRedaction:
     """Invariant §5.1: Credential redaction in URLs for logs and exceptions."""
 
     def test_redact_url_function_exported(self) -> None:
-        assert redact_url is not None, "redact_url function must be exported from trio_http_proxy.util"
+        assert redact_url is not None, (
+            "redact_url function must be exported from trio_http_proxy.util"
+        )
 
     @pytest.mark.parametrize(
         ("raw_url", "expected_redacted"),
@@ -131,7 +133,9 @@ class TestUrlCredentialRedaction:
     def test_redact_url_sanitizes_userinfo(
         self, raw_url: str, expected_redacted: str
     ) -> None:
-        assert redact_url is not None, "redact_url function must be exported from trio_http_proxy.util"
+        assert redact_url is not None, (
+            "redact_url function must be exported from trio_http_proxy.util"
+        )
         assert redact_url(raw_url) == expected_redacted
 
     def test_cache_backend_unavailable_exception_redacts_credentials(self) -> None:
@@ -146,10 +150,14 @@ class TestUrlCredentialRedaction:
             cache.start()
 
         msg = str(exc_info.value)
-        assert "super_secret_pw" not in msg, f"Password leaked in exception message: {msg}"
+        assert "super_secret_pw" not in msg, (
+            f"Password leaked in exception message: {msg}"
+        )
         assert "user:***@127.0.0.1:6379" in msg
 
-    def test_startup_failure_log_redacts_credentials(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_startup_failure_log_redacts_credentials(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         raw_url = "redis://app_user:secret_token_xyz@127.0.0.1:6379/0"
         cache = ProxyCache(
             cache_url=raw_url,
@@ -162,21 +170,27 @@ class TestUrlCredentialRedaction:
             cache.stop()
 
         for record in caplog.records:
-            assert "secret_token_xyz" not in record.message, f"Password leaked in log message: {record.message}"
+            assert "secret_token_xyz" not in record.message, (
+                f"Password leaked in log message: {record.message}"
+            )
 
 
 class TestLifecycleStateMachine:
     """Invariant §4.2: LifecycleState enum, atomic transitions & restart prohibition."""
 
     def test_lifecycle_state_enum_exported_with_required_members(self) -> None:
-        assert LifecycleState is not None, "LifecycleState enum must be exported from trio_http_proxy.cache"
+        assert LifecycleState is not None, (
+            "LifecycleState enum must be exported from trio_http_proxy.cache"
+        )
         member_names = [m.name for m in LifecycleState]
         expected_members = ["NEW", "STARTING", "RUNNING", "STOPPING", "STOPPED"]
         assert member_names == expected_members
 
     def test_initial_lifecycle_state_is_new(self) -> None:
         cache = ProxyCache(enabled=False)
-        assert hasattr(cache, "lifecycle_state"), "ProxyCache must expose lifecycle_state property"
+        assert hasattr(cache, "lifecycle_state"), (
+            "ProxyCache must expose lifecycle_state property"
+        )
         assert cache.lifecycle_state == LifecycleState.NEW
         assert not cache.is_running
         assert not cache.is_stopped
@@ -229,7 +243,9 @@ class TestStartupTimeoutThreadLeakPrevention:
 
     def test_startup_aborted_event_initialized(self) -> None:
         cache = ProxyCache(enabled=False)
-        assert hasattr(cache, "_startup_aborted"), "ProxyCache must define _startup_aborted threading.Event"
+        assert hasattr(cache, "_startup_aborted"), (
+            "ProxyCache must define _startup_aborted threading.Event"
+        )
         assert isinstance(cache._startup_aborted, threading.Event)
         assert not cache._startup_aborted.is_set()
 
@@ -272,13 +288,17 @@ class TestStartupTimeoutThreadLeakPrevention:
 
         # Invariant: _startup_aborted must be set on timeout
         assert hasattr(cache, "_startup_aborted")
-        assert cache._startup_aborted.is_set(), "_startup_aborted must be set when startup times out"
+        assert cache._startup_aborted.is_set(), (
+            "_startup_aborted must be set when startup times out"
+        )
         assert cache.lifecycle_state == LifecycleState.STOPPED
 
         # Unblock thread and verify it cleanly aborts without running loop.run_forever()
         unblock_thread.set()
         thread_exited.wait(timeout=1.0)
-        assert thread_exited.is_set(), "Delayed thread must terminate after observing abort event"
+        assert thread_exited.is_set(), (
+            "Delayed thread must terminate after observing abort event"
+        )
 
 
 class TestBridgeShutdownProtocol:
@@ -305,7 +325,9 @@ class TestBridgeShutdownProtocol:
 
         try:
             cache.stop()
-            assert asyncgens_shutdown_called, "loop.shutdown_asyncgens() was not called during bridge stop"
+            assert asyncgens_shutdown_called, (
+                "loop.shutdown_asyncgens() was not called during bridge stop"
+            )
             assert cache.lifecycle_state == LifecycleState.STOPPED
         finally:
             if not cache.is_stopped:

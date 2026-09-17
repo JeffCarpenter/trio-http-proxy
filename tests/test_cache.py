@@ -201,7 +201,9 @@ async def test_http_proxy_with_rate_limit_exceeded():
         async with trio.open_nursery() as nursery:
             nursery.start_soon(partial(http_proxy, stream_with_sock, proxy_cache=pc))
             reply = await test_client.receive_some(4096)
-            assert reply == http.http_429_too_many_requests % ttl_to_seconds(pc.rate_limit_period)
+            assert reply == http.http_429_too_many_requests % ttl_to_seconds(
+                pc.rate_limit_period
+            )
             remainder = await test_client.receive_some(4096)
             assert remainder == b""
 

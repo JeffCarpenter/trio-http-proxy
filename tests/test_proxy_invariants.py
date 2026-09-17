@@ -25,6 +25,7 @@ def connect_request(target=b"example.com:443", extra=b""):
 @tt.trio_test
 async def test_invariant_1_start_server_uses_exact_custom_proxy_cache():
     """A custom proxy_cache passed to start_server is the exact object used by handlers."""
+
     class CustomCache:
         def __init__(self):
             self.started = False
@@ -66,9 +67,13 @@ async def test_invariant_1_start_server_uses_exact_custom_proxy_cache():
 
 
 @tt.trio_test
-async def test_invariant_1_start_server_resets_cache_context_after_shutdown(monkeypatch):
+async def test_invariant_1_start_server_resets_cache_context_after_shutdown(
+    monkeypatch,
+):
     """A stopped custom cache is not reused by later defaulted calls."""
-    custom_cache = type("CustomCache", (), {"start": lambda self: None, "stop": lambda self: None})()
+    custom_cache = type(
+        "CustomCache", (), {"start": lambda self: None, "stop": lambda self: None}
+    )()
     fallback_cache: Any = type("FallbackCache", (), {})()
     checks = []
 
@@ -515,9 +520,13 @@ async def test_invariant_2_failed_handler_start_closes_stream_and_releases_token
     assert limiter.borrowed_tokens == 0
 
 
-@pytest.mark.parametrize("accept_errno", [errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM])
+@pytest.mark.parametrize(
+    "accept_errno", [errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM]
+)
 @tt.trio_test
-async def test_invariant_2_transient_accept_errors_retry(accept_errno, caplog, mock_clock):
+async def test_invariant_2_transient_accept_errors_retry(
+    accept_errno, caplog, mock_clock
+):
     """Transient accept resource errors release capacity, sleep, and retry."""
     limiter = trio.CapacityLimiter(1)
     stream = tt.memory_stream_pair()[0]

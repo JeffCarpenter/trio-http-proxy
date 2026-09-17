@@ -538,6 +538,7 @@ async def test_backend_error_boundary_reraises_programming_errors(monkeypatch):
         dns_cache_ttl="60s",
         cache_failure_policy="fail-open",
     ) as cache:
+
         async def broken_get(*args, **kwargs):
             raise TypeError("internal bug: wrong type passed")
 
@@ -566,11 +567,15 @@ async def test_proxy_cache_check_circuit_and_record_connection_result_protocol()
         permit1 = await pc.check_circuit("api.service.local", 443)
         assert permit1 is not None
         assert not permit1.is_probe
-        await pc.record_connection_result("api.service.local", 443, exc=OSError("down 1"), permit=permit1)
+        await pc.record_connection_result(
+            "api.service.local", 443, exc=OSError("down 1"), permit=permit1
+        )
 
         permit2 = await pc.check_circuit("api.service.local", 443)
         assert permit2 is not None
-        await pc.record_connection_result("api.service.local", 443, exc=OSError("down 2"), permit=permit2)
+        await pc.record_connection_result(
+            "api.service.local", 443, exc=OSError("down 2"), permit=permit2
+        )
 
         # 2. Breaker has tripped to OPEN
         with pytest.raises(CircuitBreakerOpen):
@@ -593,7 +598,9 @@ async def test_proxy_cache_check_circuit_and_record_connection_result_protocol()
             await pc.check_circuit("api.service.local", 443)
 
         # 5. Successful probe connection records result and closes breaker
-        await pc.record_connection_result("api.service.local", 443, exc=None, permit=probe_permit)
+        await pc.record_connection_result(
+            "api.service.local", 443, exc=None, permit=probe_permit
+        )
         assert breaker.state == CircuitState.CLOSED
 
         # 6. Normal traffic resumes
@@ -604,7 +611,9 @@ async def test_proxy_cache_check_circuit_and_record_connection_result_protocol()
 
 def test_circuit_permit_context_manager_auto_abort():
     """Verify that uncompleted with-statement exit automatically aborts permit."""
-    breaker = DestinationCircuitBreaker(errors_rate=50, period=10.0, ttl=5.0, min_calls=1)
+    breaker = DestinationCircuitBreaker(
+        errors_rate=50, period=10.0, ttl=5.0, min_calls=1
+    )
     breaker.record_result(OSError("trip"), now=1000.0)
     assert breaker.state == CircuitState.OPEN
 
@@ -644,16 +653,20 @@ async def test_circuit_breaker_functions_during_backend_outage():
         # Circuit breaker must not bypass: recording failures must still trip the breaker
         permit1 = await cache.check_circuit("upstream.example.com", 80)
         await cache.record_connection_result(
-            "upstream.example.com", 80, exc=ConnectionRefusedError("fail 1"), permit=permit1
+            "upstream.example.com",
+            80,
+            exc=ConnectionRefusedError("fail 1"),
+            permit=permit1,
         )
 
         permit2 = await cache.check_circuit("upstream.example.com", 80)
         await cache.record_connection_result(
-            "upstream.example.com", 80, exc=ConnectionRefusedError("fail 2"), permit=permit2
+            "upstream.example.com",
+            80,
+            exc=ConnectionRefusedError("fail 2"),
+            permit=permit2,
         )
 
         # Circuit breaker must be OPEN and reject traffic even when backend is degraded
         with pytest.raises(CircuitBreakerOpen):
             await cache.check_circuit("upstream.example.com", 80)
-
-

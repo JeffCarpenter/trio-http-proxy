@@ -11,12 +11,9 @@ import errno
 import inspect
 import logging
 import re
-from collections.abc import MutableMapping
 from contextlib import nullcontext
-from contextvars import ContextVar
 from functools import partial
 from io import DEFAULT_BUFFER_SIZE
-from itertools import count
 from os import getenv, strerror
 from typing import Any
 from urllib.parse import urlsplit
@@ -34,6 +31,21 @@ from .cache import (
     RateLimitError,
     get_client_key,
 )
+from .connection_context import (
+    _DEFAULT_PROXY_CACHE_SENTINEL,
+    CV_CLIENT_STREAM,
+    CV_CONN_ID,
+    CV_DEST_STREAM,
+    CV_DESTHOST,
+    CV_PIPE_FROM,
+    CV_PROXY_CACHE,
+    _conn_ids,
+    format_conn_prefix,
+)
+from .connection_filter import ConnectionFilter
+from .connection_logger_adapter import ConnectionLoggerAdapter
+from .proxy_protocol_error import ProxyProtocolError
+from .request_too_large_error import RequestTooLargeError
 from .util import _float_env, _retry_after_seconds
 
 
@@ -125,114 +137,9 @@ def _http_429_response(retry_after: Any = None) -> bytes:
     return http.http_429_too_many_requests % retry_after
 
 
-class ProxyProtocolError(ValueError):
-    """The client's CONNECT request is malformed or violates the
-    authority-form contract (RFC 7231 section 4.3.6). Raised in place of
-    `assert` so validation survives `python -O` (asserts are stripped under
-    optimization, silently turning every one of these checks into a no-op)."""
-
-
-class RequestTooLargeError(ProxyProtocolError):
-    """The CONNECT request exceeded maxreqsz before a complete request
-    arrived. A subclass of ProxyProtocolError so it's still caught wherever
-    that is, but distinguishable so tunnel() can reply 414 instead of 400."""
-
-
-CV_CLIENT_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
-    "client_stream", default=None
-)
-CV_DEST_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
-    "dest_stream", default=None
-)
-CV_PIPE_FROM: ContextVar[trio.SocketStream | None] = ContextVar(
-    "pipe_from", default=None
-)
-CV_DESTHOST: ContextVar[str | None] = ContextVar("desthost", default=None)
-CV_CONN_ID: ContextVar[int | None] = ContextVar("conn_id", default=None)
-_DEFAULT_PROXY_CACHE_SENTINEL = object()
-CV_PROXY_CACHE: ContextVar[Any] = ContextVar(
-    "proxy_cache", default=_DEFAULT_PROXY_CACHE_SENTINEL
-)
-
-_conn_ids = count(1)
-
 LOGGER_NAME = "trio_http_proxy"
 _raw_logger = logging.getLogger(LOGGER_NAME if __name__ == "__main__" else __name__)
 _raw_logger.addHandler(logging.NullHandler())
-
-
-def _connection_context() -> dict[str, Any]:
-    conn_id = CV_CONN_ID.get()
-    client_stream = CV_CLIENT_STREAM.get()
-    dest_stream = CV_DEST_STREAM.get()
-    desthost = CV_DESTHOST.get()
-    pipe_from = CV_PIPE_FROM.get()
-    direction = None
-    prefix = ""
-
-    if client_stream is not None:
-        if dest_stream is not None:
-            direction = "<>"
-            if pipe_from is not None:
-                direction = "->" if pipe_from is client_stream else "<-"
-            prefix = f"[conn{conn_id} {direction} {desthost}]"
-        else:
-            prefix = f"[conn{conn_id}]"
-
-    return {
-        "conn_id": conn_id,
-        "desthost": desthost,
-        "direction": direction,
-        "conn_prefix": prefix,
-    }
-
-
-def format_conn_prefix() -> str:
-    return str(_connection_context()["conn_prefix"])
-
-
-class ConnectionFilter(logging.Filter):
-    """Ensure connection attributes (conn_id, desthost, direction, conn_prefix)
-    are always populated on LogRecord instances."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        ctx = _connection_context()
-        for k, v in ctx.items():
-            if not hasattr(record, k):
-                setattr(record, k, v)
-        return True
-
-
-class ConnectionLoggerAdapter(logging.LoggerAdapter):
-    """LoggerAdapter that prepends connection context to log messages and injects
-    structured attributes into LogRecord extra."""
-
-    def process(
-        self, msg: Any, kwargs: MutableMapping[str, Any]
-    ) -> tuple[Any, MutableMapping[str, Any]]:
-        ctx = _connection_context()
-        prefix = ctx["conn_prefix"]
-        if prefix:
-            escaped_prefix = prefix.replace("%", "%%")
-            msg = f"{escaped_prefix} {msg}"
-        extra = kwargs.setdefault("extra", {})
-        for k, v in ctx.items():
-            extra.setdefault(k, v)
-        return msg, kwargs
-
-    def addHandler(self, hdlr: logging.Handler) -> None:
-        self.logger.addHandler(hdlr)
-
-    def removeHandler(self, hdlr: logging.Handler) -> None:
-        self.logger.removeHandler(hdlr)
-
-    def addFilter(self, fltr: logging.Filter | Any) -> None:
-        self.logger.addFilter(fltr)
-
-    def removeFilter(self, fltr: logging.Filter | Any) -> None:
-        self.logger.removeFilter(fltr)
-
-
 _raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
@@ -500,7 +407,7 @@ async def _record_connection_result(
     try:
         sig = inspect.signature(proxy_cache.record_connection_result)
         accepts_permit = "permit" in sig.parameters
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         accepts_permit = False
 
     if accepts_permit:
@@ -577,7 +484,7 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(http.http_502_bad_gateway)
-            except (trio.BrokenResourceError, trio.ClosedResourceError):
+            except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             raise
 
@@ -607,7 +514,7 @@ async def tunnel(
                 )
                 try:
                     await client_stream.send_all(http.http_502_bad_gateway)
-                except (trio.BrokenResourceError, trio.ClosedResourceError):
+                except trio.BrokenResourceError, trio.ClosedResourceError:
                     pass
                 raise
 
@@ -649,7 +556,7 @@ async def tunnel(
                 )
                 try:
                     await client_stream.send_all(http.http_504_gateway_timeout)
-                except (trio.BrokenResourceError, trio.ClosedResourceError):
+                except trio.BrokenResourceError, trio.ClosedResourceError:
                     pass
                 raise last_exc
             else:
@@ -665,7 +572,7 @@ async def tunnel(
                 )
                 try:
                     await client_stream.send_all(http.http_502_bad_gateway)
-                except (trio.BrokenResourceError, trio.ClosedResourceError):
+                except trio.BrokenResourceError, trio.ClosedResourceError:
                     pass
                 if last_exc is not None:
                     raise last_exc
