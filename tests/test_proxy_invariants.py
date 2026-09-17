@@ -81,29 +81,32 @@ async def test_invariant_1_start_server_resets_cache_context_after_shutdown(
         checks.append(client_key)
 
     fallback_cache.check_rate_limit = check_rate_limit
-    monkeypatch.setattr(proxy, "DEFAULT_PROXY_CACHE", fallback_cache)
+    cv_token = proxy.CV_PROXY_CACHE.set(fallback_cache)
 
     async def fake_serve(handler, port):
         return None
 
-    await proxy.start_server(
-        server=proxy.http_proxy,
-        port=0,
-        _serve=fake_serve,
-        proxy_cache=custom_cache,
-    )
+    try:
+        await proxy.start_server(
+            server=proxy.http_proxy,
+            port=0,
+            _serve=fake_serve,
+            proxy_cache=custom_cache,
+        )
 
-    proxy_client, test_client = tt.memory_stream_pair()
+        proxy_client, test_client = tt.memory_stream_pair()
 
-    class FakeSocket:
-        def getpeername(self):
-            return ("127.0.0.1", 12345)
+        class FakeSocket:
+            def getpeername(self):
+                return ("127.0.0.1", 12345)
 
-    cast(Any, proxy_client).socket = FakeSocket()
-    await test_client.send_all(b"GARBAGE\r\n\r\n")
-    await proxy.http_proxy(proxy_client)
+        cast(Any, proxy_client).socket = FakeSocket()
+        await test_client.send_all(b"GARBAGE\r\n\r\n")
+        await proxy.http_proxy(proxy_client)
 
-    assert checks == ["127.0.0.1"]
+        assert checks == ["127.0.0.1"]
+    finally:
+        proxy.CV_PROXY_CACHE.reset(cv_token)
 
 
 @tt.trio_test

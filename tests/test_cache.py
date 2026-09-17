@@ -8,13 +8,13 @@ from cashews.ttl import ttl_to_seconds
 
 from trio_http_proxy import http
 from trio_http_proxy.cache import (
-    DEFAULT_PROXY_CACHE,
     CircuitBreakerOpen,
     ProxyCache,
     RateLimitError,
     get_client_key,
 )
 from trio_http_proxy.proxy import http_proxy, tunnel
+from trio_http_proxy.proxy_cache import get_default_proxy_cache
 
 
 def connect_request(target: bytes = b"example.com:443", extra: bytes = b"") -> bytes:
@@ -221,5 +221,6 @@ def test_get_client_key():
 
 
 def test_default_proxy_cache_singleton():
-    assert isinstance(DEFAULT_PROXY_CACHE, ProxyCache)
-    assert DEFAULT_PROXY_CACHE.cache is not None
+    cache = get_default_proxy_cache()
+    assert isinstance(cache, ProxyCache)
+    assert cache is get_default_proxy_cache()  # memoized singleton

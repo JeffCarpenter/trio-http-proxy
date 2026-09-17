@@ -45,8 +45,11 @@ def _enable_log_capture(caplog):
 
 
 @pytest.fixture(autouse=True)
-def _disable_cache_in_proxy_tests(monkeypatch):
-    monkeypatch.setattr(proxy, "DEFAULT_PROXY_CACHE", None)
+def _disable_cache_in_proxy_tests():
+    """Default cache resolution yields None: no cashews backend in proxy tests."""
+    token = proxy.CV_PROXY_CACHE.set(None)
+    yield
+    proxy.CV_PROXY_CACHE.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +384,9 @@ async def test_tunnel_oversized_request_sends_414_not_bare_400():
     # indistinguishable 400 Bad Request instead of a status that actually
     # tells the client its request was too big.
     proxy_client, test_client = tt.memory_stream_pair()
-    oversized_target = b"a" * (proxy.DEFAULT_MAXREQSZ + 1) + b":443"
+    oversized_target = (
+        b"a" * (proxy.ProxySettings.model_fields["maxreqsz"].default + 1) + b":443"
+    )
     await test_client.send_all(connect_request(target=oversized_target))
 
     async def fake_open_tcp_stream(_host, _port):
@@ -558,7 +563,7 @@ async def test_http_proxy_forwards_large_payload_across_chunk_boundaries():
     proxy_client.receive_stream.receive_some_hook = count_client_to_dest_reads
     dest_proxy_side.receive_stream.receive_some_hook = count_dest_to_client_reads
 
-    payload_size = proxy.BUFMAXSZ * 3 + 777
+    payload_size = proxy.ProxySettings.model_fields["bufmaxsz"].default * 3 + 777
     client_payload = random.Random(1).randbytes(payload_size)
     dest_payload = random.Random(2).randbytes(payload_size)
 
@@ -1266,7 +1271,9 @@ async def test_tunnel_logs_warning_with_exc_info_on_bad_request(caplog):
 @tt.trio_test
 async def test_tunnel_logs_warning_with_exc_info_on_oversized_request(caplog):
     proxy_client, test_client = tt.memory_stream_pair()
-    oversized = b"a" * (proxy.DEFAULT_MAXREQSZ + 1) + b":443"
+    oversized = (
+        b"a" * (proxy.ProxySettings.model_fields["maxreqsz"].default + 1) + b":443"
+    )
     await test_client.send_all(connect_request(target=oversized))
     with pytest.raises(proxy.RequestTooLargeError):
         await proxy.tunnel(proxy_client)
@@ -1337,9 +1344,18 @@ def test_logger_adapter_delegates_handlers_and_filters():
     assert test_filter not in proxy.logger.logger.filters
 
 
-def test_log_level_defaults_and_env():
-    assert proxy.DEFAULT_LOG_LEVEL == "INFO"
-    assert proxy.LOG_LEVEL in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+def test_log_level_defaults_and_env(proxy_settings):
+    assert proxy_settings.log_level == "INFO"
+    assert proxy.ProxySettings.VALID_LOG_LEVELS <= {
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+        "WARN",
+        "FATAL",
+        "NOTSET",
+    }
 
 
 def test_raw_logger_filter_populates_attributes(caplog):

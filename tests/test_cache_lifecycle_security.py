@@ -321,7 +321,7 @@ class TestBridgeShutdownProtocol:
             asyncgens_shutdown_called = True
             await original_shutdown_asyncgens()
 
-        loop.shutdown_asyncgens = tracking_shutdown_asyncgens  # type: ignore[method-assign]
+        loop.shutdown_asyncgens = tracking_shutdown_asyncgens  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
 
         try:
             cache.stop()
