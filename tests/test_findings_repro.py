@@ -259,7 +259,7 @@ def test_repro_tier3_error_responses_headers():
         http.http_400_bad_request,
         http.http_408_request_timeout,
         http.http_414_uri_too_long,
-        http.http_429_too_many_requests,
+        http.http_429_too_many_requests % 42,
         http.http_502_bad_gateway,
         http.http_503_service_unavailable,
         http.http_504_gateway_timeout,

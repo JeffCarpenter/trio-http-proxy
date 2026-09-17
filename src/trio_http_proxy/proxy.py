@@ -24,10 +24,7 @@ from urllib.parse import urlsplit
 import h11
 import trio
 
-
-from .util import _float_env, _retry_after_seconds
 from . import http
-
 from .cache import (
     DEFAULT_PROXY_CACHE,
     DEFAULT_RATE_LIMIT_PERIOD,
@@ -36,6 +33,7 @@ from .cache import (
     RateLimitError,
     get_client_key,
 )
+from .util import _float_env, _retry_after_seconds
 
 
 def _int_env(

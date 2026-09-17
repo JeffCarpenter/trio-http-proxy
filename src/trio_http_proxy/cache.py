@@ -11,6 +11,7 @@ from typing import Any, Self, TypeVar, cast
 import cashews
 import trio
 from cashews import Cache, CircuitBreakerOpen
+from cashews.ttl import TTL
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ DEFAULT_CIRCUIT_BREAKER_MIN_CALLS = _int_env("CIRCUIT_BREAKER_MIN_CALLS", 3, min
 DEFAULT_RATE_LIMIT_ENABLED = _bool_env("RATE_LIMIT_ENABLED", False)
 DEFAULT_RATE_LIMIT = _int_env("RATE_LIMIT", 0, min_val=0)
 DEFAULT_RATE_LIMIT_PERIOD = getenv("RATE_LIMIT_PERIOD", "60s")
-DEFAULT_RATE_LIMIT_TTL = getenv("RATE_LIMIT_TTL", "60s")
+DEFAULT_RATE_LIMIT_TTL = getenv("RATE_LIMIT_TTL")
 
 
 def _failure_policy(value: str) -> str:
@@ -122,22 +123,24 @@ class ProxyCache:
         rate_limit_enabled: bool = DEFAULT_RATE_LIMIT_ENABLED,
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_limit_period: str = DEFAULT_RATE_LIMIT_PERIOD,
-        rate_limit_ttl: str = DEFAULT_RATE_LIMIT_TTL,
+        rate_limit_ttl: str | None = DEFAULT_RATE_LIMIT_TTL,
         failure_policy: str = CACHE_FAILURE_POLICY,
         cache_failure_policy: str | None = None,
     ) -> None:
         self.cache_url = cache_url
         self.enabled = enabled
-        self.dns_cache_ttl = dns_cache_ttl
+        self.dns_cache_ttl: TTL = dns_cache_ttl
         self.circuit_breaker_enabled = circuit_breaker_enabled
         self.circuit_breaker_errors_rate = circuit_breaker_errors_rate
-        self.circuit_breaker_period = circuit_breaker_period
-        self.circuit_breaker_ttl = circuit_breaker_ttl
+        self.circuit_breaker_period: TTL = circuit_breaker_period
+        self.circuit_breaker_ttl: TTL = circuit_breaker_ttl
         self.circuit_breaker_min_calls = circuit_breaker_min_calls
         self.rate_limit_enabled = rate_limit_enabled
         self.rate_limit = rate_limit
-        self.rate_limit_period = rate_limit_period
-        self.rate_limit_ttl = rate_limit_ttl
+        self.rate_limit_period: TTL = rate_limit_period
+        self.rate_limit_ttl: TTL = (
+            rate_limit_ttl if rate_limit_ttl is not None else self.rate_limit_period
+        )
         if cache_failure_policy is not None:
             failure_policy = cache_failure_policy
         self.failure_policy = _failure_policy(failure_policy)

@@ -4,7 +4,9 @@ from typing import Any, Self
 import pytest
 import trio
 import trio.testing as tt
+from cashews.ttl import ttl_to_seconds
 
+from trio_http_proxy import http
 from trio_http_proxy.cache import (
     DEFAULT_PROXY_CACHE,
     CircuitBreakerOpen,
@@ -13,7 +15,6 @@ from trio_http_proxy.cache import (
     get_client_key,
 )
 from trio_http_proxy.proxy import http_proxy, tunnel
-from trio_http_proxy import http
 
 
 def connect_request(target: bytes = b"example.com:443", extra: bytes = b"") -> bytes:
@@ -197,7 +198,7 @@ async def test_http_proxy_with_rate_limit_exceeded():
         async with trio.open_nursery() as nursery:
             nursery.start_soon(partial(http_proxy, stream_with_sock, proxy_cache=pc))
             reply = await test_client.receive_some(4096)
-            assert reply == http.http_429_too_many_requests
+            assert reply == http.http_429_too_many_requests % ttl_to_seconds(pc.rate_limit_period)
             remainder = await test_client.receive_some(4096)
             assert remainder == b""
 
