@@ -7,6 +7,7 @@ import queue
 import socket
 import threading
 import time
+from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine
 from os import getenv
 from typing import Any, Self, TypeVar, cast
@@ -109,8 +110,17 @@ class RateLimitError(cashews.RateLimitError):
         self.retry_after = retry_after
 
     @property
-    def retry_after_seconds(self) -> int | None:
-        return self.retry_after
+    def retry_after_seconds(self) -> float | None:
+        return float(self.retry_after) if self.retry_after is not None else None
+
+
+BACKEND_EXCEPTIONS: tuple[type[Exception], ...] = (
+    cashews.exceptions.CacheError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    socket.error,
+)
 
 
 class CircuitState(str, enum.Enum):
@@ -119,15 +129,67 @@ class CircuitState(str, enum.Enum):
     HALF_OPEN = "half_open"
 
 
+def canonicalize_destination(host: str, port: int) -> tuple[str, int]:
+    """Normalize destination host and port for circuit breaker identity mapping."""
+    dest_host = host.strip().rstrip(".").lower()
+    clean_host = dest_host.strip("[]")
+    try:
+        ip = ipaddress.ip_address(clean_host)
+        dest_host = ip.compressed
+    except ValueError:
+        pass
+    return dest_host, int(port)
+
+
+class CircuitPermit:
+    """Tokenized lease representing admission into a destination circuit breaker."""
+
+    def __init__(
+        self,
+        breaker: DestinationCircuitBreaker,
+        epoch: int,
+        permit_id: int,
+        is_probe: bool = False,
+    ) -> None:
+        self.breaker = breaker
+        self.epoch = epoch
+        self.permit_id = permit_id
+        self.is_probe = is_probe
+        self.was_aborted: bool = False
+        self.was_completed: bool = False
+
+    def abort(self) -> None:
+        """Abort this lease, releasing any probe reservation immediately."""
+        if self.was_aborted or self.was_completed:
+            return
+        self.was_aborted = True
+        self.breaker._abort_permit(self)
+
+    def mark_completed(self) -> None:
+        self.was_completed = True
+
+    def __enter__(self) -> CircuitPermit:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        if exc_type is not None and not self.was_completed:
+            self.abort()
+
+
 class DestinationCircuitBreaker:
     """Explicit Trio-native circuit breaker for a destination (host, port).
 
     Implements:
-    - True gating before connecting.
-    - Strict half-open single-probe discipline (only 1 probe permitted; concurrent
-      connections are rejected with CircuitBreakerOpen).
-    - Configurable error rate and min_calls within a sliding time window.
-    - Automatic reset on successful probe; immediate re-opening on failed probe.
+    - Tokenized lease admission via CircuitPermit preventing pre-open completion theft.
+    - Strict half-open single-probe discipline with probe lease tracking.
+    - Deadlock recovery for dropped probe permits after TTL expiration.
+    - O(1) amortized sliding window via collections.deque and rolling error counts.
+    - Strict breaker and epoch identity checking on completion recording.
     """
 
     def __init__(
@@ -136,65 +198,190 @@ class DestinationCircuitBreaker:
         period: float = 60.0,
         ttl: float = 30.0,
         min_calls: int = 3,
+        epoch: int = 0,
     ) -> None:
         self.errors_rate = errors_rate
         self.period = period
         self.ttl = ttl
         self.min_calls = min_calls
         self.state: CircuitState = CircuitState.CLOSED
-        self.opened_at: float = 0.0
+        self.opened_at: float | None = None
+        self.epoch: int = epoch
+        self._permit_seq: int = 0
         self._half_open_in_flight: bool = False
-        self._calls: list[tuple[float, bool]] = []
+        self._active_probe_id: int | None = None
+        self._probe_started_at: float | None = None
+        self._calls: deque[tuple[float, bool]] = deque()
+        self._window_error_count: int = 0
         self._lock = threading.Lock()
 
-    def can_execute(self, now: float | None = None) -> bool:
+    def _prune_calls(self, now: float) -> None:
+        cutoff = now - self.period
+        while self._calls and self._calls[0][0] < cutoff:
+            _, old_err = self._calls.popleft()
+            if old_err:
+                self._window_error_count -= 1
+
+    def acquire_permit(self, now: float | None = None) -> CircuitPermit | None:
         if now is None:
             now = time.monotonic()
         with self._lock:
             if self.state == CircuitState.OPEN:
-                if now - self.opened_at >= self.ttl:
+                opened_at = self.opened_at
+                if opened_at is not None and now - opened_at >= self.ttl:
                     self.state = CircuitState.HALF_OPEN
                     self._half_open_in_flight = False
+                    self._active_probe_id = None
+                    self._probe_started_at = None
+                else:
+                    return None
+
+            if self.state == CircuitState.HALF_OPEN:
+                if self._half_open_in_flight:
+                    # Check for dropped probe lease timeout recovery (§6.9)
+                    if (
+                        self._probe_started_at is not None
+                        and now - self._probe_started_at >= self.ttl
+                    ):
+                        logger.warning(
+                            "Probe lease %s timed out after %ss in HALF_OPEN; admitting new probe",
+                            self._active_probe_id,
+                            self.ttl,
+                        )
+                        self._half_open_in_flight = False
+                        self._active_probe_id = None
+                    else:
+                        return None
+                self._half_open_in_flight = True
+                self._permit_seq += 1
+                self._active_probe_id = self._permit_seq
+                self._probe_started_at = now
+                return CircuitPermit(
+                    breaker=self,
+                    epoch=self.epoch,
+                    permit_id=self._permit_seq,
+                    is_probe=True,
+                )
+
+            # CircuitState.CLOSED
+            self._permit_seq += 1
+            return CircuitPermit(
+                breaker=self,
+                epoch=self.epoch,
+                permit_id=self._permit_seq,
+                is_probe=False,
+            )
+
+    def can_execute(self, now: float | None = None) -> bool:
+        """Legacy check returning boolean (does not track permit identity)."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            if self.state == CircuitState.OPEN:
+                opened_at = self.opened_at
+                if opened_at is not None and now - opened_at >= self.ttl:
+                    self.state = CircuitState.HALF_OPEN
+                    self._half_open_in_flight = False
+                    self._active_probe_id = None
+                    self._probe_started_at = None
                 else:
                     return False
 
             if self.state == CircuitState.HALF_OPEN:
                 if self._half_open_in_flight:
-                    # Gating: concurrent calls leak through avoided; only 1 probe allowed
-                    return False
+                    if (
+                        self._probe_started_at is not None
+                        and now - self._probe_started_at >= self.ttl
+                    ):
+                        self._half_open_in_flight = False
+                        self._active_probe_id = None
+                    else:
+                        return False
                 self._half_open_in_flight = True
+                self._probe_started_at = now
                 return True
 
             return True
 
-    def record_result(self, exc: Exception | None, now: float | None = None) -> None:
+    def _abort_permit(self, permit: CircuitPermit) -> None:
+        with self._lock:
+            if permit.breaker is self and permit.epoch == self.epoch:
+                if (
+                    self.state == CircuitState.HALF_OPEN
+                    and permit.is_probe
+                    and (
+                        self._active_probe_id is None
+                        or self._active_probe_id == permit.permit_id
+                    )
+                ):
+                    self._half_open_in_flight = False
+                    self._active_probe_id = None
+                    self._probe_started_at = None
+
+    def record_result(
+        self,
+        exc: Exception | None,
+        now: float | None = None,
+        permit: CircuitPermit | None = None,
+    ) -> None:
         if now is None:
             now = time.monotonic()
         is_error = exc is not None
         with self._lock:
+            # 1. Invalidation checks: breaker identity, epoch, and abort status (§6.6)
+            if permit is not None:
+                permit.mark_completed()
+                if permit.breaker is not self:
+                    return
+                if permit.epoch != self.epoch:
+                    return
+                if permit.was_aborted:
+                    return
+
+            # 2. State-specific transitions (§6.7, §6.8)
             if self.state == CircuitState.HALF_OPEN:
+                # Permitless callers or non-probe leases cannot transition HALF_OPEN
+                if permit is None or not permit.is_probe:
+                    return
+                if (
+                    self._active_probe_id is not None
+                    and permit.permit_id != self._active_probe_id
+                ):
+                    return
+
                 self._half_open_in_flight = False
+                self._active_probe_id = None
+                self._probe_started_at = None
                 if is_error:
                     self.state = CircuitState.OPEN
                     self.opened_at = now
+                    self.epoch += 1
                 else:
                     self.state = CircuitState.CLOSED
+                    self.epoch += 1
                     self._calls.clear()
+                    self._window_error_count = 0
+                    self.opened_at = None
             elif self.state == CircuitState.CLOSED:
                 self._calls.append((now, is_error))
-                cutoff = now - self.period
-                self._calls = [(t, err) for t, err in self._calls if t >= cutoff]
+                if is_error:
+                    self._window_error_count += 1
+                self._prune_calls(now)
                 if len(self._calls) >= self.min_calls:
-                    error_count = sum(1 for _, err in self._calls if err)
-                    rate = (error_count / len(self._calls)) * 100.0
+                    rate = (self._window_error_count / len(self._calls)) * 100.0
                     if rate >= self.errors_rate:
                         self.state = CircuitState.OPEN
                         self.opened_at = now
+                        self.epoch += 1
                         self._calls.clear()
+                        self._window_error_count = 0
+
+
+DEFAULT_MAX_DESTINATIONS: int = 10_000
 
 
 class CircuitBreakerManager:
-    """Manages DestinationCircuitBreaker instances per (host, port)."""
+    """Manages DestinationCircuitBreaker instances per canonicalized (host, port)."""
 
     def __init__(
         self,
@@ -202,38 +389,91 @@ class CircuitBreakerManager:
         period: float = 60.0,
         ttl: float = 30.0,
         min_calls: int = 3,
+        max_destinations: int = DEFAULT_MAX_DESTINATIONS,
     ) -> None:
         self.errors_rate = errors_rate
         self.period = period
         self.ttl = ttl
         self.min_calls = min_calls
-        self._breakers: dict[tuple[str, int], DestinationCircuitBreaker] = {}
+        self.max_destinations = max_destinations
+        self._breakers: OrderedDict[tuple[str, int], DestinationCircuitBreaker] = (
+            OrderedDict()
+        )
+        self._epoch_counter: int = 0
         self._lock = threading.Lock()
 
     def get_breaker(self, host: str, port: int) -> DestinationCircuitBreaker:
-        key = (host, port)
+        key = canonicalize_destination(host, port)
         with self._lock:
             breaker = self._breakers.get(key)
-            if breaker is None:
-                breaker = DestinationCircuitBreaker(
-                    errors_rate=self.errors_rate,
-                    period=self.period,
-                    ttl=self.ttl,
-                    min_calls=self.min_calls,
-                )
-                self._breakers[key] = breaker
+            if breaker is not None:
+                self._breakers.move_to_end(key)
+                return breaker
+
+            if len(self._breakers) >= self.max_destinations:
+                self._evict_one_locked()
+
+            self._epoch_counter += 1
+            breaker = DestinationCircuitBreaker(
+                errors_rate=self.errors_rate,
+                period=self.period,
+                ttl=self.ttl,
+                min_calls=self.min_calls,
+                epoch=self._epoch_counter,
+            )
+            self._breakers[key] = breaker
             return breaker
+
+    def _evict_one_locked(self) -> None:
+        """Evict an idle CLOSED breaker or oldest entry if none idle."""
+        now = time.monotonic()
+        # 1. Look for idle CLOSED breaker with empty calls (after pruning) and no in-flight probe (§6.14)
+        for k, b in self._breakers.items():
+            if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
+                b._prune_calls(now)
+                if len(b._calls) == 0:
+                    del self._breakers[k]
+                    return
+
+        # 2. Fallback: any CLOSED breaker without active probe
+        for k, b in self._breakers.items():
+            if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
+                del self._breakers[k]
+                return
+
+        # 3. Last resort: evict oldest entry
+        self._breakers.popitem(last=False)
+
+    def acquire_permit(
+        self, host: str, port: int, now: float | None = None
+    ) -> CircuitPermit | None:
+        return self.get_breaker(host, port).acquire_permit(now=now)
 
     def can_execute(self, host: str, port: int, now: float | None = None) -> bool:
         return self.get_breaker(host, port).can_execute(now=now)
 
     def record_result(
-        self, host: str, port: int, exc: Exception | None, now: float | None = None
+        self,
+        host: str,
+        port: int,
+        exc: Exception | None,
+        now: float | None = None,
+        permit: CircuitPermit | None = None,
     ) -> None:
-        self.get_breaker(host, port).record_result(exc, now=now)
+        self.get_breaker(host, port).record_result(exc, now=now, permit=permit)
 
     def clear(self) -> None:
         with self._lock:
+            for breaker in self._breakers.values():
+                with breaker._lock:
+                    breaker.epoch += 1
+                    breaker.state = CircuitState.CLOSED
+                    breaker._half_open_in_flight = False
+                    breaker._active_probe_id = None
+                    breaker._probe_started_at = None
+                    breaker._calls.clear()
+                    breaker._window_error_count = 0
+            self._epoch_counter += 10
             self._breakers.clear()
 
 
@@ -260,6 +500,7 @@ class ProxyCache:
         circuit_breaker_period: str = DEFAULT_CIRCUIT_BREAKER_PERIOD,
         circuit_breaker_ttl: str = DEFAULT_CIRCUIT_BREAKER_TTL,
         circuit_breaker_min_calls: int = DEFAULT_CIRCUIT_BREAKER_MIN_CALLS,
+        circuit_breaker_max_destinations: int = DEFAULT_MAX_DESTINATIONS,
         rate_limit_enabled: bool = DEFAULT_RATE_LIMIT_ENABLED,
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_limit_period: str = DEFAULT_RATE_LIMIT_PERIOD,
@@ -293,12 +534,29 @@ class ProxyCache:
         self.circuit_breaker_period: TTL = circuit_breaker_period
         self.circuit_breaker_ttl: TTL = circuit_breaker_ttl
         self.circuit_breaker_min_calls = circuit_breaker_min_calls
+        self.circuit_breaker_max_destinations = circuit_breaker_max_destinations
         self.rate_limit_enabled = rate_limit_enabled
         self.rate_limit = rate_limit
         self.rate_limit_period: TTL = rate_limit_period
         self.rate_limit_ttl: TTL = (
             rate_limit_ttl if rate_limit_ttl is not None else self.rate_limit_period
         )
+        parsed_period = ttl_to_seconds(self.rate_limit_period)
+        if parsed_period is None or parsed_period <= 0:
+            raise ValueError(
+                f"rate_limit_period must evaluate to > 0 seconds, got {rate_limit_period!r}"
+            )
+        self.rate_limit_period_sec = float(parsed_period)
+
+        parsed_ttl = ttl_to_seconds(self.rate_limit_ttl)
+        if parsed_ttl is None or parsed_ttl <= 0:
+            raise ValueError(
+                f"rate_limit_ttl must evaluate to > 0 seconds, got {rate_limit_ttl!r}"
+            )
+        self.rate_limit_ttl_sec = float(parsed_ttl)
+
+        parsed_dns_ttl = ttl_to_seconds(self.dns_cache_ttl)
+        self.dns_cache_ttl_sec = float(parsed_dns_ttl) if parsed_dns_ttl is not None else 0.0
         if cache_failure_policy is not None:
             failure_policy = cache_failure_policy
         self.failure_policy = _failure_policy(failure_policy)
@@ -322,6 +580,7 @@ class ProxyCache:
             period=float(cb_period) if cb_period is not None else 60.0,
             ttl=float(cb_ttl) if cb_ttl is not None else 30.0,
             min_calls=self.circuit_breaker_min_calls,
+            max_destinations=self.circuit_breaker_max_destinations,
         )
 
         self._resolve_dns_fn: Callable[[str], Coroutine[Any, Any, list[str]]] | None = (
@@ -595,7 +854,7 @@ class ProxyCache:
         c = self.cache
 
         # DNS Resolution Caching with namespace
-        if self.dns_cache_ttl and self.dns_cache_ttl not in ("0", "0s"):
+        if self.dns_cache_ttl_sec > 0:
             dns_key = f"{self.namespace}:dns:{{host}}"
 
             @c(ttl=self.dns_cache_ttl, key=dns_key)
@@ -637,6 +896,8 @@ class ProxyCache:
         )
 
     def _handle_backend_failure(self, operation: str, exc: Exception) -> None:
+        if not isinstance(exc, BACKEND_EXCEPTIONS):
+            raise exc
         if self._stopped:
             raise exc
         if self.cache_failure_policy == "fail-open":

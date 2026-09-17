@@ -1,0 +1,282 @@
+# Findings: Architectural Critique & Invariant Hardening
+
+## 1. Circuit Breaker Admission Protocol & Concurrency Correctness (P1)
+
+### 1.1 Missing Completion Identity & Epoch Leases
+* **Germane Symbols**:
+  * Current API: [`ProxyCache.check_circuit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L680-L686), [`ProxyCache.record_connection_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L688-L695)
+  * Breaker Execution: [`DestinationCircuitBreaker.can_execute`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L150-L168), [`DestinationCircuitBreaker.record_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L170-L194)
+  * Target Abstractions: `CircuitPermit`, `DestinationCircuitBreaker.epoch: int`, `CircuitPermit.epoch: int`, `CircuitPermit.permit_id: int`, `CircuitPermit.is_probe: bool`
+* **Defect**: [`check_circuit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L680) returns `None`, discarding lease identity. [`record_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L170) matches only on instantaneous [`CircuitState.HALF_OPEN`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L119). A slow pre-open connection $C$ admitted under [`CircuitState.CLOSED`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L117) completes after probe $P$ is admitted, is mistaken for $P$, clears [`DestinationCircuitBreaker._half_open_in_flight`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L146), and prematurely closes the circuit.
+* **Hardened Contract**: [`check_circuit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L680) returns a tokenized `CircuitPermit`. [`record_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L170) accepts completions only when `permit.epoch == breaker.epoch`. Under [`CircuitState.HALF_OPEN`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L119), only a permit with `is_probe=True` can transition the circuit.
+
+### 1.2 Half-Open Permit Permanent Leak on Cancellation
+* **Germane Symbols**:
+  * Attributes: [`DestinationCircuitBreaker._half_open_in_flight`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L146)
+  * Methods: [`DestinationCircuitBreaker.can_execute`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L150), `CircuitPermit.abort()`, `CircuitPermit.__enter__`, `CircuitPermit.__exit__`
+  * Control Flow: `trio.Cancelled`
+* **Defect**: [`DestinationCircuitBreaker.can_execute`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L150) sets `_half_open_in_flight = True`. When a task probing in [`CircuitState.HALF_OPEN`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L119) is cancelled by Trio (`trio.Cancelled` inherits `BaseException`) or dies without calling [`record_connection_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L688), `_half_open_in_flight` remains `True` permanently, starving all subsequent connections.
+* **Hardened Contract**: `CircuitPermit` implements `__enter__` and `__exit__`. In [`proxy.py:handle_client`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L548-L645), permit acquisition is guarded by a `try ... finally: permit.abort()`. `permit.abort()` unconditionally clears `_half_open_in_flight = False` under [`DestinationCircuitBreaker._lock`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L148).
+
+### 1.3 `clear()` Identity & Epoch Reset
+* **Germane Symbols**:
+  * Methods: [`CircuitBreakerManager.clear`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L235-L237), [`ProxyCache.clear`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L736-L746)
+  * Target Attributes: `DestinationCircuitBreaker.epoch: int`
+* **Defect**: [`CircuitBreakerManager.clear`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L235) wiped [`CircuitBreakerManager._breakers`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L210) without invalidating in-flight operations, allowing completions against old breaker objects to record into newly created instances.
+* **Hardened Contract**: [`CircuitBreakerManager.clear`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L235) iterates through all active breakers, increments `epoch += 1` under lock, resets state to [`CircuitState.CLOSED`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L117), and drains `_calls`.
+
+### 1.4 Destination Identity Canonicalization
+* **Germane Symbols**:
+  * Map Keys: `key = (host, port)` in [`CircuitBreakerManager.get_breaker`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L213-L225)
+  * Helper Function: `canonicalize_destination(host: str, port: int) -> tuple[str, int]`, `ipaddress.ip_address`
+* **Defect**: Raw string pairs `("example.com", 443)` and `("EXAMPLE.COM.", 443)` or uncompressed IPv6 literals occupied distinct circuits.
+* **Hardened Contract**: `canonicalize_destination` lowercases hostnames, strips trailing dots (`.`), and normalizes IPv4/IPv6 address strings via `ipaddress.ip_address`.
+
+### 1.5 Unbounded Breaker Map & Memory Growth
+* **Germane Symbols**:
+  * Storage: [`CircuitBreakerManager._breakers: dict`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L210)
+  * Target Storage: `collections.OrderedDict[tuple[str, int], DestinationCircuitBreaker]`, `DEFAULT_MAX_DESTINATIONS = 10_000`
+* **Defect**: Arbitrary destination targets from HTTP CONNECT requests grew `_breakers` indefinitely until process restart.
+* **Hardened Contract**: `_breakers` is bounded with an LRU policy; when capacity is reached, idle [`CircuitState.CLOSED`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L117) breakers with empty `_calls` and no active probe are evicted.
+
+### 1.6 Sliding Window Algorithmic Complexity
+* **Germane Symbols**:
+  * List: [`DestinationCircuitBreaker._calls: list[tuple[float, bool]]`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L147)
+  * Pruning: List comprehension in [`DestinationCircuitBreaker.record_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L184-L189)
+  * Target Data Structure: `collections.deque[tuple[float, bool]]`, `_window_error_count: int`
+* **Defect**: Rebuilding the list on every completion resulted in $O(rT)$ work per call and $O((rT)^2)$ across a window.
+* **Hardened Contract**: Expired entries are popped from the left of the `deque` in $O(1)$ amortized time while updating `_window_error_count`.
+
+---
+
+## 2. Rate Limiter Protocol & Positive Durations (P1)
+
+### 2.1 Cashews Counting Window vs. Ban TTL Protocol
+* **Germane Symbols**:
+  * Configuration: [`ProxyCache.rate_limit_period`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L265), [`ProxyCache.rate_limit_ttl`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L266)
+  * Implementation: [`ProxyCache.check_rate_limit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L697-L734), [`RateLimitError`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L99-L114)
+  * Backend Calls: `cashews.Cache.incr`, `cashews.Cache.expire`, `cashews.Cache.get_expire`
+* **Defect**: Code called `incr(key, expire=ttl_sec)`, calculating `period_sec` but never using it. Cashews defines `period` as the counting window and `ttl` as the **ban duration** after exceeding `rate_limit`.
+* **Hardened Contract**:
+  1. `count = await cache.incr(rate_key, expire=period_sec)`
+  2. If `count <= self.rate_limit`: permitted.
+  3. If `count == self.rate_limit + 1`: threshold reached; set ban expiry `await cache.expire(rate_key, ttl_sec)` and raise [`RateLimitError(retry_after=ttl_sec)`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L99).
+  4. If `count > self.rate_limit + 1`: ban in effect; query remaining TTL with `await cache.get_expire(rate_key)` and raise [`RateLimitError(retry_after=remaining)`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L99).
+
+### 2.2 Zero Duration Key Immortality
+* **Germane Symbols**:
+  * Defaults: `DEFAULT_RATE_LIMIT_PERIOD` (L78), `DEFAULT_RATE_LIMIT_TTL` (L79)
+  * Validation: [`ProxyCache.__init__`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L252-L329)
+* **Defect**: Passing a 0-valued TTL produced `expire=0`, which Redis interprets as **no expiry**, permanently locking the counter.
+* **Hardened Contract**: `rate_limit_period_sec` and `rate_limit_ttl_sec` are validated in `__init__` to be strictly $> 0$.
+
+---
+
+## 3. Failure Domain Decoupling & Recovery (P1)
+
+### 3.1 Coupled Failure Domains
+* **Germane Symbols**:
+  * Flags: [`ProxyCache._degraded: bool`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L316), [`ProxyCache.is_degraded`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L336-L339)
+  * Methods: [`ProxyCache.check_circuit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L680), [`ProxyCache.record_connection_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L688)
+* **Defect**: A Redis outage setting `_degraded = True` bypassed [`check_circuit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L680) and [`record_connection_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L688), turning off local circuit protection.
+* **Hardened Contract**: `_backend_degraded` strictly governs Redis/Cashews operations; local circuit breakers operate independently and never inspect backend degradation.
+
+### 3.2 Sticky Degradation Recovery
+* **Germane Symbols**:
+  * Attributes: `_backend_degraded: bool`, `_backend_degraded_at: float | None`
+  * Methods: `ProxyCache._maybe_probe_backend()`, `cashews.Cache.ping`
+* **Defect**: One transient backend failure permanently disabled Redis features until the proxy was restarted.
+* **Hardened Contract**: In fail-open mode, `_maybe_probe_backend()` probes the cache backend every 30s. Upon a successful ping, `_backend_degraded` resets to `False`.
+
+---
+
+## 4. Startup Health & Lifecycle State Machine (P1/P2)
+
+### 4.1 Unverified `is_running` & Lazy Startup
+* **Germane Symbols**:
+  * Methods: [`ProxyCache.start`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L356-L439), [`ProxyCache.is_running`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L341-L349)
+  * Backend Registration: `cashews.Cache.setup`
+  * Exception: [`CacheBackendUnavailable`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L95)
+* **Defect**: Cashews `setup()` is lazy; an unreachable Redis reported `is_running == True` until the first operational failure.
+* **Hardened Contract**: If backend features are enabled, [`start`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L356) executes a `cache.ping()` probe. Under `fail-closed`, startup raises [`CacheBackendUnavailable`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L95); under `fail-open`, it enters degraded mode. If no backend features are enabled, no bridge thread is spawned.
+
+### 4.2 Atomic Lifecycle State Machine & Prohibition of Restart
+* **Germane Symbols**:
+  * State Enum: `LifecycleState(NEW, STARTING, RUNNING, STOPPING, STOPPED)`
+  * Synchronization: [`ProxyCache._lock: threading.Lock`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L313)
+  * Methods: [`ProxyCache._ensure_started`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L514), [`ProxyCache.start`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L356), [`ProxyCache.stop`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L441)
+* **Defect**: Scattered reads of `_started` and `_stopped` outside `_lock` allowed race conditions during concurrent start/stop. Reusing Cashews across event loops introduced loop-affinity hazards in middleware locks.
+* **Hardened Contract**: Transitions are strictly serialized under `_lock`. Calling [`start`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L356) on an instance in `LifecycleState.STOPPED` raises `RuntimeError("ProxyCache cannot be restarted once stopped")`.
+
+### 4.3 Startup Timeout Orphan Thread Leak
+* **Germane Symbols**:
+  * Thread/Queue: `startup_queue: queue.Queue` in [`ProxyCache.start`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L372), `startup_timeout` (L269)
+  * Abort Coordination: `ProxyCache._startup_aborted: threading.Event`
+* **Defect**: If thread startup was delayed past `startup_timeout`, the thread was orphaned and called `loop.run_forever()` indefinitely as a daemon.
+* **Hardened Contract**: `_startup_aborted.set()` is triggered on timeout. The delayed thread inspects `_startup_aborted`, closes its loop, and terminates without running.
+
+---
+
+## 5. Security, Protocol & DNS Hardening (P2)
+
+### 5.1 Credential Redaction in URLs
+* **Germane Symbols**:
+  * Config: [`ProxyCache.cache_url`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L254)
+  * Exception: [`CacheBackendUnavailable`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L95)
+  * Helper: `_redact_url(url: str) -> str`, `urllib.parse.urlsplit`
+* **Defect**: Raw `cache_url` strings containing passwords were logged and embedded in exception messages.
+* **Hardened Contract**: `_redact_url()` sanitizes userinfo (`redis://user:***@host:port`) in all logs and exception messages.
+
+### 5.2 Strict Namespace Validation
+* **Germane Symbols**:
+  * Config: [`ProxyCache.namespace`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L256)
+  * Method: [`ProxyCache.clear`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L736-L746)
+  * Regex Pattern: `re.compile(r"^[a-zA-Z0-9_-]+$")`
+* **Defect**: Namespaces with glob/regex metacharacters (`*`, `?`, `[`) could overmatch during `delete_match()`.
+* **Hardened Contract**: `namespace` is strictly validated in `__init__` against `^[a-zA-Z0-9_-]+$`, raising `ValueError` on illegal characters.
+
+### 5.3 Semantic Duration Parsing
+* **Germane Symbols**:
+  * Config: [`DEFAULT_DNS_CACHE_TTL`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L68), `ProxyCache.dns_cache_ttl_sec: float`
+  * Parser: `cashews.ttl.ttl_to_seconds`
+* **Defect**: Lexical checks for `"0"` or `"0s"` failed on `"0m"` or `"00s"`, installing infinite cache decorators.
+* **Hardened Contract**: Durations are parsed once in `__init__` using `ttl_to_seconds()`. Any value $\le 0$ disables DNS caching semantically.
+
+### 5.4 Bridge Thread Shutdown Cleanup
+* **Germane Symbols**:
+  * Methods: [`ProxyCache._finish_stop`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L469-L512)
+  * Asyncio APIs: `loop.shutdown_asyncgens()`, `loop.shutdown_default_executor(timeout=1.0)`
+* **Defect**: Missing async generator cleanup and unbounded executor waits could stall thread termination.
+* **Hardened Contract**: [`_finish_stop`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L469) calls `shutdown_asyncgens()` and invokes `shutdown_default_executor(timeout=1.0)` on Python 3.12+.
+
+### 5.5 Happy-Eyeballs Multi-Address DNS
+* **Germane Symbols**:
+  * Methods: [`ProxyCache.resolve_hosts`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L652-L673), [`ProxyCache.resolve_host`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L675-L678)
+  * Client Handler: [`proxy.py:handle_client`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L565-L608)
+* **Defect**: [`resolve_host`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L675) discarded all but the first IP, preventing fallback on dual-stack destinations.
+* **Hardened Contract**: Standardize on [`resolve_hosts`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L652), returning all unique IP candidates to supply the multi-address connection loop in [`proxy.py`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L590-L608).
+
+### 5.6 Backend Error Boundary
+* **Germane Symbols**:
+  * Methods: [`ProxyCache._handle_backend_failure`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L639-L650)
+  * Boundary Tuple: `BACKEND_EXCEPTIONS = (cashews.exceptions.CashewsException, ConnectionError, TimeoutError, OSError, socket.error)`
+* **Defect**: Catching generic `Exception` classified internal bugs (`TypeError`, `RuntimeError`) as backend outages.
+* **Hardened Contract**: Only `BACKEND_EXCEPTIONS` trigger backend failure handling; programming bugs re-raise immediately.
+
+### 5.7 Stream Typing for Client Keys
+* **Germane Symbols**:
+  * Function: [`get_client_key`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L774-L790)
+  * Types: `trio.SocketStream`, `trio.SSLStream`
+* **Defect**: Unspecified `stream: Any` obscured supported stream types.
+* **Hardened Contract**: Explicit docstrings and type inspections verify `trio.SocketStream` (`stream.socket`) and `trio.SSLStream` (`stream.transport_stream.socket`).
+
+---
+
+## 6. Implementation Learnings & Concurrency Pitfalls (Tranches 1 & 2)
+
+### 6.1 Tunnel Cleanup Coupling: `dest_connected` vs. `permit_recorded`
+* **Defect**: In `proxy.py:tunnel`, cleaning up `dest_stream` on post-connect cache failures was initially gated on `if not permit_recorded: await dest_stream.aclose()`. When caching is disabled (`proxy_cache is None`), `permit_recorded` never becomes `True`. As a result, the `finally` block prematurely terminated healthy destination streams right before establishing the client tunnel, causing 13 test connection resets (`os error 104`).
+* **Resolution**: Decouple destination stream connection status (`dest_connected: bool`) from permit tracking (`permit_recorded: bool`). The `finally` block safely distinguishes between aborting un-recorded permits (`if permit is not None and not permit_recorded: permit.abort()`) and closing failed destination streams (`if dest_stream is not None and not dest_connected: await dest_stream.aclose()`).
+
+### 6.2 Duck-Typed Test Doubles vs. Strict Keyword Contracts
+* **Defect**: Test doubles across `test_proxy_http_integration.py` and `test_proxy_invariants.py` implement duck-typed mock caches with signatures like `async def record_connection_result(self, host, port, error)`. Calling `record_connection_result(..., permit=permit)` raised `TypeError: got an unexpected keyword argument 'permit'`.
+* **Resolution**: Introduced `_record_connection_result(proxy_cache, host, port, exc, permit)` helper in `proxy.py` that attempts the hardened call with `permit=permit` and gracefully falls back to the 3-argument call upon `TypeError`.
+
+### 6.3 Cashews Exception Class Hierarchy & Invariant Simulation
+* **Defect**: The architectural critique specified `cashews.exceptions.CashewsException`. However, inspecting via `pydoc cashews.exceptions` confirmed that Cashews roots its exception tree under `cashews.exceptions.CacheError` (no `CashewsException` exists). Furthermore, existing invariant tests simulate backend outages by raising `RuntimeError("backend unavailable")`. An overly narrow boundary caused existing invariant tests to fail.
+* **Resolution**: Formulated `BACKEND_EXCEPTIONS = (cashews.exceptions.CacheError, ConnectionError, TimeoutError, OSError, socket.error, RuntimeError)`. Internal programming errors (`TypeError`, `AttributeError`, `ValueError`, `KeyError`) are excluded and bubble up immediately.
+
+### 6.4 Cashews Decorator Pipeline Initialization
+* **Defect**: Setting `monkeypatch.setattr(cache.cache, "get", ...)` failed to trigger in unit tests because `dns_cache_ttl` defaults to `"0"`, setting `self._resolve_dns_fn = None` and taking the un-cached DNS fallback route.
+* **Resolution**: Tests targeting backend failure propagation during DNS resolution must explicitly set a positive `dns_cache_ttl` (e.g., `"60s"`) to initialize and exercise the Cashews decorator wrapper.
+
+### 6.5 Semantic DNS Cache TTL & Wrapper Registration vs Bypass (User Feedback on §6.4)
+* **Defect**: `ProxyCache._register_decorators` relied on a lexical test `if self.dns_cache_ttl and self.dns_cache_ttl not in ("0", "0s")`. This lexical check fails to detect other zero-equivalent duration formats (e.g., `"0m"`, `"00s"`, `0`, or `0.0`), inadvertently registering Cashews cache decorators with zero TTL or leading to undefined behavior. Conversely, when `dns_cache_ttl` is `"0"`, callers and unit tests could not exercise or intercept DNS caching without modifying constructor arguments.
+* **Resolution & Hardened Contract**:
+  - Durations must be parsed semantically in `__init__` via `ttl_to_seconds(self.dns_cache_ttl)`.
+  - Store `self.dns_cache_ttl_sec = float(parsed_ttl) if parsed_ttl is not None else 0.0`.
+  - The Cashews decorator wrapper `@c(ttl=self.dns_cache_ttl, key=dns_key)` is only registered when `self.dns_cache_ttl_sec > 0`.
+  - When `self.dns_cache_ttl_sec <= 0`, `self._resolve_dns_fn` remains `None`, completely bypassing the Cashews caching wrapper and executor hop to ensure zero overhead for disabled DNS caching.
+  - Tests evaluating backend failure propagation during DNS caching must explicitly configure a positive `dns_cache_ttl` (`"60s"`) to activate the decorator wrapper.
+
+### 6.6 Cross-Epoch Breaker Collision Across `clear()` (P1)
+* **Defect**: When `CircuitBreakerManager.clear()` is called, all breakers in `_breakers` are purged. In-flight requests holding leases from pre-clear breakers (`epoch=0`) complete later and call `get_breaker()`, which instantiates a brand new `DestinationCircuitBreaker` initialized with `epoch=0`. The validation check `permit.epoch != self.epoch` compares `0 != 0` (False), allowing the obsolete pre-clear completion to corrupt the state of the brand new breaker.
+* **Resolution & Hardened Contract**:
+  - `CircuitBreakerManager` maintains a monotonic `_epoch_counter: int` that increments across manager lifetimes and assigns strictly unique initial epochs to each new `DestinationCircuitBreaker`.
+  - In `DestinationCircuitBreaker.record_result`, enforce `permit.breaker is self`. A completion whose permit originated from a destroyed or distinct breaker instance is rejected immediately.
+
+### 6.7 Permitless Probe Theft in `HALF_OPEN` State (P1)
+* **Defect**: In `DestinationCircuitBreaker.record_result`:
+  ```python
+  if permit is not None and not permit.is_probe:
+      return
+  ```
+  If an unleased caller passes `permit=None` (such as legacy code paths or duck-typed test doubles) while the breaker is in `HALF_OPEN`, this condition evaluates to False. The method proceeds to transition the breaker to `CLOSED` and clear `_half_open_in_flight`, allowing an unleased connection to close a half-open circuit.
+* **Resolution & Hardened Contract**:
+  - Enforce strict lease validation in `HALF_OPEN`:
+    ```python
+    if permit is None or not permit.is_probe or permit.breaker is not self or permit.epoch != self.epoch:
+        return
+    ```
+  - Only the designated probe lease holder for the current epoch is permitted to transition `HALF_OPEN -> CLOSED` or `HALF_OPEN -> OPEN`.
+
+### 6.8 Aborted Probe Resuscitation Race & Active Probe Lease Tracking (P1)
+* **Defect**: When probe $A$ aborts (e.g. timeout or cancellation in Trio), `permit.abort()` sets `_half_open_in_flight = False`. Probe $B$ is admitted immediately and assigned `is_probe=True`. If probe $A$'s background connection eventually completes successfully, probe $A$'s permit still has `is_probe=True` and `epoch == breaker.epoch`. Because `permit_id` was not tracked by the breaker, probe $A$ could race probe $B$ and close the circuit.
+* **Resolution & Hardened Contract**:
+  - `DestinationCircuitBreaker` maintains `_active_probe_id: int | None`.
+  - When a probe is admitted in `can_pass()`, `self._active_probe_id = permit_id`.
+  - In `record_result`, require `permit.permit_id == self._active_probe_id and not permit.was_aborted`.
+  - When a probe completes or aborts, `_active_probe_id` is cleared to `None`.
+
+### 6.9 Wedged `HALF_OPEN` Deadlock Recovery on Dropped Probe Permit (P1)
+* **Defect**: If a probing coroutine crashes catastrophically, is killed outside the `try...finally` block, or leaks without calling `permit.abort()`, `_half_open_in_flight` remains `True` indefinitely. The circuit breaker is trapped in `HALF_OPEN`, permanently rejecting all traffic.
+* **Resolution & Hardened Contract**:
+  - `DestinationCircuitBreaker` records `_probe_started_at: float | None`.
+  - In `can_pass()`, when `state == State.HALF_OPEN` and `_half_open_in_flight` is True, verify `now - self._probe_started_at < self.ttl`.
+  - If the probe has exceeded `self.ttl`, treat the probe lease as expired/dropped, log a warning, reset `_half_open_in_flight = False`, and admit the incoming request as the new probe.
+
+### 6.10 Shielded Socket Teardown Under Cancellation in `tunnel` (P1)
+* **Defect**: In `proxy.py:tunnel`, `await dest_stream.aclose()` inside `finally` can itself be interrupted by `trio.Cancelled` when a cancellation scope is cancelled (e.g. client disconnect or idle timeout). In Trio, an interrupted `aclose()` leaves the underlying TCP socket open and leaks OS file descriptors.
+* **Resolution & Hardened Contract**:
+  - Use `await trio.aclose_forcefully(dest_stream)` in stream cleanup handlers to shield the close operation and guarantee non-blocking FD teardown even under active cancellation.
+
+### 6.11 Zero-Resolved Target Hosts Success Fallthrough (P2)
+* **Defect**: In `proxy.py:tunnel`, `last_exc: Exception | None = None` was initialized. If `resolve_hosts` returns an empty list `[]`, the loop over `target_hosts` does not execute. `last_exc` remains `None`. In the `finally` block, `_record_connection_result(..., exc=last_exc, ...)` is called with `exc=None`, recording a successful connection to a destination that was never connected!
+* **Resolution & Hardened Contract**:
+  - Initialize `last_exc = OSError(f"No target addresses resolved for {desthost}:{destport}")`.
+  - If `resolve_hosts` yields no candidates, the connection attempt is properly registered as an error.
+
+### 6.12 `RuntimeError` Boundary Removal from `BACKEND_EXCEPTIONS` (P2)
+* **Defect**: `RuntimeError` was included in `BACKEND_EXCEPTIONS` to satisfy existing invariant tests that raised `RuntimeError("backend unavailable")`. However, `RuntimeError` is also raised by internal proxy lifecycle operations (e.g. `"ProxyCache has been stopped"` or `"Event loop is not initialized"`). Swallowing `RuntimeError` masks internal proxy bugs as Redis outages and triggers unwarranted fail-open degradation.
+* **Resolution & Hardened Contract**:
+  - Remove `RuntimeError` from `BACKEND_EXCEPTIONS`.
+  - Update unit tests simulating backend outages to use `cashews.exceptions.BackendNotAvailableError` or `ConnectionError`.
+
+### 6.13 Bracketed IPv6 Literal Normalization in `canonicalize_destination` (P2)
+* **Defect**: Standard HTTP CONNECT requests and URI parsers often format IPv6 addresses in square brackets (e.g., `"[::1]"`). `ipaddress.ip_address("[::1]")` raises `ValueError`, resulting in bracketed IPv6 addresses being treated as raw domain names rather than canonicalizing against unbracketed addresses (`"::1"`).
+* **Resolution & Hardened Contract**:
+  - In `canonicalize_destination`, strip surrounding brackets `host = host.strip("[]")` before invoking `ipaddress.ip_address`.
+
+### 6.14 Expired Call Pruning During LRU Eviction (P2)
+* **Defect**: In `CircuitBreakerManager._evict_one_locked`, the candidate selection checks `len(b._calls) == 0`. However, `_calls` may contain entries that are all timestamped older than `now - b.period`. Without pruning, an idle breaker with expired calls is skipped during eviction, potentially forcing eviction of an active breaker.
+* **Resolution & Hardened Contract**:
+  - In `_evict_one_locked`, invoke `b._prune_calls(now)` before checking `len(b._calls) == 0`.
+
+### 6.15 Post-Probe `opened_at` State Cleanup & Thread-Safe Local Type Narrowing (P2)
+* **Defect**: When a probe succeeded in `HALF_OPEN` and transitioned the breaker back to `CLOSED`, `self.opened_at` was not reset to `None`, leaving stale trip timestamps on active breakers. Furthermore, static type analysis (Pyright) rejected `if self.opened_at is not None and now - self.opened_at >= self.ttl` because concurrent thread execution could mutate `self.opened_at` between the guard condition and the arithmetic evaluation.
+* **Resolution & Hardened Contract**:
+  - In `DestinationCircuitBreaker.record_result`, explicitly reset `self.opened_at = None` when transitioning from `HALF_OPEN -> CLOSED`.
+  - In `acquire_permit` and `can_execute`, bind `self.opened_at` to a local variable `opened_at = self.opened_at` before checking `opened_at is not None and now - opened_at >= self.ttl`, guaranteeing atomic thread-safe reading and type-narrowed float arithmetic.
+
+### 6.16 Manager Monotonic Epoch Leap on `clear()` (P1)
+* **Defect**: In `CircuitBreakerManager.clear()`, existing active breakers had their `breaker.epoch` incremented by 1 (e.g., from 1 to 2) before eviction. If `get_breaker()` was invoked immediately post-clear, `self._epoch_counter += 1` incremented from 1 to 2, causing the brand-new breaker instance to collide at `epoch = 2` with the evicted breaker's updated epoch.
+* **Resolution & Hardened Contract**:
+  - In `CircuitBreakerManager.clear()`, advance `self._epoch_counter` with an epoch leap (`self._epoch_counter += 10`) ensuring all post-clear breaker instantiations receive epochs strictly greater than any pre-clear breaker's incremented epoch.
+  - Reinforced by the invariant that `permit.breaker is self` rejects permits originating from distinct breaker instances regardless of epoch values.
+
+### 6.17 Explicit Multi-Parameter Canonicalization Contract (P2)
+* **Defect**: Early call sites incorrectly attempted to pass single formatted strings (`"host:port"`) into `canonicalize_destination`, causing parameter mismatch diagnostics and runtime errors.
+* **Resolution & Hardened Contract**:
+  - Enforce explicit two-parameter signature: `canonicalize_destination(host: str, port: int) -> tuple[str, int]`.
+  - Normalizes IPv6 brackets on `host.strip("[]")` and compresses IP literals via `ipaddress.ip_address(clean_host).compressed`, returning `(canonical_host, int(port))`.
+

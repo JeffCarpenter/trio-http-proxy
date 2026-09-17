@@ -1,0 +1,83 @@
+# Progress Log: Circuit Breaker, Rate Limiter & Lifecycle Hardening
+
+## 2026-09-16
+- Reviewed in-depth architectural and concurrency critique across circuit breaking, rate limiting, and lifecycle management.
+- Initialized new task plan targeting 17 core requirements across 5 tranches.
+- Formulated `findings.md` documenting the critique and technical solutions:
+  - Admission tokens/leases with generation counter (`CircuitPermit`).
+  - Safe release of half-open permits on cancellation, exception, and abort.
+  - Epoch invalidation on `clear()`.
+  - Canonicalization of destination identities.
+  - Bounded breaker manager with LRU eviction.
+  - $O(1)$ deque-based sliding window with incremental error counts.
+  - Cashews rate limit ban TTL protocol (`incr(expire=period)`, `expire(ttl)` on threshold).
+  - Complete decoupling of local circuit breaker from Redis backend outages.
+  - Degradation health probing and periodic recovery.
+  - Startup ping and zero-overhead when backend features are disabled.
+  - Single `LifecycleState` enum with locked transitions and no restart.
+  - Thread leak prevention on startup timeout.
+  - URL credential sanitization.
+  - Strict namespace regex validation.
+  - Proceeding with Tranche 1: Circuit Breaker Admission Protocol, Permit Token & Eviction.
+- **Tranche 1 Completed**:
+  - Implemented `CircuitPermit` with epoch, permit ID, probe lease tracking, context manager protocol, and explicit `abort()`.
+  - Implemented destination canonicalization via `canonicalize_destination` (lowercase, FQDN dot strip, IPv4/IPv6 normalization).
+  - Implemented bounded `CircuitBreakerManager` with LRU eviction of idle closed breakers and epoch invalidation on `clear()`.
+  - Converted sliding window in `DestinationCircuitBreaker` to `collections.deque` and rolling incremental `_window_error_count` for $O(1)$ updates.
+  - Hardened connection tunnel in `proxy.py` to acquire `CircuitPermit`, pass permit to `_record_connection_result`, and reliably abort/close streams in `finally` upon cancellation or error.
+  - Verified 144/144 tests passing via `uv run pytest`.
+  - Verified `mcpls` diagnostics clean across modified files.
+- Ready for Tranche 2: Rate Limiter Protocol & Backend Error Boundary.
+- **Tranche 2 Completed**:
+  - Implemented Cashews ban-TTL protocol in `ProxyCache.check_rate_limit`: counting window via `incr(expire=period_sec)`, ban threshold via `expire(ttl_sec)` on `count == rate_limit + 1`, and active ban duration retrieval via `get_expire`.
+  - Added strict positive duration validation in `ProxyCache.__init__` for `rate_limit_period` and `rate_limit_ttl`, preventing Redis key immortality (`expire=0`).
+  - Defined `BACKEND_EXCEPTIONS` tuple and enforced backend error boundary in `_handle_backend_failure` to immediately bubble up internal programming bugs (`TypeError`, `AttributeError`, etc.) without masking defects as backend outages.
+  - Added 3 invariant tests to `tests/test_cache_invariants.py` for zero-duration rejection, ban-TTL state transitions, and error boundary behavior.
+  - Verified 147/147 tests passing via `uv run pytest`.
+  - Verified `mcpls` diagnostics clean across modified files.
+- **Adversarial Code Review & Findings Documentation**:
+  - Spawned two adversarial review subagents probing concurrency, cancellation, leases, and lifecycle boundaries.
+  - Documented findings in `findings.md` (§6.5–§6.14):
+    - §6.5: Semantic DNS cache TTL parsing (`dns_cache_ttl_sec`) and decorator wrapper registration vs bypass.
+    - §6.6: Cross-epoch breaker collision across `clear()` (P1).
+    - §6.7: Permitless probe theft in `HALF_OPEN` state (P1).
+    - §6.8: Aborted probe resuscitation race & active probe lease tracking (P1).
+    - §6.9: Wedged `HALF_OPEN` deadlock recovery on dropped probe permit (P1).
+    - §6.10: Shielded socket teardown under cancellation via `trio.aclose_forcefully` (P1).
+    - §6.11: Zero-resolved target hosts success fallthrough (P2).
+    - §6.12: `RuntimeError` boundary removal from `BACKEND_EXCEPTIONS` (P2).
+    - §6.13: Bracketed IPv6 literal normalization in `canonicalize_destination` (P2).
+    - §6.14: Expired call pruning during LRU eviction (P2).
+- Ready for Phase 2.5: Apply adversarial review remediations before proceeding to Tranche 3.
+- **Phase 2.5 Progress (Adversarial Review Remediations: P1 & P2 Invariant Fixes)**:
+  - Hardened `src/trio_http_proxy/cache.py`:
+    - `CircuitPermit`: Implemented tokenized leases with monotonic identity, epoch binding, context manager protocol (`__enter__`/`__exit__`), and non-aborting completion tracking.
+    - `DestinationCircuitBreaker`: Implemented active probe ID tracking (`_active_probe_id`), dropped probe timeout recovery (`now - self._probe_started_at >= self.ttl`), strict permit verification in `HALF_OPEN` rejecting permitless callers, epoch and breaker instance validation (`permit.breaker is self`), and $O(1)$ deque sliding window.
+    - `CircuitBreakerManager`: Added monotonic `_epoch_counter` ensuring new breaker instances never collide with pre-clear epochs, plus call pruning in LRU eviction.
+    - `ProxyCache.__init__`: Added `circuit_breaker_max_destinations`, semantic duration validation (`rate_limit_period_sec`, `rate_limit_ttl_sec`, `dns_cache_ttl_sec`).
+    - `ProxyCache._handle_backend_failure`: Narrowed `BACKEND_EXCEPTIONS` by removing `RuntimeError` per §6.12.
+  - Hardened `src/trio_http_proxy/proxy.py`:
+    - Stream cleanup in `tunnel`: Shielded non-blocking teardown via `await trio.aclose_forcefully(dest_stream)` in `finally`.
+    - Connection resolution: Initialized `last_exc = OSError(...)` preventing false success recording when DNS resolution returns empty candidates.
+  - Test Suite & Diagnostics Status:
+    - Running `uv run pytest` identified 3 test adjustments needed in `tests/test_cache_invariants.py`:
+      - 2 mock backend tests raised `RuntimeError` which correctly bubbles up under the narrowed `BACKEND_EXCEPTIONS` boundary (need `cashews.exceptions.BackendNotAvailableError` or `ConnectionError`).
+      - 1 state machine unit test called `record_result` without a permit, which correctly rejects state transitions under the hardened §6.7 permit validation in `HALF_OPEN` (needs permit pass).
+    - `mcpls` diagnostics clean (`{"diagnostics":[]}`) across `src/trio_http_proxy/cache.py` and `src/trio_http_proxy/proxy.py`.
+- **Phase 2.5 Completed**:
+  - Implemented and verified all remediations (§6.5–§6.14):
+    - Monotonic `_epoch_counter` + `permit.breaker is self` preventing cross-clear epoch collisions.
+    - Permit validation in `HALF_OPEN` rejecting unleased callers.
+    - Active probe tracking (`_active_probe_id`) preventing aborted probe resuscitation.
+    - Dropped probe timeout recovery in `HALF_OPEN`.
+    - Shielded stream cleanup via `await trio.aclose_forcefully(dest_stream)`.
+    - Empty DNS resolution error tracking with `OSError`.
+    - Clean `BACKEND_EXCEPTIONS` boundary without `RuntimeError`.
+    - Bracketed IPv6 canonicalization.
+    - Semantic duration parsing and `_register_decorators` gating on `dns_cache_ttl_sec > 0`.
+    - Expired call pruning in LRU eviction.
+  - Added 6 new invariant unit tests to `tests/test_cache_invariants.py`.
+  - Full test suite passing: **153/153 tests passing** in 4.64s (`uv run pytest`).
+  - Zero diagnostics reported across all project files (`mcpls:get_diagnostics`).
+- Ready for Tranche 3: Failure Domain Decoupling, Health Probing & Startup Health Check.
+

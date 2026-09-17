@@ -30,6 +30,7 @@ from .cache import (
     DEFAULT_RATE_LIMIT_PERIOD,
     CacheBackendUnavailable,
     CircuitBreakerOpen,
+    CircuitPermit,
     RateLimitError,
     get_client_key,
 )
@@ -489,6 +490,19 @@ async def start_server(
             CV_PROXY_CACHE.reset(cache_token)
 
 
+async def _record_connection_result(
+    proxy_cache: Any,
+    host: str,
+    port: int,
+    exc: Exception | None,
+    permit: CircuitPermit | None,
+) -> None:
+    try:
+        await proxy_cache.record_connection_result(host, port, exc, permit=permit)
+    except TypeError:
+        await proxy_cache.record_connection_result(host, port, exc)
+
+
 async def tunnel(
     client_stream,
     _connect=trio.open_tcp_stream,
@@ -545,9 +559,10 @@ async def tunnel(
 
     CV_DESTHOST.set(desthost)
 
+    permit: CircuitPermit | None = None
     if proxy_cache is not None:
         try:
-            await proxy_cache.check_circuit(desthost, destport)
+            permit = await proxy_cache.check_circuit(desthost, destport)
         except CircuitBreakerOpen:
             logger.warning(
                 "Circuit breaker open for %s:%d, sending 502 to client...",
@@ -556,90 +571,115 @@ async def tunnel(
             )
             try:
                 await client_stream.send_all(http.http_502_bad_gateway)
-            except trio.BrokenResourceError, trio.ClosedResourceError:
+            except (trio.BrokenResourceError, trio.ClosedResourceError):
                 pass
             raise
 
     logger.info("Got CONNECT request for %s:%d, connecting...", desthost, destport)
 
-    target_hosts = [desthost]
-    if proxy_cache is not None:
-        try:
-            if hasattr(proxy_cache, "resolve_hosts"):
-                target_hosts = await proxy_cache.resolve_hosts(desthost)
-            else:
-                resolved = await proxy_cache.resolve_host(desthost)
-                target_hosts = [resolved]
-        except OSError as exc:
-            if proxy_cache is not None:
-                await proxy_cache.record_connection_result(desthost, destport, exc)
-            logger.warning(
-                "Could not resolve %s, sending 502 to client...",
-                desthost,
-            )
-            try:
-                await client_stream.send_all(http.http_502_bad_gateway)
-            except trio.BrokenResourceError, trio.ClosedResourceError:
-                pass
-            raise
-
+    permit_recorded = False
     dest_stream = None
-    last_exc: OSError | trio.TooSlowError | None = None
-    overall_deadline = trio.current_time() + dest_connect_timeout
-
-    for i, host in enumerate(target_hosts):
-        time_left = overall_deadline - trio.current_time()
-        if time_left <= 0:
-            last_exc = trio.TooSlowError("Overall connect timeout exceeded")
-            break
-        rem = len(target_hosts) - i
-        per_host_timeout = time_left / rem if rem > 1 else time_left
-
-        try:
-            with trio.fail_after(per_host_timeout):
-                dest_stream = await _connect(host, destport)
-            break
-        except OSError as exc:
-            last_exc = exc
-            continue
-        except trio.TooSlowError as exc:
-            last_exc = exc
-            continue
-
-    if dest_stream is None:
-        if isinstance(last_exc, trio.TooSlowError):
-            if proxy_cache is not None:
-                await proxy_cache.record_connection_result(desthost, destport, last_exc)
-            logger.warning(
-                "Timed out connecting to %s:%d, sending 504 to client...",
-                desthost,
-                destport,
-            )
-            try:
-                await client_stream.send_all(http.http_504_gateway_timeout)
-            except trio.BrokenResourceError, trio.ClosedResourceError:
-                pass
-            raise last_exc
-        else:
-            if proxy_cache is not None:
-                await proxy_cache.record_connection_result(desthost, destport, last_exc)
-            logger.warning(
-                "Could not connect to %s:%d, sending 502 to client...",
-                desthost,
-                destport,
-            )
-            try:
-                await client_stream.send_all(http.http_502_bad_gateway)
-            except trio.BrokenResourceError, trio.ClosedResourceError:
-                pass
-            if last_exc is not None:
-                raise last_exc
-            raise OSError(f"Failed to connect to {desthost}:{destport}")
-
+    dest_connected = False
     try:
+        target_hosts = [desthost]
         if proxy_cache is not None:
-            await proxy_cache.record_connection_result(desthost, destport, None)
+            try:
+                if hasattr(proxy_cache, "resolve_hosts"):
+                    target_hosts = await proxy_cache.resolve_hosts(desthost)
+                else:
+                    resolved = await proxy_cache.resolve_host(desthost)
+                    target_hosts = [resolved]
+            except OSError as exc:
+                if proxy_cache is not None:
+                    await _record_connection_result(
+                        proxy_cache, desthost, destport, exc, permit
+                    )
+                    permit_recorded = True
+                logger.warning(
+                    "Could not resolve %s, sending 502 to client...",
+                    desthost,
+                )
+                try:
+                    await client_stream.send_all(http.http_502_bad_gateway)
+                except (trio.BrokenResourceError, trio.ClosedResourceError):
+                    pass
+                raise
 
+        last_exc: Exception | None = OSError(
+            f"No target addresses resolved for {desthost}:{destport}"
+        )
+        overall_deadline = trio.current_time() + dest_connect_timeout
+
+        for i, host in enumerate(target_hosts):
+            time_left = overall_deadline - trio.current_time()
+            if time_left <= 0:
+                last_exc = trio.TooSlowError("Overall connect timeout exceeded")
+                break
+            rem = len(target_hosts) - i
+            per_host_timeout = time_left / rem if rem > 1 else time_left
+
+            try:
+                with trio.fail_after(per_host_timeout):
+                    dest_stream = await _connect(host, destport)
+                break
+            except OSError as exc:
+                last_exc = exc
+                continue
+            except trio.TooSlowError as exc:
+                last_exc = exc
+                continue
+
+        if dest_stream is None:
+            if isinstance(last_exc, trio.TooSlowError):
+                if proxy_cache is not None:
+                    await _record_connection_result(
+                        proxy_cache, desthost, destport, last_exc, permit
+                    )
+                    permit_recorded = True
+                logger.warning(
+                    "Timed out connecting to %s:%d, sending 504 to client...",
+                    desthost,
+                    destport,
+                )
+                try:
+                    await client_stream.send_all(http.http_504_gateway_timeout)
+                except (trio.BrokenResourceError, trio.ClosedResourceError):
+                    pass
+                raise last_exc
+            else:
+                if proxy_cache is not None:
+                    await _record_connection_result(
+                        proxy_cache, desthost, destport, last_exc, permit
+                    )
+                    permit_recorded = True
+                logger.warning(
+                    "Could not connect to %s:%d, sending 502 to client...",
+                    desthost,
+                    destport,
+                )
+                try:
+                    await client_stream.send_all(http.http_502_bad_gateway)
+                except (trio.BrokenResourceError, trio.ClosedResourceError):
+                    pass
+                if last_exc is not None:
+                    raise last_exc
+                raise OSError(f"Failed to connect to {desthost}:{destport}")
+
+        if proxy_cache is not None:
+            await _record_connection_result(
+                proxy_cache, desthost, destport, None, permit
+            )
+            permit_recorded = True
+
+        dest_connected = True
+    finally:
+        if permit is not None and not permit_recorded:
+            permit.abort()
+        if dest_stream is not None and not dest_connected:
+            await trio.aclose_forcefully(dest_stream)
+
+    assert dest_stream is not None
+    try:
         CV_DEST_STREAM.set(dest_stream)
         logger.info("Connected to %s, sending 200 to client...", desthost)
         await client_stream.send_all(http.http_200_connection_established)
@@ -648,7 +688,8 @@ async def tunnel(
         logger.info("Sent 200 to client, tunnel established.")
         return dest_stream
     except BaseException:
-        await dest_stream.aclose()
+        if dest_stream is not None:
+            await dest_stream.aclose()
         raise
 
 
