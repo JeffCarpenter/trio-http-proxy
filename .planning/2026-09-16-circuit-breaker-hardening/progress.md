@@ -88,7 +88,27 @@
     - `test_proxy_cache_check_circuit_and_record_connection_result_protocol`
     - `test_circuit_permit_context_manager_auto_abort`
   - Full test suite passing: **155/155 tests passing** in 5.11s (`uv run pytest`).
-  - Static analysis clean: `uv run ruff check` (0 issues), `uv run pyright` (0 errors), `mcpls:get_diagnostics` (0 diagnostics across all project files).
 - Ready for Tranche 3: Failure Domain Decoupling, Health Probing & Startup Health Check.
+- **Tranche 3 Progress (TDD Phase)**:
+  - **Tracer Bullet 1 (Circuit Breaker Decoupling) Completed**:
+    - Removed `self._degraded` bypass from `ProxyCache.check_circuit` and `ProxyCache.record_connection_result`.
+    - Local in-memory destination circuit breakers continue to record failures, trip to OPEN, and enforce admission during backend outages.
+    - Verified with `tests/test_cache_invariants.py::test_circuit_breaker_functions_during_backend_outage` (156/156 tests passing).
+  - **3 Parallel TDD Test Suites Dispatched & Verified RED**:
+    - Dispatched 3 parallel subagents with strict lane isolation, zero production mutations, and mandatory `mcpls` code intelligence usage:
+      1. `tests/test_cache_thread_elimination.py` (7 tests, 4 RED): Validates bridge thread/loop elimination when cache is disabled or no backend features are enabled.
+      2. `tests/test_cache_startup_ping.py` (6 tests, 3 RED): Validates startup health ping against `cache.cache.ping()` within `startup_timeout`, failing fast in fail-closed and degrading in fail-open.
+      3. `tests/test_cache_backend_recovery.py` (5 tests, 4 RED): Validates non-sticky periodic probe recovery in fail-open mode, restoring rate-limiting and DNS caching upon successful backend ping.
+    - Static analysis and `mcpls` diagnostics clean across all new test files.
+  - **Tranche 3 GREEN Implementation Completed**:
+    - Decoupled `ProxyCache.check_circuit` and `ProxyCache.record_connection_result` from `self.enabled` and `self._degraded`.
+    - Added `_has_backend_features()` to eliminate bridge thread and loop when backend is disabled (`enabled=False` or `cache_url=""`) or when no backend features requiring Cashews are enabled (`dns_cache_ttl_sec <= 0` and `not rate_limit_enabled`).
+    - Implemented startup ping against `cache.cache.ping()` within `startup_timeout`:
+      - Fail-closed: transport failure or timeout raises `CacheBackendUnavailable` immediately, joins the thread, and closes the loop.
+      - Fail-open: transitions into degraded mode (`is_degraded=True`, `is_running=False`) without raising, keeping the loop alive for probing.
+    - Implemented `_maybe_probe_backend()` with 30s throttling under `_probe_lock`, recovering degraded backend to healthy upon successful ping.
+    - All 46 tests across the 4 cache test suites passing; full test suite passing: **174/174 tests passing** in 5.20s (`uv run pytest`).
+    - `mcpls` diagnostics clean (0 errors/warnings on `src/trio_http_proxy/cache.py`).
+- Ready for Tranche 4: Lifecycle State Machine, URL Redaction & Configuration Hardening.
 
 
