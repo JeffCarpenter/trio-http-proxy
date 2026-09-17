@@ -20,14 +20,13 @@ import trio
 from cashews import Cache, CircuitBreakerOpen
 from cashews.ttl import TTL, ttl_to_seconds
 
-from .cache_backend_unavailable import CacheBackendUnavailable
-from .circuit_breaker_manager import (
+from .cache import LifecycleState
+from .circuit_breaker import (
     DEFAULT_MAX_DESTINATIONS,
     CircuitBreakerManager,
+    CircuitPermit,
 )
-from .circuit_permit import CircuitPermit
-from .lifecycle_state import LifecycleState
-from .rate_limit_error import RateLimitError
+from .errors import CacheBackendUnavailable, RateLimitError
 from .util import redact_url
 
 logger = logging.getLogger(__name__)

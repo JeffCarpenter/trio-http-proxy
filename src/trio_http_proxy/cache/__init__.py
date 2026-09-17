@@ -6,17 +6,16 @@ backward compatibility.
 
 from cashews import CircuitBreakerOpen
 
-from .cache_backend_unavailable import CacheBackendUnavailable
-from .circuit_breaker_manager import (
+from ..circuit_breaker import (
     DEFAULT_MAX_DESTINATIONS,
     CircuitBreakerManager,
+    CircuitPermit,
+    CircuitState,
+    DestinationCircuitBreaker,
     canonicalize_destination,
 )
-from .circuit_permit import CircuitPermit
-from .circuit_state import CircuitState
-from .destination_circuit_breaker import DestinationCircuitBreaker
-from .lifecycle_state import LifecycleState
-from .proxy_cache import (
+from ..errors import CacheBackendUnavailable, RateLimitError
+from ..proxy_cache import (
     BACKEND_EXCEPTIONS,
     CACHE_FAILURE_POLICY,
     DEFAULT_CACHE_ENABLED,
@@ -42,7 +41,7 @@ from .proxy_cache import (
     _int_env,
     get_client_key,
 )
-from .rate_limit_error import RateLimitError
+from .lifecycle_state import LifecycleState
 
 __all__ = [
     "BACKEND_EXCEPTIONS",

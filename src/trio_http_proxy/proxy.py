@@ -31,7 +31,7 @@ from .cache import (
     RateLimitError,
     get_client_key,
 )
-from .connection_context import (
+from .connection import (
     _DEFAULT_PROXY_CACHE_SENTINEL,
     CV_CLIENT_STREAM,
     CV_CONN_ID,
@@ -39,13 +39,12 @@ from .connection_context import (
     CV_DESTHOST,
     CV_PIPE_FROM,
     CV_PROXY_CACHE,
+    ConnectionFilter,
+    ConnectionLoggerAdapter,
     _conn_ids,
     format_conn_prefix,
 )
-from .connection_filter import ConnectionFilter
-from .connection_logger_adapter import ConnectionLoggerAdapter
-from .proxy_protocol_error import ProxyProtocolError
-from .request_too_large_error import RequestTooLargeError
+from .errors import ProxyProtocolError, RequestTooLargeError
 from .util import _float_env, _retry_after_seconds
 
 

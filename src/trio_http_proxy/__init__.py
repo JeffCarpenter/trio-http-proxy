@@ -1,3 +1,4 @@
+from . import circuit_breaker, connection, errors
 from .cache import (
     CACHE_FAILURE_POLICY,
     DEFAULT_CACHE_ENABLED,
@@ -128,6 +129,9 @@ __all__ = [
     "ProxyProtocolError",
     "RateLimitError",
     "RequestTooLargeError",
+    "circuit_breaker",
+    "connection",
+    "errors",
     "format_conn_prefix",
     "get_client_key",
     "http_200_connection_established",
