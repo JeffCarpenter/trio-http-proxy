@@ -4,7 +4,7 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy import proxy
+from trio_http_proxy import http, proxy
 from trio_http_proxy.cache import CacheBackendUnavailable, RateLimitError
 
 
@@ -50,7 +50,7 @@ async def test_http_proxy_cache_backend_failure_sends_503(stage: str) -> None:
     )
 
     response = await client_stream.receive_some(4096)
-    assert response == proxy.HTTP_503_SERVICE_UNAVAILABLE
+    assert response == http.http_503_service_unavailable
     assert b"502" not in response
     assert b"429" not in response
     assert await client_stream.receive_some(4096) == b""
@@ -105,7 +105,7 @@ async def test_http_proxy_post_connect_cache_failure_closes_destination() -> Non
     )
 
     response = await client_stream.receive_some(4096)
-    assert response == proxy.HTTP_503_SERVICE_UNAVAILABLE
+    assert response == http.http_503_service_unavailable
     assert b"200" not in response
     assert b"502" not in response
     assert b"429" not in response

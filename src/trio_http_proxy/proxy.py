@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-# Copyright 2018-2019 Joshua Bronson. All Rights Reserved.
+# Copyright 2018-2019 Joshua Bronson.    All Rights Reserved.
+# Copyright 2026      Jeffrey Carpenter.
 #
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -22,6 +23,10 @@ from urllib.parse import urlsplit
 
 import h11
 import trio
+
+
+from .util import _float_env, _retry_after_seconds
+from . import http
 
 from .cache import (
     DEFAULT_PROXY_CACHE,
@@ -64,22 +69,6 @@ def _validate_bufmaxsz(val: int) -> int:
     return val
 
 
-def _float_env(name: str, default: float, _getenv: Any = getenv) -> float:
-    return float(_getenv(name, default))
-
-
-def _retry_after_seconds(period: str) -> int:
-    if period.endswith("s"):
-        try:
-            return int(period[:-1])
-        except ValueError:
-            pass
-    try:
-        return int(period)
-    except ValueError:
-        return 60
-
-
 DEFAULT_PORT = 8080
 PORT = _int_env("PORT", DEFAULT_PORT, min_val=0, max_val=65535)
 
@@ -102,6 +91,8 @@ PIPE_IDLE_TIMEOUT = _float_env("PIPE_IDLE_TIMEOUT", DEFAULT_PIPE_IDLE_TIMEOUT)
 DEFAULT_PIPE_SEND_TIMEOUT = 30.0
 PIPE_SEND_TIMEOUT = _float_env("PIPE_SEND_TIMEOUT", DEFAULT_PIPE_SEND_TIMEOUT)
 
+RETRY_AFTER_SECS = _retry_after_seconds(DEFAULT_RATE_LIMIT_PERIOD)
+
 # Connection cap: bounds how many active proxy tunnels run concurrently.
 # Note: this limits active tunnels/sessions, not raw accepted socket file
 # descriptors, as connections exceeding the limit wait in the limiter's
@@ -112,29 +103,6 @@ CONN_LIMITER = trio.CapacityLimiter(MAXCONNS)
 
 DEFAULT_LOG_LEVEL = "INFO"
 LOG_LEVEL = getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
-
-HTTP_METHOD_CONNECT = b"CONNECT"
-HTTP_400_BAD_REQUEST = (
-    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-)
-HTTP_408_REQUEST_TIMEOUT = (
-    b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-)
-HTTP_414_URI_TOO_LONG = (
-    b"HTTP/1.1 414 URI Too Long\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-)
-RETRY_AFTER_SECS = _retry_after_seconds(DEFAULT_RATE_LIMIT_PERIOD)
-HTTP_429_TOO_MANY_REQUESTS = (
-    f"HTTP/1.1 429 Too Many Requests\r\nRetry-After: {RETRY_AFTER_SECS}\r\n"
-    f"Connection: close\r\nContent-Length: 0\r\n\r\n".encode()
-)
-HTTP_502_BAD_GATEWAY = (
-    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-)
-HTTP_503_SERVICE_UNAVAILABLE = b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-HTTP_504_GATEWAY_TIMEOUT = (
-    b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-)
 
 
 def _http_429_response(retry_after: Any = None) -> bytes:
@@ -155,7 +123,7 @@ def _http_429_response(retry_after: Any = None) -> bytes:
                 f"HTTP/1.1 429 Too Many Requests\r\nRetry-After: {seconds}\r\n"
                 f"Connection: close\r\nContent-Length: 0\r\n\r\n"
             ).encode()
-    return HTTP_429_TOO_MANY_REQUESTS
+    return http.http_429_too_many_requests % retry_after
 
 
 class ProxyProtocolError(ValueError):
@@ -170,8 +138,6 @@ class RequestTooLargeError(ProxyProtocolError):
     arrived. A subclass of ProxyProtocolError so it's still caught wherever
     that is, but distinguishable so tunnel() can reply 414 instead of 400."""
 
-
-HTTP_200_CONNECTION_ESTABLISHED = b"HTTP/1.1 200 Connection established\r\n\r\n"
 
 CV_CLIENT_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
     "client_stream", default=None
@@ -313,7 +279,7 @@ async def http_proxy(
                         "Cache backend unavailable during rate limit check, sending 503 to client..."
                     )
                     try:
-                        await client_stream.send_all(HTTP_503_SERVICE_UNAVAILABLE)
+                        await client_stream.send_all(http.http_503_service_unavailable)
                     except trio.BrokenResourceError, trio.ClosedResourceError:
                         pass
                     return
@@ -332,7 +298,7 @@ async def http_proxy(
                     "Cache backend unavailable during tunnel, sending 503 to client..."
                 )
                 try:
-                    await client_stream.send_all(HTTP_503_SERVICE_UNAVAILABLE)
+                    await client_stream.send_all(http.http_503_service_unavailable)
                 except trio.BrokenResourceError, trio.ClosedResourceError:
                     pass
                 return
@@ -557,14 +523,14 @@ async def tunnel(
             "Oversized CONNECT request, sending 414 to client...", exc_info=True
         )
         try:
-            await client_stream.send_all(HTTP_414_URI_TOO_LONG)
+            await client_stream.send_all(http.http_414_uri_too_long)
         except trio.BrokenResourceError, trio.ClosedResourceError:
             pass
         raise
     except ProxyProtocolError, h11.ProtocolError:
         logger.warning("Bad CONNECT request, sending 400 to client...", exc_info=True)
         try:
-            await client_stream.send_all(HTTP_400_BAD_REQUEST)
+            await client_stream.send_all(http.http_400_bad_request)
         except trio.BrokenResourceError, trio.ClosedResourceError:
             pass
         raise
@@ -574,7 +540,7 @@ async def tunnel(
             exc_info=True,
         )
         try:
-            await client_stream.send_all(HTTP_408_REQUEST_TIMEOUT)
+            await client_stream.send_all(http.http_408_request_timeout)
         except trio.BrokenResourceError, trio.ClosedResourceError:
             pass
         raise
@@ -591,7 +557,7 @@ async def tunnel(
                 destport,
             )
             try:
-                await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+                await client_stream.send_all(http.http_502_bad_gateway)
             except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             raise
@@ -614,7 +580,7 @@ async def tunnel(
                 desthost,
             )
             try:
-                await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+                await client_stream.send_all(http.http_502_bad_gateway)
             except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             raise
@@ -652,7 +618,7 @@ async def tunnel(
                 destport,
             )
             try:
-                await client_stream.send_all(HTTP_504_GATEWAY_TIMEOUT)
+                await client_stream.send_all(http.http_504_gateway_timeout)
             except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             raise last_exc
@@ -665,7 +631,7 @@ async def tunnel(
                 destport,
             )
             try:
-                await client_stream.send_all(HTTP_502_BAD_GATEWAY)
+                await client_stream.send_all(http.http_502_bad_gateway)
             except trio.BrokenResourceError, trio.ClosedResourceError:
                 pass
             if last_exc is not None:
@@ -678,7 +644,7 @@ async def tunnel(
 
         CV_DEST_STREAM.set(dest_stream)
         logger.info("Connected to %s, sending 200 to client...", desthost)
-        await client_stream.send_all(HTTP_200_CONNECTION_ESTABLISHED)
+        await client_stream.send_all(http.http_200_connection_established)
         if trailing_data:
             await dest_stream.send_all(trailing_data)
         logger.info("Sent 200 to client, tunnel established.")
@@ -727,7 +693,7 @@ async def process_as_connect_request(
 
     if not isinstance(h11_nextevt, h11.Request):
         raise ProxyProtocolError(f"{h11_nextevt=} is not a h11.Request")
-    if h11_nextevt.method != HTTP_METHOD_CONNECT:
+    if h11_nextevt.method != http.http_method_connect:
         raise ProxyProtocolError(f"{h11_nextevt.method=} != CONNECT")
     target = h11_nextevt.target
     try:
@@ -871,15 +837,6 @@ __all__ = [
     "DEFAULT_PIPE_SEND_TIMEOUT",
     "DEFAULT_PORT",
     "DEST_CONNECT_TIMEOUT",
-    "HTTP_200_CONNECTION_ESTABLISHED",
-    "HTTP_400_BAD_REQUEST",
-    "HTTP_408_REQUEST_TIMEOUT",
-    "HTTP_414_URI_TOO_LONG",
-    "HTTP_429_TOO_MANY_REQUESTS",
-    "HTTP_502_BAD_GATEWAY",
-    "HTTP_503_SERVICE_UNAVAILABLE",
-    "HTTP_504_GATEWAY_TIMEOUT",
-    "HTTP_METHOD_CONNECT",
     "LOG_LEVEL",
     "MAXCONNS",
     "MAXREQSZ",
