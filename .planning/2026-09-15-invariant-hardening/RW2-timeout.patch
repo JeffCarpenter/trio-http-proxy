@@ -1,0 +1,497 @@
+diff --git a/src/trio_http_proxy/__init__.py b/src/trio_http_proxy/__init__.py
+index f9c83ae..5728ab5 100644
+--- a/src/trio_http_proxy/__init__.py
++++ b/src/trio_http_proxy/__init__.py
+@@ -1,5 +1,7 @@
+ from .cache import (
++    CACHE_FAILURE_POLICY,
+     DEFAULT_CACHE_ENABLED,
++    DEFAULT_CACHE_FAILURE_POLICY,
+     DEFAULT_CACHE_URL,
+     DEFAULT_CIRCUIT_BREAKER_ENABLED,
+     DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE,
+@@ -12,6 +14,7 @@ from .cache import (
+     DEFAULT_RATE_LIMIT_ENABLED,
+     DEFAULT_RATE_LIMIT_PERIOD,
+     DEFAULT_RATE_LIMIT_TTL,
++    CacheBackendUnavailable,
+     CircuitBreakerOpen,
+     ProxyCache,
+     RateLimitError,
+@@ -67,6 +70,7 @@ from .proxy import (
+ 
+ __all__ = [
+     "BUFMAXSZ",
++    "CACHE_FAILURE_POLICY",
+     "CONNECT_READ_TIMEOUT",
+     "CONN_LIMITER",
+     "CV_CLIENT_STREAM",
+@@ -76,6 +80,7 @@ __all__ = [
+     "CV_PIPE_FROM",
+     "DEFAULT_BUFFER_SIZE",
+     "DEFAULT_CACHE_ENABLED",
++    "DEFAULT_CACHE_FAILURE_POLICY",
+     "DEFAULT_CACHE_URL",
+     "DEFAULT_CIRCUIT_BREAKER_ENABLED",
+     "DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE",
+@@ -112,6 +117,7 @@ __all__ = [
+     "PIPE_IDLE_TIMEOUT",
+     "PIPE_SEND_TIMEOUT",
+     "PORT",
++    "CacheBackendUnavailable",
+     "CircuitBreakerOpen",
+     "ConnectionFilter",
+     "ConnectionLoggerAdapter",
+diff --git a/src/trio_http_proxy/cache.py b/src/trio_http_proxy/cache.py
+index 3bdeba2..624c472 100644
+--- a/src/trio_http_proxy/cache.py
++++ b/src/trio_http_proxy/cache.py
+@@ -7,14 +7,38 @@ from collections.abc import Callable, Coroutine
+ from os import getenv
+ from typing import Any, Self, TypeVar
+ 
++import cashews
+ import trio
+-from cashews import Cache, CircuitBreakerOpen, RateLimitError
++from cashews import Cache, CircuitBreakerOpen
+ 
+ logger = logging.getLogger(__name__)
+ 
+ T = TypeVar("T")
+ 
+ 
++class CacheBackendUnavailable(Exception):
++    """Raised when the cache backend is unavailable under fail-closed policy."""
++
++
++class RateLimitError(cashews.RateLimitError):
++    """Raised when rate limit is exceeded, exposing accurate integer retry metadata."""
++
++    def __init__(
++        self,
++        *args: Any,
++        retry_after: int | None = None,
++        **kwargs: Any,
++    ) -> None:
++        if retry_after is None and args and isinstance(args[0], int):
++            retry_after = args[0]
++        super().__init__(*args, **kwargs)
++        self.retry_after = retry_after
++
++    @property
++    def retry_after_seconds(self) -> int | None:
++        return self.retry_after
++
++
+ def _int_env(
+     name: str,
+     default: int,
+@@ -46,8 +70,40 @@ def _bool_env(
+     return val.strip().lower() in ("1", "true", "yes", "on")
+ 
+ 
++def _policy_env(
++    name: str,
++    default: str,
++    _getenv: Callable[..., str | None] = getenv,
++) -> str:
++    val = _getenv(name)
++    if val is None or not val.strip():
++        return default
++    res = val.strip().lower()
++    if res not in ("fail-open", "fail-closed"):
++        raise ValueError(
++            f"Invalid {name}: {val!r}, must be 'fail-open' or 'fail-closed'"
++        )
++    return res
++
++
++def _retry_after_seconds(period: str | int) -> int:
++    if isinstance(period, int):
++        return period
++    if period.endswith("s"):
++        try:
++            return int(period[:-1])
++        except ValueError:
++            pass
++    try:
++        return int(period)
++    except ValueError:
++        return 60
++
++
+ DEFAULT_CACHE_URL = getenv("CACHE_URL", "mem://")
+ DEFAULT_CACHE_ENABLED = _bool_env("CACHE_ENABLED", True)
++DEFAULT_CACHE_FAILURE_POLICY = _policy_env("CACHE_FAILURE_POLICY", "fail-open")
++CACHE_FAILURE_POLICY = DEFAULT_CACHE_FAILURE_POLICY
+ DEFAULT_DNS_CACHE_TTL = getenv("DNS_CACHE_TTL", "0s")
+ DEFAULT_CIRCUIT_BREAKER_ENABLED = _bool_env("CIRCUIT_BREAKER_ENABLED", True)
+ DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE = _int_env(
+@@ -87,7 +143,15 @@ class ProxyCache:
+         rate_limit: int = DEFAULT_RATE_LIMIT,
+         rate_limit_period: str = DEFAULT_RATE_LIMIT_PERIOD,
+         rate_limit_ttl: str = DEFAULT_RATE_LIMIT_TTL,
++        failure_policy: str = DEFAULT_CACHE_FAILURE_POLICY,
++        cache_failure_policy: str | None = None,
+     ) -> None:
++        if cache_failure_policy is not None:
++            failure_policy = cache_failure_policy
++        if failure_policy not in ("fail-open", "fail-closed"):
++            raise ValueError(
++                f"Invalid CACHE_FAILURE_POLICY: {failure_policy!r}, must be 'fail-open' or 'fail-closed'"
++            )
+         self.cache_url = cache_url
+         self.enabled = enabled
+         self.dns_cache_ttl = dns_cache_ttl
+@@ -100,6 +164,8 @@ class ProxyCache:
+         self.rate_limit = rate_limit
+         self.rate_limit_period = rate_limit_period
+         self.rate_limit_ttl = rate_limit_ttl
++        self.failure_policy = failure_policy
++        self.cache_failure_policy = failure_policy
+ 
+         self.cache = Cache(name="trio_http_proxy")
+         self._loop: asyncio.AbstractEventLoop | None = None
+@@ -108,6 +174,7 @@ class ProxyCache:
+         self._lock = threading.Lock()
+         self._started = False
+         self._stopped = False
++        self._backend_available = True
+ 
+         self._resolve_dns_fn: Callable[[str], Coroutine[Any, Any, list[str]]] | None = (
+             None
+@@ -137,10 +204,13 @@ class ProxyCache:
+                 try:
+                     loop.run_forever()
+                 finally:
+-                    loop.close()
++                    try:
++                        loop.close()
++                    except Exception:  # noqa: BLE001, S110
++                        pass
+ 
+             self._thread = threading.Thread(
+-                target=_run_loop, daemon=True, name="cashews-trio-bridge"
++                target=_run_loop, daemon=False, name="cashews-trio-bridge"
+             )
+             self._thread.start()
+             self._ready.wait()
+@@ -148,12 +218,23 @@ class ProxyCache:
+             try:
+                 self.cache.setup(self.cache_url)
+                 self._register_decorators()
+-            except Exception:
++                self._backend_available = True
++            except Exception as exc:
+                 logger.exception(
+                     "Failed to setup cashews cache with %s", self.cache_url
+                 )
+-                self._teardown_thread()
+-                raise
++                self._backend_available = False
++                loop = self._loop
++                thread = self._thread
++                self._teardown_bridge(loop, thread)
++                self._loop = None
++                self._thread = None
++                if self.failure_policy == "fail-closed":
++                    raise CacheBackendUnavailable(
++                        f"Failed to setup cache backend: {exc}"
++                    ) from exc
++                self._started = True
++                return
+ 
+             self._started = True
+ 
+@@ -163,30 +244,70 @@ class ProxyCache:
+             if not self._started and not self._stopped:
+                 return
+             self._stopped = True
+-            self._teardown_thread()
++            loop = self._loop
++            thread = self._thread
++
++        self._teardown_bridge(loop, thread)
++
++        with self._lock:
++            self._loop = None
++            self._thread = None
+             self._started = False
++            self._resolve_dns_fn = None
++            self._circuit_probe_fn = None
++            self._rate_limiter_fn = None
++
++    def _teardown_bridge(
++        self,
++        loop: asyncio.AbstractEventLoop | None,
++        thread: threading.Thread | None,
++    ) -> None:
++        if loop and loop.is_running():
++
++            async def _drain() -> None:
++                tasks = [
++                    t
++                    for t in asyncio.all_tasks(loop)
++                    if t is not asyncio.current_task()
++                ]
++                for t in tasks:
++                    t.cancel()
++                if tasks:
++                    await asyncio.gather(*tasks, return_exceptions=True)
++                try:
++                    await self.cache.close()
++                except Exception:
++                    logger.debug("Exception closing cashews cache", exc_info=True)
++                remaining = [
++                    t
++                    for t in asyncio.all_tasks(loop)
++                    if t is not asyncio.current_task()
++                ]
++                for t in remaining:
++                    t.cancel()
++                if remaining:
++                    await asyncio.gather(*remaining, return_exceptions=True)
+ 
+-    def _teardown_thread(self) -> None:
+-        if self._loop and self._loop.is_running():
+             try:
+-                fut = asyncio.run_coroutine_threadsafe(self.cache.close(), self._loop)
+-                fut.result(timeout=2.0)
++                fut = asyncio.run_coroutine_threadsafe(_drain(), loop)
++                fut.result(timeout=5.0)
+             except Exception:
+-                logger.debug("Exception closing cashews cache", exc_info=True)
+-            self._loop.call_soon_threadsafe(self._loop.stop)
+-            if self._thread:
+-                self._thread.join(timeout=2.0)
+-        self._loop = None
+-        self._thread = None
+-        self._resolve_dns_fn = None
+-        self._circuit_probe_fn = None
+-        self._rate_limiter_fn = None
++                logger.debug("Exception during bridge task draining", exc_info=True)
++
++            loop.call_soon_threadsafe(loop.stop)
++
++        if thread:
++            thread.join(timeout=5.0)
++            if thread.is_alive():
++                raise RuntimeError("Cashews bridge thread failed to terminate")
+ 
+     def _ensure_started(self) -> None:
+         if self._stopped:
+             raise RuntimeError("ProxyCache has been stopped")
+         if not self._started:
+             self.start()
++        if not self._backend_available and self.failure_policy == "fail-closed":
++            raise CacheBackendUnavailable("Cache backend unavailable")
+ 
+     def run_coroutine(self, coro: Coroutine[Any, Any, T], timeout: float = 10.0) -> T:
+         """Execute a coroutine in the background asyncio event loop synchronously."""
+@@ -258,16 +379,22 @@ class ProxyCache:
+             async def _resolve_dns(host: str) -> list[str]:
+                 if self._loop is None:
+                     raise RuntimeError("Event loop is not initialized")
+-                addr_infos = await self._loop.run_in_executor(
+-                    None,
+-                    socket.getaddrinfo,
+-                    host,
+-                    None,
+-                    socket.AF_UNSPEC,
+-                    socket.SOCK_STREAM,
+-                )
++                try:
++                    addr_infos = await self._loop.run_in_executor(
++                        None,
++                        socket.getaddrinfo,
++                        host,
++                        None,
++                        socket.AF_UNSPEC,
++                        socket.SOCK_STREAM,
++                    )
++                except OSError as exc:
++                    exc._is_dns_error = True  # type: ignore[attr-defined]
++                    raise
+                 if not addr_infos:
+-                    raise OSError(f"Name resolution failed for {host}")
++                    err = OSError(f"Name resolution failed for {host}")
++                    err._is_dns_error = True  # type: ignore[attr-defined]
++                    raise err
+                 seen: set[str] = set()
+                 ips: list[str] = []
+                 for info in addr_infos:
+@@ -323,8 +450,7 @@ class ProxyCache:
+ 
+         If the host is already an IP literal or DNS caching is disabled, returns [host].
+         """
+-        self._ensure_started()
+-        if not self.enabled or self._resolve_dns_fn is None:
++        if not self.enabled:
+             return [host]
+ 
+         # Check if already an IP literal
+@@ -334,7 +460,29 @@ class ProxyCache:
+         except ValueError:
+             pass
+ 
+-        return await self.run(self._resolve_dns_fn, host)
++        self._ensure_started()
++        if not self._backend_available:
++            if self.failure_policy == "fail-closed":
++                raise CacheBackendUnavailable("Cache backend unavailable")
++            return [host]
++
++        if self._resolve_dns_fn is None:
++            return [host]
++
++        try:
++            return await self.run(self._resolve_dns_fn, host)
++        except Exception as exc:
++            if getattr(exc, "_is_dns_error", False) or isinstance(exc, socket.gaierror):
++                raise
++            logger.warning(
++                "DNS cache lookup failed due to cache backend error: %s", exc
++            )
++            self._backend_available = False
++            if self.failure_policy == "fail-closed":
++                raise CacheBackendUnavailable(
++                    f"Cache backend error during DNS resolution: {exc}"
++                ) from exc
++            return [host]
+ 
+     async def resolve_host(self, host: str) -> str:
+         """Resolve a destination host to a single IP string, with cashews caching.
+@@ -357,10 +505,29 @@ class ProxyCache:
+         Inspects the circuit breaker state without registering a call count or
+         falsely recording a success. Raises CircuitBreakerOpen if open.
+         """
++        if not self.enabled:
++            return
+         self._ensure_started()
+-        if not self.enabled or not self.circuit_breaker_enabled:
++        if not self._backend_available:
++            if self.failure_policy == "fail-closed":
++                raise CacheBackendUnavailable("Cache backend unavailable")
++            return
++        if not self.circuit_breaker_enabled:
+             return
+-        is_open = await self.run(self._is_circuit_open, host, port)
++
++        try:
++            is_open = await self.run(self._is_circuit_open, host, port)
++        except Exception as exc:
++            logger.warning(
++                "Circuit breaker check failed due to cache backend error: %s", exc
++            )
++            self._backend_available = False
++            if self.failure_policy == "fail-closed":
++                raise CacheBackendUnavailable(
++                    f"Cache backend error during circuit check: {exc}"
++                ) from exc
++            return
++
+         if is_open:
+             raise CircuitBreakerOpen()
+ 
+@@ -371,10 +538,14 @@ class ProxyCache:
+ 
+         Swallows exceptions so recording never interferes with caller error handling.
+         """
+-        self._ensure_started()
+-        if not self.enabled or self._circuit_probe_fn is None:
++        if (
++            not self.enabled
++            or not self._backend_available
++            or self._circuit_probe_fn is None
++        ):
+             return
+         try:
++            self._ensure_started()
+             await self.run(self._circuit_probe_fn, host, port, exc)
+         except Exception, CircuitBreakerOpen:  # noqa: BLE001, S110
+             pass
+@@ -382,18 +553,62 @@ class ProxyCache:
+     async def check_rate_limit(self, key: str) -> None:
+         """Verify the given key has not exceeded the configured rate limit.
+ 
+-        Raises RateLimitError if exceeded.
++        Raises RateLimitError if exceeded, exposing accurate integer retry metadata.
+         """
++        if not self.enabled:
++            return
+         self._ensure_started()
+-        if not self.enabled or self._rate_limiter_fn is None:
++        if not self._backend_available:
++            if self.failure_policy == "fail-closed":
++                raise CacheBackendUnavailable("Cache backend unavailable")
++            return
++        if self._rate_limiter_fn is None:
++            return
++
++        try:
++            await self.run(self._rate_limiter_fn, key)
++        except RateLimitError:
++            raise
++        except cashews.RateLimitError as exc:
++            cache_key = f"rate_limit:rl:{key}"
++            try:
++                expire = await self.run(self.cache.get_expire, cache_key)
++            except Exception:  # noqa: BLE001
++                expire = None
++            retry_after = (
++                int(expire)
++                if expire is not None and expire > 0
++                else _retry_after_seconds(self.rate_limit_ttl or self.rate_limit_period)
++            )
++            raise RateLimitError(retry_after=retry_after) from exc
++        except Exception as exc:
++            logger.warning(
++                "Rate limit check failed due to cache backend error: %s", exc
++            )
++            self._backend_available = False
++            if self.failure_policy == "fail-closed":
++                raise CacheBackendUnavailable(
++                    f"Cache backend error during rate limit check: {exc}"
++                ) from exc
+             return
+-        await self.run(self._rate_limiter_fn, key)
+ 
+     async def clear(self) -> None:
+         """Clear all entries in the cache."""
++        if not self.enabled:
++            return
+         self._ensure_started()
+-        if self.enabled:
++        if not self._backend_available:
++            if self.failure_policy == "fail-closed":
++                raise CacheBackendUnavailable("Cache backend unavailable")
++            return
++        try:
+             await self.run(self.cache.clear)
++        except Exception as exc:
++            self._backend_available = False
++            if self.failure_policy == "fail-closed":
++                raise CacheBackendUnavailable(
++                    f"Cache backend error during clear: {exc}"
++                ) from exc
+ 
+     def __enter__(self) -> Self:
+         self.start()
+@@ -432,7 +647,9 @@ def get_client_key(stream: Any) -> str | None:
+ DEFAULT_PROXY_CACHE = ProxyCache()
+ 
+ __all__ = [
++    "CACHE_FAILURE_POLICY",
+     "DEFAULT_CACHE_ENABLED",
++    "DEFAULT_CACHE_FAILURE_POLICY",
+     "DEFAULT_CACHE_URL",
+     "DEFAULT_CIRCUIT_BREAKER_ENABLED",
+     "DEFAULT_CIRCUIT_BREAKER_ERRORS_RATE",
+@@ -445,6 +662,7 @@ __all__ = [
+     "DEFAULT_RATE_LIMIT_ENABLED",
+     "DEFAULT_RATE_LIMIT_PERIOD",
+     "DEFAULT_RATE_LIMIT_TTL",
++    "CacheBackendUnavailable",
+     "CircuitBreakerOpen",
+     "ProxyCache",
+     "RateLimitError",

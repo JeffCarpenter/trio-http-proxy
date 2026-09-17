@@ -1,0 +1,8 @@
+Goal: Audit Retry-After accuracy for custom rate-limit period/TTL and independently review the ten-item invariant matrix for ambiguous or missing acceptance details.
+Scope: Read-only inspection of src/trio_http_proxy/cache.py, src/trio_http_proxy/proxy.py, tests/, README*, CLAUDE.md, and pyproject.toml. You may run read-only probes. Write nothing.
+Context: Repository: /home/jeff/code/fork/trio_http_proxy
+This is an HTTP CONNECT proxy using Trio, h11, and cashews. Current HEAD is 463df1b. The repository is clean. Existing tests are in tests/test_proxy.py, tests/test_cache.py, and tests/test_findings_repro.py. This is DESIGN/AUDIT ONLY: do not edit any file.
+
+Accept: Trace how period and TTL are parsed and applied and how Retry-After is produced. State PASS/FAIL/UNTESTED. Flag ambiguities in the full matrix that must be resolved before implementation and recommend precise observable semantics/tests.
+Constraints: You do NOT have permission to delegate: do not spawn or invoke any other agent/worker. Do not edit, create, delete, or format repository files. If out-of-scope work is needed, STOP and report BLOCKED. Treat current docs/code as evidence, not assumed truth. Report only after checking the actual repository.
+Report format: RESULT: DONE|BLOCKED|SPLIT; then Findings; Evidence (commands and results); Proposed acceptance test/design; Files changed (must be none).

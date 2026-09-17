@@ -1,0 +1,157 @@
+{
+  "pool_size": 5,
+  "active_workers_current": 1,
+  "model": "gemini-3.8-flash-high",
+  "tranches": {
+    "RW1": {
+      "pid": 9770,
+      "worktree": "/home/jeff/code/fork/trio_http_proxy/.worktrees/proxy-core",
+      "branch": "invariant/proxy-core",
+      "prompt": "Goal: Implement proxy/server invariants with test-first development.\nScope: You own only src/trio_http_proxy/proxy.py and tests/test_proxy_invariants.py in this worktree. Do not edit any other file.\nContext: Baseline is 93 tests passing. Required invariants: (1) a custom proxy_cache passed to start_server is the exact object used by connection handlers; (2) MAXCONNS+N idle clients do not create unbounded accepted FDs/tasks\u2014gate before accept, not inside an already-accepted handler; (3) if the client vanishes after destination connect, close destination stream; (4) a CONNECT header smaller than max is accepted even when the same read includes trailing bytes making total > max, and trailing bytes are preserved; (5) a complete header exactly MAXREQSZ bytes is accepted, while an incomplete or larger header is rejected; (6) invalid target octets yield deterministic HTTP 400; (7) if the first cached address blackholes/times out, another address is attempted within an overall bounded connect timeout. Preserve existing public behavior where compatible.\nAccept: Add focused tests in tests/test_proxy_invariants.py. For every behavior, run the new test first and record the expected RED before production changes. Then implement minimal fixes. Run uv run pytest tests/test_proxy_invariants.py, uv run pytest, uv run pyright, and uv run ruff check src/trio_http_proxy/proxy.py tests/test_proxy_invariants.py. Commit all scoped changes on this branch with a clear message.\nConstraints: RW tranche. You may read the whole repo but write only the two scoped files. Do NOT spawn or invoke any agent/worker. If an out-of-scope file is required, stop and report BLOCKED instead of editing it. Do not weaken tests. start_server may replace its internal serving design; keep injected serving hooks testable. DEST_CONNECT_TIMEOUT is an overall bound, not N times the timeout.\nReport: RESULT DONE|BLOCKED|SPLIT; commit hash; changed files; each RED command/result; verification commands/results; remaining risks. Files outside scope must be none.",
+      "running": false,
+      "completion_state": "completed",
+      "result": "DONE",
+      "commit": "67f21601fe68c979afdb4187ec384b06769a40eb",
+      "scope_verified": true,
+      "independent_checks": "105 pytest passed; pyright 0; ruff passed; mcpls production diagnostics none; test LSP workspace mismatch under review",
+      "acceptance": "accepted_with_repair",
+      "independent_findings": [
+        "CV_PROXY_CACHE retains the custom cache after start_server returns, even after that cache is stopped",
+        "admission turnover releases limiter tokens",
+        "invalid non-ASCII target byte returns 400",
+        "real blackhole simulation falls back within overall deadline"
+      ],
+      "accepted_commits": [
+        "67f21601fe68c979afdb4187ec384b06769a40eb",
+        "e3365e5b76b43f96333bb1e1343a5cc15202eb97"
+      ]
+    },
+    "RW2": {
+      "pid": 9775,
+      "worktree": "/home/jeff/code/fork/trio_http_proxy/.worktrees/cache-core",
+      "branch": "invariant/cache-core",
+      "prompt": "Goal: Implement cache failure-policy, rate-limit retry metadata, and bridge shutdown invariants with test-first development.\nScope: You own only src/trio_http_proxy/cache.py, src/trio_http_proxy/__init__.py, and tests/test_cache_invariants.py in this worktree. Do not edit any other file.\nContext: Baseline is 93 tests passing. Add an explicit CACHE_FAILURE_POLICY configuration with values fail-open and fail-closed, default fail-open. Setup/runtime cache backend failures under fail-open must disable/bypass cache-backed DNS, circuit breaking, and rate limiting while allowing proxy work to continue; fail-closed must raise a stable project exception CacheBackendUnavailable for the HTTP layer to map to 503. Preserve ordinary destination DNS OSError semantics. When rate limiting rejects, expose accurate integer Retry-After metadata based on the cache key's actual remaining expiry, so the HTTP layer can render it. Stopping ProxyCache while bridge work is pending must cancel/drain bridge tasks and leave no live cashews bridge thread or event loop; it must not silently discard references to a live thread.\nAccept: Add focused tests in tests/test_cache_invariants.py. Run each new test before production changes and record expected RED. Implement minimal changes. Export new public exception/config symbols from cache.py and __init__.py. Run uv run pytest tests/test_cache_invariants.py, uv run pytest, uv run pyright, and uv run ruff check on scoped files. Commit all scoped changes.\nConstraints: RW tranche. You may read the whole repo but write only scoped files. Do NOT spawn or invoke any agent/worker. If out-of-scope work is required, report it; do not edit it. Do not fake thread cleanup with daemon status or by nulling references before verified termination. Avoid deadlocks between stop(), callbacks, and the bridge lock.\nReport: RESULT DONE|BLOCKED|SPLIT; commit hash; changed files; each RED command/result; verification commands/results; remaining risks. Files outside scope must be none.",
+      "running": false,
+      "completion_state": "timed_out_uncommitted",
+      "result": "NO_REPORT",
+      "exit_code": 0,
+      "duration_seconds": 1193.109853164,
+      "acceptance": "rejected_pending_repair",
+      "supervision": "four hung pytest processes terminated; agy later terminated one remaining background task on print-timeout"
+    },
+    "RW3-luna-diagnostics": {
+      "rlm_child_id": "sub-011ed2d9",
+      "worktree": "/home/jeff/code/fork/trio_http_proxy/.worktrees/proxy-core",
+      "branch": "invariant/proxy-core",
+      "model": "openai-codex/gpt-5.6-luna",
+      "running": false,
+      "completion_state": "completed",
+      "result": "NO_CHANGES",
+      "write_scope": [
+        "tests/test_proxy_invariants.py"
+      ],
+      "scope_verified": true,
+      "verification": [
+        "ruff clean",
+        "native pyright clean"
+      ],
+      "finding": "mcpls diagnostic was stale/wrong-workspace"
+    },
+    "RW4-proxy-repair": {
+      "rlm_child_id": "sub-a713fd55",
+      "worktree": "/home/jeff/code/fork/trio_http_proxy/.worktrees/proxy-core",
+      "branch": "invariant/proxy-core",
+      "model": "openai-codex/gpt-5.6-luna",
+      "running": false,
+      "completion_state": "completed",
+      "result": "DONE",
+      "write_scope": [
+        "src/trio_http_proxy/proxy.py",
+        "tests/test_proxy_invariants.py"
+      ],
+      "commit": "e3365e5b76b43f96333bb1e1343a5cc15202eb97",
+      "scope_verified": true,
+      "independent_checks": [
+        "114 pytest passed",
+        "pyright 0",
+        "scoped ruff passed",
+        "git show --check passed"
+      ]
+    },
+    "RW5-cache-redo": {
+      "rlm_child_id": "sub-4db5c943",
+      "worktree": "/home/jeff/code/fork/trio_http_proxy/.worktrees/cache-core",
+      "branch": "invariant/cache-core",
+      "base": "97c8c50",
+      "model": "openai-codex/gpt-5.6-luna",
+      "running": false,
+      "completion_state": "completed",
+      "result": "DONE",
+      "write_scope": [
+        "src/trio_http_proxy/cache.py",
+        "src/trio_http_proxy/__init__.py",
+        "tests/test_cache_invariants.py"
+      ],
+      "commit": "b386ce3",
+      "scope_verified": true,
+      "acceptance": "accepted_and_integrated",
+      "independent_checks": [
+        "123 pytest passed",
+        "pyright 0",
+        "scoped ruff passed",
+        "git show --check passed"
+      ],
+      "static_review": [
+        "future callback deadlock removed",
+        "daemon status not treated as termination proof",
+        "failed stop retains refs and permits retry",
+        "rate expiry key is rate_limit:rl:{key}"
+      ],
+      "main_commit": "9e75d8a"
+    },
+    "RW6-cache-executor-repair": {
+      "worker": "luna-cache-executor-repair",
+      "model": "openai-codex/gpt-5.6-luna",
+      "worktree": ".worktrees/cache-core",
+      "branch": "invariant/cache-core",
+      "write_scope": [
+        "src/trio_http_proxy/cache.py",
+        "tests/test_cache_invariants.py"
+      ],
+      "depends_on": [
+        "RW5-cache-redo"
+      ],
+      "running": false,
+      "completion_state": "completed",
+      "finding": "default executor alive after successful stop",
+      "result": "DONE",
+      "commit": "3d8202a",
+      "acceptance": "accepted_and_integrated",
+      "main_commit": "bc09fa8",
+      "independent_checks": [
+        "124 pytest passed",
+        "pyright 0",
+        "scoped ruff passed",
+        "pending/race/retry lifecycle probe passed"
+      ]
+    },
+    "RW7-http-cache-integration": {
+      "worker": "luna-http-cache-integration",
+      "model": "openai-codex/gpt-5.6-luna",
+      "worktree": ".worktrees/http-integration",
+      "branch": "invariant/http-integration",
+      "write_scope": [
+        "src/trio_http_proxy/proxy.py",
+        "src/trio_http_proxy/__init__.py (if needed)",
+        "tests HTTP integration",
+        "README.rst"
+      ],
+      "depends_on": [
+        "RW5-cache-redo",
+        "RW6-cache-executor-repair"
+      ],
+      "running": true,
+      "completion_state": "active"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+RW worker contract (stored boilerplate)
+- Use test-first development: add focused regression tests, run them before implementation, and record RED evidence.
+- Implement the smallest production change, then run focused tests, full pytest, pyright, and scoped ruff.
+- Read the repository as needed, but write only explicitly owned paths. Stop and report BLOCKED before any out-of-scope write.
+- Do not spawn or invoke another worker/agent. Do not weaken tests.
+- Commit scoped changes.
+- Report: RESULT DONE|BLOCKED|SPLIT; commit hash; changed files; RED evidence; verification; risks; confirm no out-of-scope files.
