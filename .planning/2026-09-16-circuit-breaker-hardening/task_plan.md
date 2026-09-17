@@ -56,11 +56,11 @@ Address all P1 and P2 architectural, concurrency, and security findings:
   - Deps: Tranches 1, 2
   - Accept: Circuit breaker functions during backend outage; degraded backend recovers upon successful ping; startup fails fast in fail-closed if unreachable; no thread when disabled.
 
-- [ ] **Tranche 4: Lifecycle State Machine, URL Redaction & Configuration Hardening**
-  - Scope: `src/trio_http_proxy/cache.py`
-  - Goal: LifecycleState enum, URL credential redaction, strict namespace regex, startup timeout cancellation event, full shutdown protocol.
+- [x] **Tranche 4: Lifecycle State Machine, URL Redaction & Configuration Hardening**
+  - Scope: `src/trio_http_proxy/cache.py`, `src/trio_http_proxy/util.py`, `tests/test_cache_lifecycle_security.py`
+  - Goal: `LifecycleState` enum (`NEW`, `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`). Atomic transitions. Prohibit restart. Shared abort event preventing orphan thread on startup timeout. Redact userinfo credentials in URLs. Strict namespace regex. Semantic TTL parsing. Proper shutdown (`shutdown_asyncgens`).
   - Deps: Tranches 1, 2, 3
-  - Accept: All transitions atomic under lock, credentials redacted in logs, shutdown cleans all tasks/threads.
+  - Accept: Clean lifecycle transitions; no orphan threads; sanitized credentials in logs/exceptions; strict namespace validation. 48/48 tests passing; 222/222 full suite passing; 0 diagnostics.
 
 - [ ] **Tranche 5: Verification, Invariant Tests & mcpls Diagnostics**
   - Scope: `tests/`, `src/trio_http_proxy/`
@@ -69,9 +69,9 @@ Address all P1 and P2 architectural, concurrency, and security findings:
   - Accept: 100% test pass rate, 0 Ruff errors, 0 Pyright issues, 0 `mcpls` diagnostics.
 
 ## Status
-- Complete: Tranche 1, Tranche 2, Phase 2.5, Tranche 3 (Decoupling, Health Probing, Startup Ping, Thread Elimination)
-- In Progress: Tranche 4 (Lifecycle State Machine, URL Redaction & Configuration Hardening)
-- Queued: Tranche 5
+- Complete: Tranche 1, Tranche 2, Phase 2.5, Tranche 3, Tranche 4 (Lifecycle State Machine, URL Redaction & Configuration Hardening)
+- Queued: Tranche 5 (Final Verification & Cleanups)
 
 ## Next Steps
-1. Proceed with Tranche 4: Lifecycle State Machine, URL Redaction & Configuration Hardening.
+1. Proceed with Tranche 5: Verification, Invariant Tests & mcpls Diagnostics.
+

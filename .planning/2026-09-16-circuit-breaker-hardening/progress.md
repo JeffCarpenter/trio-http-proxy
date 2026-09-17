@@ -107,8 +107,29 @@
       - Fail-closed: transport failure or timeout raises `CacheBackendUnavailable` immediately, joins the thread, and closes the loop.
       - Fail-open: transitions into degraded mode (`is_degraded=True`, `is_running=False`) without raising, keeping the loop alive for probing.
     - Implemented `_maybe_probe_backend()` with 30s throttling under `_probe_lock`, recovering degraded backend to healthy upon successful ping.
-    - All 46 tests across the 4 cache test suites passing; full test suite passing: **174/174 tests passing** in 5.20s (`uv run pytest`).
-    - `mcpls` diagnostics clean (0 errors/warnings on `src/trio_http_proxy/cache.py`).
 - Ready for Tranche 4: Lifecycle State Machine, URL Redaction & Configuration Hardening.
+- **Tranche 4 Progress (Lifecycle State Machine, URL Redaction & Configuration Hardening)**:
+  - **TDD Test Suite Written & Verified RED**:
+    - Created `tests/test_cache_lifecycle_security.py` (48 tests covering namespace validation, semantic TTL, URL redaction, LifecycleState, startup timeout thread abort, and bridge shutdown).
+    - Verified RED: 29 failed against initial code.
+  - **GREEN Implementation Completed**:
+    - Defined `LifecycleState(enum.Enum)` with `NEW`, `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`.
+    - Enforced atomic locked lifecycle transitions:
+      - Starting transitions `NEW -> STARTING -> RUNNING`.
+      - Prohibits restart after `STOPPED`, raising `RuntimeError("ProxyCache cannot be restarted once stopped")`.
+      - Idempotent `start()` when already `RUNNING`, and idempotent `stop()` when already `STOPPED`.
+    - Added `redact_url()` helper in `src/trio_http_proxy/util.py` to sanitize userinfo credentials in URLs (`redis://user:***@host:port`).
+    - Wired `redact_url` into `CacheBackendUnavailable` exception formatting and `logger.warning(...)` in `src/trio_http_proxy/cache.py`.
+    - Enforced strict namespace regex validation (`^[a-zA-Z0-9_-]+$`) in `ProxyCache.__init__`.
+    - Enforced semantic duration parsing in `ProxyCache.__init__`, rejecting non-positive and zero-equivalent durations (`"0m"`, `"00s"`, `"-5s"`).
+    - Added `_startup_aborted: threading.Event`, set upon startup timeout, ensuring delayed bridge threads terminate immediately without entering `run_forever()`.
+    - Hardened bridge stop sequence with `loop.shutdown_asyncgens()` and `loop.shutdown_default_executor()`.
+  - **Verification**:
+    - `tests/test_cache_lifecycle_security.py`: **48/48 tests passing**.
+    - Full repository test suite: **222/222 tests passing** in 5.26s (`uv run pytest`).
+    - Code intelligence: **0 diagnostics** reported across all project files (`mcpls:get_diagnostics`).
+    - Linting & type checking: **0 Ruff errors**, **0 Pyright issues**.
+- Ready for Tranche 5: Verification, Invariant Tests & mcpls Diagnostics.
+
 
 

@@ -4,6 +4,7 @@ import ipaddress
 import logging
 import math
 import queue
+import re
 import socket
 import threading
 import time
@@ -17,7 +18,22 @@ import trio
 from cashews import Cache, CircuitBreakerOpen
 from cashews.ttl import TTL, ttl_to_seconds
 
+from trio_http_proxy.util import redact_url
+
 logger = logging.getLogger(__name__)
+
+NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+class LifecycleState(enum.Enum):
+    """Lifecycle states of a ProxyCache instance."""
+
+    NEW = "NEW"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
+    STOPPED = "STOPPED"
+
 
 T = TypeVar("T")
 
@@ -531,6 +547,11 @@ class ProxyCache:
         # Semantic boundary validation in constructor
         if not isinstance(namespace, str) or not namespace.strip():
             raise ValueError("Cache namespace must be a non-empty string")
+        _stripped_namespace = namespace.strip()
+        if not NAMESPACE_PATTERN.match(_stripped_namespace):
+            raise ValueError(
+                f"Cache namespace must match '^[a-zA-Z0-9_-]+$', got {namespace!r}"
+            )
         if not 1 <= circuit_breaker_errors_rate <= 99:
             raise ValueError(
                 f"circuit_breaker_errors_rate must be between 1 and 99, got {circuit_breaker_errors_rate}"
@@ -546,7 +567,7 @@ class ProxyCache:
 
         self.cache_url = cache_url
         self.enabled = enabled
-        self.namespace = namespace.strip()
+        self.namespace = _stripped_namespace
         self._explicit_dns_cache_ttl = dns_cache_ttl is not None
         actual_dns_ttl = (
             dns_cache_ttl if dns_cache_ttl is not None else DEFAULT_DNS_CACHE_TTL
@@ -564,22 +585,33 @@ class ProxyCache:
         self.rate_limit_ttl: TTL = (
             rate_limit_ttl if rate_limit_ttl is not None else self.rate_limit_period
         )
-        parsed_period = ttl_to_seconds(self.rate_limit_period)
+        try:
+            parsed_period = ttl_to_seconds(self.rate_limit_period)
+        except (ValueError, TypeError):
+            parsed_period = None
         if parsed_period is None or parsed_period <= 0:
             raise ValueError(
                 f"rate_limit_period must evaluate to > 0 seconds, got {rate_limit_period!r}"
             )
         self.rate_limit_period_sec = float(parsed_period)
 
-        parsed_ttl = ttl_to_seconds(self.rate_limit_ttl)
+        try:
+            parsed_ttl = ttl_to_seconds(self.rate_limit_ttl)
+        except (ValueError, TypeError):
+            parsed_ttl = None
         if parsed_ttl is None or parsed_ttl <= 0:
             raise ValueError(
                 f"rate_limit_ttl must evaluate to > 0 seconds, got {rate_limit_ttl!r}"
             )
         self.rate_limit_ttl_sec = float(parsed_ttl)
 
-        parsed_dns_ttl = ttl_to_seconds(self.dns_cache_ttl)
-        self.dns_cache_ttl_sec = float(parsed_dns_ttl) if parsed_dns_ttl is not None else 0.0
+        try:
+            parsed_dns_ttl = ttl_to_seconds(self.dns_cache_ttl)
+        except (ValueError, TypeError):
+            parsed_dns_ttl = None
+        self.dns_cache_ttl_sec = (
+            float(parsed_dns_ttl) if parsed_dns_ttl is not None and parsed_dns_ttl > 0 else 0.0
+        )
         if cache_failure_policy is not None:
             failure_policy = cache_failure_policy
         self.failure_policy = _failure_policy(failure_policy)
@@ -590,6 +622,8 @@ class ProxyCache:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._lifecycle_state: LifecycleState = LifecycleState.NEW
+        self._startup_aborted: threading.Event = threading.Event()
         self._started = False
         self._stopped = False
         self._stopping = False
@@ -616,18 +650,22 @@ class ProxyCache:
         """True if remote backend caching features are active and not explicitly disabled."""
         if not self.enabled or not bool(self.cache_url and self.cache_url.strip()):
             return False
-        if (
+        return not (
             self._explicit_dns_cache_ttl
             and self.dns_cache_ttl_sec <= 0
             and not self.rate_limit_enabled
-        ):
-            return False
-        return True
+        )
 
     @property
     def configured_disabled(self) -> bool:
         """True if the cache is disabled by user configuration."""
         return not self.enabled
+
+    @property
+    def lifecycle_state(self) -> LifecycleState:
+        """Current LifecycleState of the ProxyCache instance."""
+        with self._lock:
+            return self._lifecycle_state
 
     @property
     def is_degraded(self) -> bool:
@@ -637,17 +675,17 @@ class ProxyCache:
     @property
     def is_running(self) -> bool:
         """True if the cache is active, healthy, and not stopped or degraded."""
-        return (
-            self._started
-            and not self._stopped
-            and not self._stopping
-            and not self._degraded
-        )
+        with self._lock:
+            return (
+                self._lifecycle_state == LifecycleState.RUNNING
+                and not self._degraded
+            )
 
     @property
     def is_stopped(self) -> bool:
         """True if the cache bridge has been stopped."""
-        return self._stopped
+        with self._lock:
+            return self._lifecycle_state == LifecycleState.STOPPED
 
     def start(self) -> None:
         """Start the background asyncio bridge thread and configure cashews."""
@@ -656,13 +694,17 @@ class ProxyCache:
             tuple[asyncio.AbstractEventLoop | None, threading.Thread | None] | None
         ) = None
         with self._lock:
-            if self._started:
+            if self._lifecycle_state == LifecycleState.STOPPED:
+                raise RuntimeError("ProxyCache cannot be restarted once stopped")
+            if self._lifecycle_state in (LifecycleState.STARTING, LifecycleState.RUNNING):
                 return
+            self._lifecycle_state = LifecycleState.STARTING
             self._stopped = False
             self._stopping = False
             self._degraded = False
             if not self._has_backend_features():
                 self._started = True
+                self._lifecycle_state = LifecycleState.RUNNING
                 return
 
             startup_queue: queue.Queue[
@@ -670,14 +712,21 @@ class ProxyCache:
             ] = queue.Queue(maxsize=1)
 
             def _run_loop() -> None:
+                if self._startup_aborted.is_set():
+                    return
                 try:
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
+                    if self._startup_aborted.is_set():
+                        loop.close()
+                        return
                     startup_queue.put((loop, None))
                 except BaseException as exc:  # noqa: BLE001
                     startup_queue.put((None, exc))
                     return
                 try:
+                    if self._startup_aborted.is_set():
+                        return
                     loop.run_forever()
                 finally:
                     loop.close()
@@ -690,15 +739,19 @@ class ProxyCache:
             try:
                 loop, startup_exc = startup_queue.get(timeout=self.startup_timeout)
             except queue.Empty:
+                self._startup_aborted.set()
                 self._stopped = True
                 self._started = False
+                self._lifecycle_state = LifecycleState.STOPPED
                 raise RuntimeError(
                     f"Timed out waiting {self.startup_timeout}s for asyncio bridge thread startup"
                 ) from None
 
             if startup_exc is not None or loop is None:
+                self._startup_aborted.set()
                 self._stopped = True
                 self._started = False
+                self._lifecycle_state = LifecycleState.STOPPED
                 raise RuntimeError(
                     f"Asyncio bridge thread startup failed: {startup_exc}"
                 ) from startup_exc
@@ -712,26 +765,29 @@ class ProxyCache:
                 self._register_decorators()
                 fut = asyncio.run_coroutine_threadsafe(self.cache.ping(), self._loop)
                 fut.result(timeout=self.startup_timeout)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 setup_error = exc
                 logger.warning(
                     "Failed to setup cashews cache or startup ping failed with %s: %s",
-                    self.cache_url,
+                    redact_url(self.cache_url),
                     exc,
                 )
                 if self.cache_failure_policy == "fail-closed":
                     self._stopped = True
                     self._started = False
                     self._degraded = False
+                    self._lifecycle_state = LifecycleState.STOPPED
                     stop_parts = self._begin_stop_locked()
                 else:
                     self._degraded = True
                     self._last_probe_time = time.monotonic()
                     self._started = True
+                    self._lifecycle_state = LifecycleState.RUNNING
             else:
                 self._started = True
                 self._degraded = False
                 self._last_probe_time = time.monotonic()
+                self._lifecycle_state = LifecycleState.RUNNING
 
         if setup_error is not None:
             if stop_parts is not None:
@@ -742,27 +798,29 @@ class ProxyCache:
                 with self._lock:
                     self._stopped = False
                     self._started = True
+                    self._lifecycle_state = LifecycleState.RUNNING
                 return
             raise CacheBackendUnavailable(
-                f"Unable to setup cache backend {self.cache_url!r}: {setup_error}"
+                f"Unable to setup cache backend {redact_url(self.cache_url)!r}: {setup_error}"
             ) from setup_error
 
     def stop(self) -> None:
         """Stop the bridge, draining pending work before closing its loop."""
         with self._lock:
+            if self._lifecycle_state == LifecycleState.STOPPED:
+                return
             if self._stopping:
                 done = self._stop_complete
                 parts = None
             elif self._loop is None and self._thread is None:
                 self._stopped = True
                 self._started = False
-                return
-            elif not self._started and self._loop is None and self._thread is None:
-                self._stopped = True
+                self._lifecycle_state = LifecycleState.STOPPED
                 return
             else:
                 self._stopped = True
                 self._started = False
+                self._lifecycle_state = LifecycleState.STOPPING
                 parts = self._begin_stop_locked()
                 done = self._stop_complete
 
@@ -794,10 +852,17 @@ class ProxyCache:
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
                 try:
+                    await loop.shutdown_asyncgens()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+                try:
                     await self.cache.close()
                 finally:
                     try:
-                        await loop.shutdown_default_executor()
+                        if hasattr(loop, "shutdown_default_executor"):
+                            await loop.shutdown_default_executor()
+                    except Exception:  # noqa: BLE001, S110
+                        pass
                     finally:
                         loop.stop()
 
@@ -812,7 +877,12 @@ class ProxyCache:
         open_loop = loop is not None and not loop.is_closed()
         with self._lock:
             self._stopping = False
+            # Only advance to STOPPED once the thread/loop are actually gone;
+            # otherwise leave the lifecycle in STOPPING so a subsequent stop()
+            # call retries cleanup instead of silently no-opping on a leaked
+            # thread/loop (stop() short-circuits on LifecycleState.STOPPED).
             if not alive and not open_loop:
+                self._lifecycle_state = LifecycleState.STOPPED
                 self._stop_complete.set()
                 if self._thread is thread:
                     self._thread = None
@@ -825,13 +895,19 @@ class ProxyCache:
             raise RuntimeError("ProxyCache bridge loop did not close")
 
     def _ensure_started(self) -> None:
-        if self._stopped:
-            raise RuntimeError("ProxyCache has been stopped")
-        if not self._started:
-            if not self._has_backend_features():
-                self._started = True
+        with self._lock:
+            if self._lifecycle_state == LifecycleState.STOPPED or self._stopped:
+                raise RuntimeError("ProxyCache has been stopped")
+            if self._lifecycle_state in (
+                LifecycleState.RUNNING,
+                LifecycleState.STARTING,
+            ):
                 return
-            self.start()
+            if not self._started and not self._has_backend_features():
+                self._started = True
+                self._lifecycle_state = LifecycleState.RUNNING
+                return
+        self.start()
 
     def run_coroutine(self, coro: Coroutine[Any, Any, T], timeout: float = 10.0) -> T:
         """Execute a coroutine in the background asyncio event loop synchronously."""
@@ -987,7 +1063,7 @@ class ProxyCache:
 
         try:
             await self.run(self.cache.ping, timeout=5.0)
-        except Exception as exc:
+        except BACKEND_EXCEPTIONS as exc:
             logger.debug("Cache backend probe ping failed: %s", exc)
         else:
             logger.info("Cache backend recovered; restored normal operations")
