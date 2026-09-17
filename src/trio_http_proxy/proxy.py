@@ -498,8 +498,14 @@ async def _record_connection_result(
     permit: CircuitPermit | None,
 ) -> None:
     try:
+        sig = inspect.signature(proxy_cache.record_connection_result)
+        accepts_permit = "permit" in sig.parameters
+    except (TypeError, ValueError):
+        accepts_permit = False
+
+    if accepts_permit:
         await proxy_cache.record_connection_result(host, port, exc, permit=permit)
-    except TypeError:
+    else:
         await proxy_cache.record_connection_result(host, port, exc)
 
 

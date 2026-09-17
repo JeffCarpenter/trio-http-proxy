@@ -10,6 +10,7 @@ from trio_http_proxy.cache import (
     CACHE_FAILURE_POLICY,
     CacheBackendUnavailable,
     CircuitBreakerManager,
+    CircuitBreakerOpen,
     CircuitState,
     DestinationCircuitBreaker,
     ProxyCache,
@@ -548,3 +549,80 @@ async def test_backend_error_boundary_reraises_programming_errors(monkeypatch):
 
         # Cache must NOT be marked degraded because of a programming bug
         assert not cache.is_degraded
+
+
+@tt.trio_test
+async def test_proxy_cache_check_circuit_and_record_connection_result_protocol():
+    """Verify that ProxyCache.check_circuit mints tokenized permits and record_connection_result closes HALF_OPEN."""
+    async with ProxyCache(
+        cache_url="mem://",
+        circuit_breaker_enabled=True,
+        circuit_breaker_errors_rate=50,
+        circuit_breaker_period="10s",
+        circuit_breaker_ttl="2s",
+        circuit_breaker_min_calls=2,
+    ) as pc:
+        # 1. Healthy CLOSED state returns permit with is_probe=False
+        permit1 = await pc.check_circuit("api.service.local", 443)
+        assert permit1 is not None
+        assert not permit1.is_probe
+        await pc.record_connection_result("api.service.local", 443, exc=OSError("down 1"), permit=permit1)
+
+        permit2 = await pc.check_circuit("api.service.local", 443)
+        assert permit2 is not None
+        await pc.record_connection_result("api.service.local", 443, exc=OSError("down 2"), permit=permit2)
+
+        # 2. Breaker has tripped to OPEN
+        with pytest.raises(CircuitBreakerOpen):
+            await pc.check_circuit("api.service.local", 443)
+
+        # 3. Fast-forward past TTL cooldown
+        breaker = pc._circuit_manager.get_breaker("api.service.local", 443)
+        assert breaker.state == CircuitState.OPEN
+        assert breaker.opened_at is not None
+        breaker.opened_at -= 3.0
+
+        # 4. First caller acquires probe permit in HALF_OPEN
+        probe_permit = await pc.check_circuit("api.service.local", 443)
+        assert probe_permit is not None
+        assert probe_permit.is_probe
+        assert breaker.state == CircuitState.HALF_OPEN
+
+        # Concurrent unleased caller is rejected in HALF_OPEN
+        with pytest.raises(CircuitBreakerOpen):
+            await pc.check_circuit("api.service.local", 443)
+
+        # 5. Successful probe connection records result and closes breaker
+        await pc.record_connection_result("api.service.local", 443, exc=None, permit=probe_permit)
+        assert breaker.state == CircuitState.CLOSED
+
+        # 6. Normal traffic resumes
+        permit_normal = await pc.check_circuit("api.service.local", 443)
+        assert permit_normal is not None
+        assert not permit_normal.is_probe
+
+
+def test_circuit_permit_context_manager_auto_abort():
+    """Verify that uncompleted with-statement exit automatically aborts permit."""
+    breaker = DestinationCircuitBreaker(errors_rate=50, period=10.0, ttl=5.0, min_calls=1)
+    breaker.record_result(OSError("trip"), now=1000.0)
+    assert breaker.state == CircuitState.OPEN
+
+    # Transition to HALF_OPEN by acquiring probe permit
+    probe = breaker.acquire_permit(now=1006.0)
+    assert probe is not None
+    assert probe.is_probe
+    assert breaker._half_open_in_flight
+
+    # Exiting context manager without completing aborts the probe
+    with probe:
+        pass  # Did not call mark_completed() or record_result()
+
+    assert probe.was_aborted
+    assert not breaker._half_open_in_flight
+
+    # New probe can now be acquired since previous probe was aborted
+    probe2 = breaker.acquire_permit(now=1007.0)
+    assert probe2 is not None
+    assert breaker._half_open_in_flight
+

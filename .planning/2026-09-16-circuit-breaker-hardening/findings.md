@@ -47,6 +47,25 @@
 * **Defect**: Rebuilding the list on every completion resulted in $O(rT)$ work per call and $O((rT)^2)$ across a window.
 * **Hardened Contract**: Expired entries are popped from the left of the `deque` in $O(1)$ amortized time while updating `_window_error_count`.
 
+### 1.7 §1.1's Hardened Contract Was Never Wired Into `ProxyCache` (P1 — SHIPPED REGRESSION, found in `claude-review-1.md`)
+* **Germane Symbols**:
+  * Unwired API: [`ProxyCache.check_circuit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L941-L947), [`ProxyCache.record_connection_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L949-L956)
+  * Orphaned Producers: [`DestinationCircuitBreaker.acquire_permit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L225-L273), [`CircuitBreakerManager.acquire_permit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L447-L450)
+  * Call Site: [`proxy.py:tunnel`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L565), [`proxy.py:_record_connection_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L493-L503)
+* **Defect**: §1.1's hardened contract ("`check_circuit` returns a tokenized `CircuitPermit`") describes the intended design but was never implemented against `ProxyCache`. As shipped, `check_circuit` still calls `self._circuit_manager.can_execute(host, port)` and implicitly returns `None`; `record_connection_result` still has the pre-hardening 3-argument signature with no `permit` parameter. `acquire_permit` exists on `DestinationCircuitBreaker`/`CircuitBreakerManager` and is exercised only by unit tests (`test_cache_invariants.py`) — never by `proxy.py`. `proxy.py:tunnel` does `permit = await proxy_cache.check_circuit(...)`, so `permit` is always `None` on the real request path. `proxy.py:_record_connection_result` then calls `record_connection_result(..., permit=permit)`, hits `TypeError` against the real (unpermitted) signature, and silently falls back to the legacy 3-arg call — so `DestinationCircuitBreaker.record_result` always runs with `permit=None` in production.
+* **Consequence**: Per §6.7's own hardened guard (`if permit is None or not permit.is_probe: return`), a `None` permit is dropped with no state change while `HALF_OPEN`. Combined with §6.9's TTL-based dropped-probe self-heal in `can_execute`/`acquire_permit` (which resets `_half_open_in_flight` after `ttl` seconds regardless of a permit), the breaker can never transition `HALF_OPEN → CLOSED` or `HALF_OPEN → OPEN` again once tripped once — it is permanently wedged admitting exactly one connection attempt per `ttl` window, forever, independent of that attempt's outcome. This is a functional regression vs. the pre-Phase-2.5 breaker, which had no permit requirement and closed normally on a successful probe.
+* **Why untested**: every invariant test added for §1.1-§6.16 drives `DestinationCircuitBreaker`/`CircuitBreakerManager` directly with hand-built permits (`acquire_permit()` called on the breaker/manager, never through `ProxyCache`). No test exercises `ProxyCache.check_circuit()` -> `tunnel()` -> `record_connection_result()` end to end with a real, enabled circuit breaker.
+* **Fix**: `check_circuit` must call `self._circuit_manager.acquire_permit(host, port)`, raise `CircuitBreakerOpen()` on `None`, and return the permit; `record_connection_result` needs a `permit: CircuitPermit | None = None` parameter threaded to `self._circuit_manager.record_result(host, port, exc, permit=permit)`. Once fixed, delete `proxy.py:_record_connection_result`'s `TypeError`-swallowing shim (§6.2) - it exists only to paper over this exact gap and will silently hide the next signature mismatch too.
+
+### 1.8 `_evict_one_locked` Touches Breaker Internals Without the Breaker's Own Lock (P1, found in `claude-review-1.md`)
+* **Germane Symbols**:
+  * Method: [`CircuitBreakerManager._evict_one_locked`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L427-L445)
+  * Contrast (correct pattern): [`CircuitBreakerManager.clear`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L465-L477), which does `with breaker._lock:` before touching each breaker
+  * Racing Callers: [`DestinationCircuitBreaker.record_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L321-L377), [`DestinationCircuitBreaker.acquire_permit`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L225-L273), [`DestinationCircuitBreaker.can_execute`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/cache.py#L275-L304) - all take `b._lock`
+* **Defect**: `_evict_one_locked` (new in §1.5/§6.14, this Phase 2.5 commit) is called from inside `get_breaker`'s `with self._lock:` block - the *manager's* lock - but reads `b.state` / `b._half_open_in_flight` and calls `b._prune_calls(now)` (mutating `b._calls` and `b._window_error_count`) for the candidate breaker `b` **without ever acquiring `b._lock`**. `DestinationCircuitBreaker` uses `threading.Lock` specifically to be safe under real OS-thread concurrency (the repo's `tests/test_stress_pyreqwest.py` stress-tests exactly this), and `clear()` (same file) correctly takes `breaker._lock` before mutating - `_evict_one_locked` is the one place that doesn't.
+* **Consequence**: At `max_destinations` capacity (default 10,000), eviction races with any concurrent `record_result()`/`acquire_permit()`/`can_execute()` on the same breaker. `_calls.popleft()` (in `_prune_calls`, unlocked) can interleave with `_calls.append()` (in `record_result`, locked) and the paired `_window_error_count` increment/decrement isn't atomic across the two call sites, so the error-rate accounting can drift - corrupting future trip/no-trip decisions for that destination. Easy to miss in normal testing since it only fires at eviction time.
+* **Fix**: Acquire `b._lock` around the `state`/`_half_open_in_flight` read and the `_prune_calls`/`len(b._calls)` check in both loops of `_evict_one_locked`, matching `clear()`'s pattern.
+
 ---
 
 ## 2. Rate Limiter Protocol & Positive Durations (P1)
@@ -279,4 +298,32 @@
 * **Resolution & Hardened Contract**:
   - Enforce explicit two-parameter signature: `canonicalize_destination(host: str, port: int) -> tuple[str, int]`.
   - Normalizes IPv6 brackets on `host.strip("[]")` and compresses IP literals via `ipaddress.ip_address(clean_host).compressed`, returning `(canonical_host, int(port))`.
+
+### 6.18 Gateway Protocol Unwiring & Mock Isolation Illusion (P1)
+* **Defect**: While 153/153 unit tests passed with 100% green status, the system in production was completely wedged once any circuit tripped:
+  - `ProxyCache.check_circuit(host, port)` still called `can_execute()` and returned `None` instead of `acquire_permit()`.
+  - `ProxyCache.record_connection_result()` lacked a `permit` parameter.
+  - `proxy.py` had a silent `try ... except TypeError:` fallback that caught the missing kwarg and discarded `permit`.
+  - In `HALF_OPEN`, `record_result` required a valid probe permit (`if permit is None or not permit.is_probe: return`), meaning every real circuit that tripped `OPEN` could never close or re-open from `HALF_OPEN`.
+  - This arose because all unit tests drove `DestinationCircuitBreaker` directly with hand-crafted permits rather than exercising `ProxyCache` $\to$ `tunnel()` end-to-end with real enabled breakers.
+* **Resolution & Hardened Contract**:
+  - `ProxyCache.check_circuit(host, port)` acquires and returns `CircuitPermit | None`, raising `CircuitBreakerOpen` on refusal.
+  - `ProxyCache.record_connection_result` accepts `permit: CircuitPermit | None = None` and passes it to `CircuitBreakerManager.record_result`.
+  - `proxy.py` inspects `inspect.signature(proxy_cache.record_connection_result)` to dispatch without swallowing internal `TypeError` exceptions.
+  - Added end-to-end integration invariant tests (`test_proxy_cache_check_circuit_and_record_connection_result_protocol`) verifying the entire lifecycle.
+
+### 6.19 AST Call Graph Diagnostics via `mcpls:get_outgoing_calls`
+* **Defect Discovery**: Grepping and manual code inspection produced ambiguous or deferred findings regarding whether `check_circuit` was calling `acquire_permit` or `can_execute`.
+* **Resolution & Tooling Insight**:
+  - Running `mcpls:prepare_call_hierarchy` and `mcpls:get_outgoing_calls` on `ProxyCache.check_circuit` queried the compiler AST directly:
+    `check_circuit` $\to$ `can_execute`, `_ensure_started`, `CircuitBreakerOpen`.
+  - The LSP call graph definitively proved that `acquire_permit` was absent from the outgoing call graph of the production gateway in a single deterministic query, cutting through code review ambiguity.
+
+### 6.20 Domain Boundary Enforcement via Real-Time Pyright LSP Diagnostics
+* **Defect Discovery**: When implementing the logging notification for permitless calls in `DestinationCircuitBreaker.record_result`, string formatting referenced `self.host` and `self.port`.
+* **Resolution & Architectural Insight**:
+  - `mcpls:get_diagnostics` immediately returned `reportAttributeAccessIssue`: `Attribute "host" is unknown` on `DestinationCircuitBreaker`.
+  - This surfaced an essential architectural invariant: `DestinationCircuitBreaker` encapsulates solely the local finite-state machine (counters, deque window, leases, state transitions) without holding destination identity. Target identity `(host, port)` is strictly owned by `CircuitBreakerManager` as dictionary keys.
+  - Compiler-grade LSP diagnostics prevented an architectural abstraction leak before tests or runtime execution were ever dispatched.
+
 

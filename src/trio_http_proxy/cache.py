@@ -157,28 +157,40 @@ class CircuitPermit:
         self.is_probe = is_probe
         self.was_aborted: bool = False
         self.was_completed: bool = False
+        self._lock = threading.Lock()
 
     def abort(self) -> None:
         """Abort this lease, releasing any probe reservation immediately."""
-        if self.was_aborted or self.was_completed:
-            return
-        self.was_aborted = True
+        with self._lock:
+            if self.was_aborted or self.was_completed:
+                return
+            self.was_aborted = True
         self.breaker._abort_permit(self)
 
-    def mark_completed(self) -> None:
-        self.was_completed = True
+    def mark_completed(self) -> bool:
+        with self._lock:
+            if self.was_aborted or self.was_completed:
+                return False
+            self.was_completed = True
+            return True
 
-    def __enter__(self) -> CircuitPermit:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
-        exc_tb: Any,
+        exc_tb: object,
     ) -> None:
-        if exc_type is not None and not self.was_completed:
-            self.abort()
+        with self._lock:
+            if not self.was_completed and not self.was_aborted:
+                self.was_aborted = True
+                should_abort = True
+            else:
+                should_abort = False
+        if should_abort:
+            self.breaker._abort_permit(self)
 
 
 class DestinationCircuitBreaker:
@@ -305,18 +317,19 @@ class DestinationCircuitBreaker:
 
     def _abort_permit(self, permit: CircuitPermit) -> None:
         with self._lock:
-            if permit.breaker is self and permit.epoch == self.epoch:
-                if (
-                    self.state == CircuitState.HALF_OPEN
-                    and permit.is_probe
-                    and (
-                        self._active_probe_id is None
-                        or self._active_probe_id == permit.permit_id
-                    )
-                ):
-                    self._half_open_in_flight = False
-                    self._active_probe_id = None
-                    self._probe_started_at = None
+            if (
+                permit.breaker is self
+                and permit.epoch == self.epoch
+                and self.state == CircuitState.HALF_OPEN
+                and permit.is_probe
+                and (
+                    self._active_probe_id is None
+                    or self._active_probe_id == permit.permit_id
+                )
+            ):
+                self._half_open_in_flight = False
+                self._active_probe_id = None
+                self._probe_started_at = None
 
     def record_result(
         self,
@@ -330,18 +343,21 @@ class DestinationCircuitBreaker:
         with self._lock:
             # 1. Invalidation checks: breaker identity, epoch, and abort status (§6.6)
             if permit is not None:
-                permit.mark_completed()
                 if permit.breaker is not self:
                     return
                 if permit.epoch != self.epoch:
                     return
-                if permit.was_aborted:
+                if not permit.mark_completed():
                     return
 
             # 2. State-specific transitions (§6.7, §6.8)
             if self.state == CircuitState.HALF_OPEN:
                 # Permitless callers or non-probe leases cannot transition HALF_OPEN
                 if permit is None or not permit.is_probe:
+                    logger.warning(
+                        "DestinationCircuitBreaker received record_result in HALF_OPEN without a valid probe permit (permit=%r); ignoring",
+                        permit,
+                    )
                     return
                 if (
                     self._active_probe_id is not None
@@ -429,17 +445,19 @@ class CircuitBreakerManager:
         now = time.monotonic()
         # 1. Look for idle CLOSED breaker with empty calls (after pruning) and no in-flight probe (§6.14)
         for k, b in self._breakers.items():
-            if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
-                b._prune_calls(now)
-                if len(b._calls) == 0:
-                    del self._breakers[k]
-                    return
+            with b._lock:
+                if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
+                    b._prune_calls(now)
+                    if len(b._calls) == 0:
+                        del self._breakers[k]
+                        return
 
         # 2. Fallback: any CLOSED breaker without active probe
         for k, b in self._breakers.items():
-            if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
-                del self._breakers[k]
-                return
+            with b._lock:
+                if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
+                    del self._breakers[k]
+                    return
 
         # 3. Last resort: evict oldest entry
         self._breakers.popitem(last=False)
@@ -938,22 +956,28 @@ class ProxyCache:
         hosts = await self.resolve_hosts(host)
         return hosts[0] if hosts else host
 
-    async def check_circuit(self, host: str, port: int) -> None:
-        """Verify that the destination circuit is not open."""
+    async def check_circuit(self, host: str, port: int) -> CircuitPermit | None:
+        """Verify that the destination circuit is not open and acquire a permit."""
         self._ensure_started()
         if not self.enabled or self._degraded or not self.circuit_breaker_enabled:
-            return
-        if not self._circuit_manager.can_execute(host, port):
-            raise CircuitBreakerOpen()
+            return None
+        permit = self._circuit_manager.acquire_permit(host, port)
+        if permit is None:
+            raise CircuitBreakerOpen(f"Circuit breaker open for {host}:{port}")
+        return permit
 
     async def record_connection_result(
-        self, host: str, port: int, exc: Exception | None = None
+        self,
+        host: str,
+        port: int,
+        exc: Exception | None = None,
+        permit: CircuitPermit | None = None,
     ) -> None:
         """Record a connection result in the Trio-native circuit breaker."""
         self._ensure_started()
         if not self.enabled or self._degraded or not self.circuit_breaker_enabled:
             return
-        self._circuit_manager.record_result(host, port, exc)
+        self._circuit_manager.record_result(host, port, exc, permit=permit)
 
     async def check_rate_limit(self, key: str) -> None:
         """Verify a key's quota and attach backend expiry on rejection."""
@@ -977,8 +1001,10 @@ class ProxyCache:
         ttl_sec = int(parsed_ttl) if parsed_ttl is not None else period_sec
 
         async def _rate_limit_backend() -> int | None:
-            count = await self.cache.incr(rate_key, expire=ttl_sec)
+            count = await self.cache.incr(rate_key, expire=period_sec)
             if count > self.rate_limit:
+                if count == self.rate_limit + 1:
+                    await self.cache.expire(rate_key, ttl_sec)
                 expiry = await self.cache.get_expire(rate_key)
                 if expiry is None or expiry <= 0:
                     expiry = ttl_sec
@@ -1072,6 +1098,7 @@ __all__ = [
     "DEFAULT_RATE_LIMIT_TTL",
     "CacheBackendUnavailable",
     "CircuitBreakerOpen",
+    "CircuitPermit",
     "CircuitState",
     "DestinationCircuitBreaker",
     "ProxyCache",

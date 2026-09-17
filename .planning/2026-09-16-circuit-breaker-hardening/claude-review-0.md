@@ -1,0 +1,27 @@
+# Review: HEAD (0da1e1e) "harden admission protocol, leases, and failure boundaries (Phase 2.5)"
+
+Reviewed via `git diff HEAD~1 HEAD`. Files: `src/trio_http_proxy/cache.py`, `src/trio_http_proxy/proxy.py`, `tests/test_cache_invariants.py`, plus new `.planning/2026-09-16-circuit-breaker-hardening/*` docs.
+
+## Blockers
+
+- `src/trio_http_proxy/cache.py:941-956` — `ProxyCache.check_circuit()` and `ProxyCache.record_connection_result()` were **not updated** in this commit. They still call the legacy `CircuitBreakerManager.can_execute()` / `record_result(host, port, exc)` path with no permit. Meanwhile `DestinationCircuitBreaker.record_result()` was changed (cache.py:341-345) so that in `HALF_OPEN` it now requires a valid probe permit (`permit is None or not permit.is_probe: return`).
+
+  Net effect in production: `proxy.py:tunnel()` calls `permit = await proxy_cache.check_circuit(...)`, but `check_circuit` always returns `None` (no `acquire_permit` call), so `permit` is always `None`. `_record_connection_result()` (proxy.py:966-976) tries `record_connection_result(..., permit=permit)`, hits `TypeError` (real signature has no `permit` kwarg), falls back to the 3-arg call, which ends up calling `breaker.record_result(exc, permit=None)`. Once a breaker trips to `OPEN` and later moves to `HALF_OPEN`, every real completion now has `permit=None` and is silently dropped by the new guard — the breaker can **never transition back to CLOSED or OPEN** from `HALF_OPEN` again. It gets permanently wedged admitting one probe per `ttl` window forever, regardless of success/failure. This is a regression vs. pre-commit behavior (old `record_result` had no permit requirement).
+  - Not caught by tests: `test_destination_circuit_breaker_state_machine` and the new invariant tests all call `DestinationCircuitBreaker.acquire_permit()`/`record_result(permit=...)` directly, never going through `ProxyCache.check_circuit`/`record_connection_result`. No test exercises the real `tunnel()` → `ProxyCache` → breaker path end-to-end for a circuit trip/recover cycle (checked `test_proxy_invariants.py`, `test_proxy_http_integration.py` — only duck-typed mock caches there, not real `ProxyCache`).
+  - Fix: update `check_circuit` to call `self._circuit_manager.acquire_permit(host, port)`, raise `CircuitBreakerOpen()` when it returns `None`, and return the permit; update `record_connection_result` to accept `permit: CircuitPermit | None = None` and pass it through to `self._circuit_manager.record_result(host, port, exc, permit=permit)`.
+
+## Concerns
+
+- `src/trio_http_proxy/cache.py:958-996` (`check_rate_limit`, unchanged by this commit) contradicts what this commit's own `findings.md` §2.1 and `progress.md` claim was implemented ("Tranche 2 Completed: ... counting window via `incr(expire=period_sec)`, ban threshold via `expire(ttl_sec)` on `count == rate_limit + 1`"). The actual code calls `self.cache.incr(rate_key, expire=ttl_sec)` — using the **ban TTL**, not `period_sec`, as the counting-window expiry — and never calls `cache.expire()` explicitly on threshold crossing. `period_sec` is computed but only used as a fallback default for `ttl_sec`, never as the counting window itself. Functionally: if a user sets `RATE_LIMIT_PERIOD` and `RATE_LIMIT_TTL` to different values, the counting window silently follows `ttl_sec`, not `period_sec` — the documented protocol isn't what ships. (Defaults are equal by default, which is why the new test `test_rate_limit_cashews_ban_ttl_protocol` — period=10s, ttl=30s — doesn't actually catch this, since it never asserts on window duration, only on ban/retry_after.)
+  - This predates this commit (not touched in the diff), but the commit's own planning docs assert it was hardened per the described contract. Worth correcting the docs or actually wiring `period_sec` into the counting `incr()` call.
+
+## Nits
+
+- `CircuitPermit.__exit__` (cache.py) only calls `self.abort()` when `exc_type is not None and not self.was_completed`. A permit used with `with permit:` that exits *without* raising and without a `record_result` call leaks silently (no abort). Currently moot since production code never uses the `with` form, but if that pattern gets adopted later this will bite. Consider aborting on any non-completed exit, not just exceptional ones.
+- `src/trio_http_proxy/proxy.py:107-125` (`_http_429_response`) uses bare-comma `except TypeError, ValueError:` — this only parses because the project requires Python 3.14+ (PEP 758 permits unparenthesized multi-exception `except`). Fine given the stated Python floor, but easy to misread as the Python-2-ism that was just fixed elsewhere in this same diff (`except trio.BrokenResourceError, trio.ClosedResourceError:` → tupled). Worth a one-line comment or just parenthesizing for clarity/consistency with the rest of the file.
+
+## Questions
+
+1. Was wiring `ProxyCache.check_circuit`/`record_connection_result` to the new permit API deliberately deferred to a later tranche, or an oversight? `task_plan.md` marks Tranche 1 "Complete" including "Hardened connection tunnel in proxy.py to acquire CircuitPermit" — but the cache-side half of that wiring is missing.
+2. Given the HALF_OPEN-wedge regression is live on `main` right now (not just in a WIP branch), do you want that fixed before anything else, ahead of Tranche 3?
+3. For the rate limiter: should `period_sec` actually gate the counting window as documented, or was inheriting `ttl_sec` for both counting and ban intentional (e.g., simpler "sliding ban" semantics)?

@@ -79,5 +79,16 @@
   - Added 6 new invariant unit tests to `tests/test_cache_invariants.py`.
   - Full test suite passing: **153/153 tests passing** in 4.64s (`uv run pytest`).
   - Zero diagnostics reported across all project files (`mcpls:get_diagnostics`).
+- **Phase 2.5 Review-1 Rectifications Completed**:
+  - **Blocker 1 (Permit Protocol Wiring)**: Wired `acquire_permit()` into `ProxyCache.check_circuit()`, returning `CircuitPermit | None` and raising `CircuitBreakerOpen` when open. Added `permit` parameter to `ProxyCache.record_connection_result()`. In `proxy.py`, inspected `proxy_cache.record_connection_result` signature to safely dispatch with/without `permit` without catching internal `TypeError`s or double-recording.
+  - **Concern 2 (Eviction Lock)**: Synchronized breaker state inspections and pruning inside `CircuitBreakerManager._evict_one_locked()` under `with b._lock:`.
+  - **Concern 4 (Permit Race & Context Exit)**: Guarded `CircuitPermit.abort()` and `mark_completed()` with a thread lock, and ensured auto-abort on uncompleted context manager exit.
+  - **Concern 6 (Rate Limiter Windows)**: Wired `period_sec` for `incr()` counting and `ttl_sec` for the ban threshold expiration (`count == rate_limit + 1`).
+  - Added 2 new invariant tests in `tests/test_cache_invariants.py`:
+    - `test_proxy_cache_check_circuit_and_record_connection_result_protocol`
+    - `test_circuit_permit_context_manager_auto_abort`
+  - Full test suite passing: **155/155 tests passing** in 5.11s (`uv run pytest`).
+  - Static analysis clean: `uv run ruff check` (0 issues), `uv run pyright` (0 errors), `mcpls:get_diagnostics` (0 diagnostics across all project files).
 - Ready for Tranche 3: Failure Domain Decoupling, Health Probing & Startup Health Check.
+
 
