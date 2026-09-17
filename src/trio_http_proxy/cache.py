@@ -547,7 +547,8 @@ class ProxyCache:
         # Semantic boundary validation in constructor
         if not isinstance(namespace, str) or not namespace.strip():
             raise ValueError("Cache namespace must be a non-empty string")
-        if not NAMESPACE_PATTERN.match(namespace):
+        _stripped_namespace = namespace.strip()
+        if not NAMESPACE_PATTERN.match(_stripped_namespace):
             raise ValueError(
                 f"Cache namespace must match '^[a-zA-Z0-9_-]+$', got {namespace!r}"
             )
@@ -566,7 +567,7 @@ class ProxyCache:
 
         self.cache_url = cache_url
         self.enabled = enabled
-        self.namespace = namespace.strip()
+        self.namespace = _stripped_namespace
         self._explicit_dns_cache_ttl = dns_cache_ttl is not None
         actual_dns_ttl = (
             dns_cache_ttl if dns_cache_ttl is not None else DEFAULT_DNS_CACHE_TTL
@@ -816,10 +817,6 @@ class ProxyCache:
                 self._started = False
                 self._lifecycle_state = LifecycleState.STOPPED
                 return
-            elif not self._started and self._loop is None and self._thread is None:
-                self._stopped = True
-                self._lifecycle_state = LifecycleState.STOPPED
-                return
             else:
                 self._stopped = True
                 self._started = False
@@ -880,8 +877,12 @@ class ProxyCache:
         open_loop = loop is not None and not loop.is_closed()
         with self._lock:
             self._stopping = False
-            self._lifecycle_state = LifecycleState.STOPPED
+            # Only advance to STOPPED once the thread/loop are actually gone;
+            # otherwise leave the lifecycle in STOPPING so a subsequent stop()
+            # call retries cleanup instead of silently no-opping on a leaked
+            # thread/loop (stop() short-circuits on LifecycleState.STOPPED).
             if not alive and not open_loop:
+                self._lifecycle_state = LifecycleState.STOPPED
                 self._stop_complete.set()
                 if self._thread is thread:
                     self._thread = None
@@ -897,6 +898,11 @@ class ProxyCache:
         with self._lock:
             if self._lifecycle_state == LifecycleState.STOPPED or self._stopped:
                 raise RuntimeError("ProxyCache has been stopped")
+            if self._lifecycle_state in (
+                LifecycleState.RUNNING,
+                LifecycleState.STARTING,
+            ):
+                return
             if not self._started and not self._has_backend_features():
                 self._started = True
                 self._lifecycle_state = LifecycleState.RUNNING
