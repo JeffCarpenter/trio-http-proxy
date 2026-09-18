@@ -52,3 +52,11 @@ Rigorously refactor `trio_http_proxy` configuration management to use `pydantic-
   - Eliminate ad-hoc `_int_env`, `_float_env`, `_bool_env`, `_failure_policy` helpers from modules outside `config`.
   - Strictly type `cache_failure_policy` as `Literal["fail-open", "fail-closed"]`.
   - Verify with `mcpls:get_diagnostics`, `pyright`, `ruff`, and `pytest`.
+
+- [x] **Tranche 6: Deduplication & Duration Processing Refactor**
+  - Consolidate duration validation into reusable `validate_duration_string` in `_base.py`.
+  - Deduplicate field validators in `CircuitBreakerSettings`, `RateLimitSettings`, and `CacheSettings`.
+  - Replace `PrivateAttr` + `model_post_init` mutable assignments with `@cached_property` duration getters.
+  - Verify with `uv run pytest`, `uv run ruff check`, `uv run pyright src`, and `dupe-cli`.
+
+

@@ -55,3 +55,15 @@
 - All module-level constants in `proxy.py` (`PORT`, `BUFMAXSZ`, `DEFAULT_PORT`, `MAXREQSZ`, etc.) and `proxy_cache.py` (`DEFAULT_CACHE_URL`, `DEFAULT_CACHE_ENABLED`, `CACHE_FAILURE_POLICY`, etc.) must remain accessible and importable.
 - `ProxyCache.__init__` must continue to accept existing keyword arguments and also accept an optional `settings: Settings | CacheSettings` or configure from defaults.
 - Any code importing from `trio_http_proxy.cache` or `trio_http_proxy.proxy` must continue to work without change.
+
+## 4. Duplication Analysis & Deduplication Refactor (Tranche 6)
+- **`dupe-cli` Scan Findings**:
+  - 407 pairs within `settings.py`: 29 explicit 1-line property getters (`return self.group.field`). These are intentional false positives to retain static typing, LSP autocomplete, and pyright type safety.
+  - 3 validator pairs: `_validate_circuit_breaker_period`, `_validate_circuit_breaker_ttl`, and `_validate_rate_limit_period` shared identical AST blocks for stripping, empty check, and error raising.
+  - 6 duration property pairs: `*_seconds` properties returning `PrivateAttr` fields populated by `model_post_init` with `object.__setattr__`.
+- **Refactoring Applied**:
+  - Extracted canonical `validate_duration_string(value, *, field, allow_zero=False)` in `_base.py`.
+  - Replaced manual stripping/checking across `CircuitBreakerSettings`, `RateLimitSettings`, and `CacheSettings` with `validate_duration_string`. In `CircuitBreakerSettings`, merged two separate validator methods into a single `@field_validator("circuit_breaker_period", "circuit_breaker_ttl")`.
+  - Replaced `PrivateAttr` + `model_post_init` mutable assignments on frozen settings with `@cached_property` duration getters, evaluating `parse_duration_seconds()` lazily and caching in `__dict__`.
+  - Verified with `uv run pytest` (260 passed), `uv run ruff check` (0 errors), and `uv run pyright src` (0 errors).
+

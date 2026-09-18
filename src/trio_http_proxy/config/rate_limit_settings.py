@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from functools import cached_property
 
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, field_validator
 
 from ._base import (
     EnvSettings,
     normalize_optional_duration,
     parse_duration_seconds,
     prefixed,
+    validate_duration_string,
 )
 
 
@@ -43,50 +44,30 @@ class RateLimitSettings(EnvSettings):
         validation_alias=prefixed("rate_limit_ttl"),
     )
 
-    _period_seconds: float = PrivateAttr(default=60.0)
-    _ttl_seconds: float | None = PrivateAttr(default=None)
-
     @field_validator("rate_limit_period")
     @classmethod
     def _validate_rate_limit_period(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError(
-                f"rate_limit_period must be a positive duration, got {value!r}"
-            )
-        parse_duration_seconds(stripped, field="rate_limit_period")
-        return stripped
+        return validate_duration_string(value, field="rate_limit_period")
 
     @field_validator("rate_limit_ttl")
     @classmethod
     def _validate_rate_limit_ttl(cls, value: str | None) -> str | None:
         return normalize_optional_duration(value, field="rate_limit_ttl")
 
-    def model_post_init(self, context: Any, /) -> None:
-        object.__setattr__(
-            self,
-            "_period_seconds",
-            parse_duration_seconds(self.rate_limit_period, field="rate_limit_period"),
-        )
-        object.__setattr__(
-            self,
-            "_ttl_seconds",
-            (
-                parse_duration_seconds(self.rate_limit_ttl, field="rate_limit_ttl")
-                if self.rate_limit_ttl is not None
-                else None
-            ),
-        )
-
-    @property
+    @cached_property
     def rate_limit_period_seconds(self) -> float:
         """Rate-limit window in seconds."""
-        return self._period_seconds
+        return parse_duration_seconds(
+            self.rate_limit_period, field="rate_limit_period"
+        )
 
-    @property
+    @cached_property
     def rate_limit_ttl_seconds(self) -> float | None:
         """Ban TTL in seconds; ``None`` means disabled."""
-        return self._ttl_seconds
+        if self.rate_limit_ttl is None:
+            return None
+        return parse_duration_seconds(self.rate_limit_ttl, field="rate_limit_ttl")
 
 
 __all__ = ["RateLimitSettings"]
+

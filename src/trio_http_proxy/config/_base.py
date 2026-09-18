@@ -69,6 +69,19 @@ def normalize_optional_duration(value: str | None, *, field: str) -> str | None:
     return stripped if seconds > 0 else None
 
 
+def validate_duration_string(
+    value: str, *, field: str, allow_zero: bool = False
+) -> str:
+    """Strip, validate, and return a duration string; enforces positivity unless allow_zero."""
+    stripped = value.strip()
+    if not stripped:
+        if allow_zero:
+            return "0s"
+        raise ValueError(f"{field} must be a positive duration, got {value!r}")
+    parse_duration_seconds(stripped, field=field, allow_zero=allow_zero)
+    return stripped
+
+
 class EnvSettings(BaseSettings):
     """Base class for env-aware settings groups.
 
@@ -95,4 +108,6 @@ __all__ = [
     "normalize_optional_duration",
     "parse_duration_seconds",
     "prefixed",
+    "validate_duration_string",
 ]
+

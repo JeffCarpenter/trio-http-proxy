@@ -25,3 +25,11 @@
   - Eliminated ad-hoc `_int_env`, `_float_env`, `_bool_env`, `_failure_policy` helpers across all non-config modules.
   - Strictly typed `cache_failure_policy` as `Literal["fail-open", "fail-closed"]`.
   - 243/243 tests pass (100%), 0 ruff errors, 0 pyright errors.
+
+- [x] **Tranche 6: Deduplication & Duration Processing Refactor**
+  - Unified duration validation in `validate_duration_string` in `_base.py`.
+  - Deduplicated field validators across `CircuitBreakerSettings`, `RateLimitSettings`, and `CacheSettings`.
+  - Replaced `PrivateAttr` and `model_post_init` mutable assignments with `@cached_property` duration getters.
+  - Eliminated cross-file validator and cache getter duplication reported by `dupe-cli`.
+  - Verified 260/260 tests pass, 0 ruff errors, 0 pyright errors.
+

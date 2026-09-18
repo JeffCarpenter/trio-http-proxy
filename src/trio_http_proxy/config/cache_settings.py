@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import re
+from functools import cached_property
 from typing import Any, Literal
 
-from pydantic import Field, FiniteFloat, PrivateAttr, field_validator
+from pydantic import Field, FiniteFloat, field_validator
 
 from ._base import (
     EnvSettings,
     parse_duration_seconds,
     prefixed,
+    validate_duration_string,
 )
 
 NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -85,8 +87,6 @@ class CacheSettings(EnvSettings):
         validation_alias=prefixed("startup_timeout"),
     )
 
-    _dns_cache_ttl_seconds: float = PrivateAttr(default=0.0)
-
     @field_validator("cache_namespace")
     @classmethod
     def _validate_cache_namespace(cls, value: str) -> str:
@@ -95,9 +95,7 @@ class CacheSettings(EnvSettings):
     @field_validator("dns_cache_ttl")
     @classmethod
     def _validate_dns_cache_ttl(cls, value: str) -> str:
-        stripped = value.strip() or "0s"
-        parse_duration_seconds(stripped, field="dns_cache_ttl", allow_zero=True)
-        return stripped
+        return validate_duration_string(value, field="dns_cache_ttl", allow_zero=True)
 
     @field_validator("cache_failure_policy", mode="before")
     @classmethod
@@ -106,19 +104,12 @@ class CacheSettings(EnvSettings):
             return normalize_failure_policy(value)
         return value
 
-    def model_post_init(self, context: Any, /) -> None:
-        object.__setattr__(
-            self,
-            "_dns_cache_ttl_seconds",
-            parse_duration_seconds(
-                self.dns_cache_ttl, field="dns_cache_ttl", allow_zero=True
-            ),
-        )
-
-    @property
+    @cached_property
     def dns_cache_ttl_seconds(self) -> float:
         """DNS cache TTL in seconds; ``0.0`` means disabled (pass-through)."""
-        return self._dns_cache_ttl_seconds
+        return parse_duration_seconds(
+            self.dns_cache_ttl, field="dns_cache_ttl", allow_zero=True
+        )
 
 
 __all__ = [
@@ -127,3 +118,4 @@ __all__ = [
     "normalize_failure_policy",
     "validate_namespace",
 ]
+

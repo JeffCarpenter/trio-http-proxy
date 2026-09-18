@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from functools import cached_property
 
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 
-from ._base import EnvSettings, parse_duration_seconds, prefixed
+from ._base import (
+    EnvSettings,
+    parse_duration_seconds,
+    prefixed,
+    validate_duration_string,
+)
 
 
 class CircuitBreakerSettings(EnvSettings):
@@ -47,56 +52,26 @@ class CircuitBreakerSettings(EnvSettings):
         validation_alias=prefixed("circuit_breaker_max_destinations"),
     )
 
-    _period_seconds: float = PrivateAttr(default=60.0)
-    _ttl_seconds: float = PrivateAttr(default=30.0)
-
-    @field_validator("circuit_breaker_period")
+    @field_validator("circuit_breaker_period", "circuit_breaker_ttl")
     @classmethod
-    def _validate_circuit_breaker_period(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError(
-                f"circuit_breaker_period must be a positive duration, got {value!r}"
-            )
-        parse_duration_seconds(stripped, field="circuit_breaker_period")
-        return stripped
+    def _validate_duration_fields(cls, value: str, info: ValidationInfo) -> str:
+        field = info.field_name or "duration"
+        return validate_duration_string(value, field=field)
 
-    @field_validator("circuit_breaker_ttl")
-    @classmethod
-    def _validate_circuit_breaker_ttl(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError(
-                f"circuit_breaker_ttl must be a positive duration, got {value!r}"
-            )
-        parse_duration_seconds(stripped, field="circuit_breaker_ttl")
-        return stripped
-
-    def model_post_init(self, context: Any, /) -> None:
-        object.__setattr__(
-            self,
-            "_period_seconds",
-            parse_duration_seconds(
-                self.circuit_breaker_period, field="circuit_breaker_period"
-            ),
-        )
-        object.__setattr__(
-            self,
-            "_ttl_seconds",
-            parse_duration_seconds(
-                self.circuit_breaker_ttl, field="circuit_breaker_ttl"
-            ),
-        )
-
-    @property
+    @cached_property
     def circuit_breaker_period_seconds(self) -> float:
         """Error-counting window in seconds."""
-        return self._period_seconds
+        return parse_duration_seconds(
+            self.circuit_breaker_period, field="circuit_breaker_period"
+        )
 
-    @property
+    @cached_property
     def circuit_breaker_ttl_seconds(self) -> float:
         """Open-circuit cool-down in seconds."""
-        return self._ttl_seconds
+        return parse_duration_seconds(
+            self.circuit_breaker_ttl, field="circuit_breaker_ttl"
+        )
 
 
 __all__ = ["CircuitBreakerSettings"]
+
