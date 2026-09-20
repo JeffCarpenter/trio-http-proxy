@@ -1,5 +1,7 @@
 # Progress: Architectural Refactoring (Perlis's Epigram 9)
 
+**Co-authored by:** GPT-5.6 Luna (high)
+
 ## Completed
 - [x] Complete architectural code review in [`findings.md`](file:///home/jeff/code/fork/trio_http_proxy/.planning/2026-09-19-code-review-perlis-epigram-9/findings.md).
 - [x] Define four remediation tranches in `task_plan.md`.
