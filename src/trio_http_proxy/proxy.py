@@ -28,7 +28,7 @@ from .cache import (
     get_client_key,
 )
 from .config import ProxySettings, Settings, get_settings
-from .config.builder import ProxyCacheBuilder
+from .config.builder import ProxyCacheBuilder, SettingsBuilderMixin
 from .connection import (
     _DEFAULT_PROXY_CACHE_SENTINEL,
     CV_CLIENT_STREAM,
@@ -290,7 +290,7 @@ async def _serve_tcp_gated(
         task_status.started(listeners)
 
 
-class ProxyBuilder:
+class ProxyBuilder(SettingsBuilderMixin):
     """Fluent builder for configuring and launching the HTTP proxy server."""
 
     def __init__(self, settings: Settings | None = None, **kwargs: Any) -> None:
@@ -351,20 +351,6 @@ class ProxyBuilder:
     def with_server(self, server: Any) -> Self:
         self._server = server
         return self
-
-    def with_settings(self, settings: Settings) -> Self:
-        self._base_settings = settings
-        return self
-
-    def build_settings(self) -> Settings:
-        if self._base_settings is not None:
-            data = {
-                k: getattr(self._base_settings, k)
-                for k in self._base_settings.model_fields_set
-            }
-            data.update(self._overrides)
-            return Settings(**data)
-        return Settings(**self._overrides)
 
     async def run(
         self,
@@ -608,7 +594,7 @@ async def tunnel(
                     pass
                 raise
 
-        last_exc: Exception | None = OSError(
+        last_exc: Exception = OSError(
             f"No target addresses resolved for {desthost}:{destport}"
         )
         overall_deadline = trio.current_time() + dest_connect_timeout
@@ -664,9 +650,7 @@ async def tunnel(
                     await client_stream.send_all(http.http_502_bad_gateway)
                 except trio.BrokenResourceError, trio.ClosedResourceError:
                     pass
-                if last_exc is not None:
-                    raise last_exc
-                raise OSError(f"Failed to connect to {desthost}:{destport}")
+                raise last_exc
 
         if proxy_cache is not None:
             await _record_connection_result(proxy_cache, result_builder.with_success())

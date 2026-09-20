@@ -22,7 +22,29 @@ def _normalize_cache_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return norm
 
 
-class ProxyCacheBuilder:
+class SettingsBuilderMixin:
+    """Shared `with_settings`/`build_settings` for builders holding
+    `_base_settings` and `_overrides`."""
+
+    _base_settings: Settings | None
+    _overrides: dict[str, Any]
+
+    def with_settings(self, settings: Settings) -> Self:
+        self._base_settings = settings
+        return self
+
+    def build_settings(self) -> Settings:
+        if self._base_settings is not None:
+            data = {
+                k: getattr(self._base_settings, k)
+                for k in self._base_settings.model_fields_set
+            }
+            data.update(self._overrides)
+            return Settings(**data)
+        return Settings(**self._overrides)
+
+
+class ProxyCacheBuilder(SettingsBuilderMixin):
     """Fluent builder for constructing and configuring ProxyCache instances.
 
     Encapsulates cache backend, circuit breaker, and rate limiting configuration
@@ -197,21 +219,6 @@ class ProxyCacheBuilder:
     def with_rate_limit_disabled(self) -> Self:
         self._overrides["rate_limit_enabled"] = False
         return self
-
-    def with_settings(self, settings: Settings) -> Self:
-        self._base_settings = settings
-        return self
-
-    def build_settings(self) -> Settings:
-        """Produce the unified Settings instance reflecting builder configuration."""
-        if self._base_settings is not None:
-            data = {
-                k: getattr(self._base_settings, k)
-                for k in self._base_settings.model_fields_set
-            }
-            data.update(self._overrides)
-            return Settings(**data)
-        return Settings(**self._overrides)
 
     def build(self) -> ProxyCache:
         """Construct the configured ProxyCache instance."""
