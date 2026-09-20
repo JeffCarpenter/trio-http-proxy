@@ -17,11 +17,13 @@ Execute the recommendations in [`findings.md`](file:///home/jeff/code/fork/trio_
   - Update [`ProxyCache.__init__`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy_cache.py#L74) to consume the unified configuration directly instead of accepting 18 unpacked parameters.
   - Preserve backward compatibility for environment variable aliases and attribute lookups.
 
-- [ ] **Tranche 2: Formalize Proxy-to-Cache Contract (`typing.Protocol`)**
-  - Define `ProxyCacheProtocol` with explicit signatures for `record_connection_result`, `check_circuit`, and `check_rate_limit`.
-  - Update `record_connection_result` to accept `permit: CircuitPermit | None = None` uniformly.
-  - Remove hot-path [`inspect.signature`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L366) from [`_record_connection_result`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L358).
-  - Replace parameter sniffing in [`start_server`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L324-L340) with explicit protocol contracts or functional composition.
+- [ ] **Tranche 2.1: ProxyCacheBuilder API (Pivot)**
+  - Implement a fluent `ProxyCacheBuilder` / `ProxyBuilder` API to replace the monolithic `Settings` object for initialization.
+  - Refactor `proxy.py` and `tests/` to use this builder, prioritizing caller ergonomics while maintaining the underlying unified configuration data structure.
+
+- [ ] **Tranche 2.2: ConnectionResultBuilder API (Pivot)**
+  - Replace the hot-path `inspect.signature` sniffing in `proxy.py` (`_record_connection_result`).
+  - Implement a `ConnectionResultBuilder` or similar construct to formalize how results are recorded to the cache without relying on a strict Protocol interface.
 
 - [ ] **Tranche 3: Consolidate Atomized Error and State Modules**
   - Merge `errors/cache_backend_unavailable.py`, `errors/proxy_protocol_error.py`, `errors/rate_limit_error.py`, and `errors/request_too_large_error.py` into [`src/trio_http_proxy/errors.py`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/errors.py).

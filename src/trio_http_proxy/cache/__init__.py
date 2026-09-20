@@ -29,11 +29,13 @@ from ..config import (
 from ..errors import CacheBackendUnavailable, RateLimitError
 from ..proxy_cache import (
     BACKEND_EXCEPTIONS,
+    LifecycleState,
     ProxyCache,
+    ProxyCacheBuilder,
+    ProxyCacheProtocol,
     get_client_key,
     get_default_proxy_cache,
 )
-from .lifecycle_state import LifecycleState
 
 __all__ = [
     "BACKEND_EXCEPTIONS",
@@ -48,6 +50,8 @@ __all__ = [
     "DestinationCircuitBreaker",
     "LifecycleState",
     "ProxyCache",
+    "ProxyCacheBuilder",
+    "ProxyCacheProtocol",
     "RateLimitError",
     "RateLimitSettings",
     "Settings",

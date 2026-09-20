@@ -1369,3 +1369,21 @@ def test_raw_logger_filter_populates_attributes(caplog):
     rec = next(r for r in caplog.records if "raw logger message" in r.message)
     assert rec.conn_id == 55
     assert rec.conn_prefix == "[conn55]"
+
+
+def test_extracted_protocol_and_streaming_modules():
+    from trio_http_proxy.protocol import (
+        ProxyProtocolError,
+        RequestTooLargeError,
+        process_as_connect_request,
+    )
+    from trio_http_proxy.streaming import pipe, pipe_with_timeout
+
+    assert callable(process_as_connect_request)
+    assert callable(pipe)
+    assert callable(pipe_with_timeout)
+    assert issubclass(ProxyProtocolError, Exception)
+    assert issubclass(RequestTooLargeError, Exception)
+    assert proxy.process_as_connect_request is process_as_connect_request
+    assert proxy.pipe is pipe
+    assert proxy.pipe_with_timeout is pipe_with_timeout

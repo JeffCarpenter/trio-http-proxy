@@ -30,7 +30,7 @@ async def dest_server_port(nursery: trio.Nursery) -> int:
 
 # --- Configuration model fixtures -------------------------------------------------
 
-from trio_http_proxy.cache import ProxyCache
+from trio_http_proxy.cache import ProxyCache, ProxyCacheBuilder
 from trio_http_proxy.config import (
     CacheSettings,
     CircuitBreakerSettings,
@@ -100,9 +100,15 @@ def settings() -> Settings:
 
 
 @pytest.fixture
+def proxy_cache_builder() -> ProxyCacheBuilder:
+    """A fresh ProxyCacheBuilder per test."""
+    return ProxyCacheBuilder()
+
+
+@pytest.fixture
 def default_proxy_cache() -> ProxyCache:
     """A fresh ProxyCache per test; avoids singleton state leaking across tests."""
-    return ProxyCache()
+    return ProxyCacheBuilder().build()
 
 
 @pytest.fixture

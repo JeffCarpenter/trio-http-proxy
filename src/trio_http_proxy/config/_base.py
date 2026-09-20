@@ -7,6 +7,8 @@ the single source of truth for duration-string parsing (cashews TTL syntax).
 
 from __future__ import annotations
 
+import re
+
 from pydantic import AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -63,10 +65,10 @@ def normalize_optional_duration(value: str | None, *, field: str) -> str | None:
     if value is None:
         return None
     stripped = value.strip()
-    if not stripped:
+    if not stripped or stripped == "0s":
         return None
-    seconds = parse_duration_seconds(stripped, field=field, allow_zero=True)
-    return stripped if seconds > 0 else None
+    parse_duration_seconds(stripped, field=field, allow_zero=False)
+    return stripped
 
 
 def validate_duration_string(
@@ -80,6 +82,33 @@ def validate_duration_string(
         raise ValueError(f"{field} must be a positive duration, got {value!r}")
     parse_duration_seconds(stripped, field=field, allow_zero=allow_zero)
     return stripped
+
+
+NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+_FAILURE_POLICIES = frozenset({"fail-open", "fail-closed"})
+
+
+def validate_namespace(value: str) -> str:
+    """Strip and validate a cache namespace; single source of truth for this rule."""
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("Cache namespace must be a non-empty string")
+    if not NAMESPACE_PATTERN.match(stripped):
+        raise ValueError(
+            f"Cache namespace must match '^[a-zA-Z0-9_-]+$', got {value!r}"
+        )
+    return stripped
+
+
+def normalize_failure_policy(value: str) -> str:
+    """Normalize a failure policy string; single source of truth for this rule."""
+    norm = value.strip().lower()
+    if norm not in _FAILURE_POLICIES:
+        raise ValueError(
+            "CACHE_FAILURE_POLICY must be either 'fail-open' or 'fail-closed'"
+        )
+    return norm
 
 
 class EnvSettings(BaseSettings):
@@ -104,10 +133,12 @@ class EnvSettings(BaseSettings):
 
 __all__ = [
     "ENV_PREFIX",
+    "NAMESPACE_PATTERN",
     "EnvSettings",
+    "normalize_failure_policy",
     "normalize_optional_duration",
     "parse_duration_seconds",
     "prefixed",
     "validate_duration_string",
+    "validate_namespace",
 ]
-

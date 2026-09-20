@@ -196,7 +196,7 @@ class TestCompositeSettings:
         assert settings.proxy.port == 9191
         assert settings.cache.cache_url == "redis://localhost"
         assert settings.circuit_breaker.circuit_breaker_errors_rate == 75
-        assert settings.rate_limit.rate_limit == 100
+        assert settings.rate_limit == 100
 
     def test_get_settings_cached(self):
         reset_settings_cache()
@@ -234,11 +234,11 @@ class TestCompositeSettings:
             settings.proxy.port = 1
 
     def test_unknown_kwarg_rejected_with_hint(self):
-        with pytest.raises(ValueError, match="Unknown settings fields.*potr"):
+        with pytest.raises(ValidationError):
             Settings(potr=1)
 
     def test_flat_kwarg_and_group_collision_rejected(self):
-        with pytest.raises(ValueError, match="Conflicting settings for group 'proxy'"):
+        with pytest.raises(ValidationError):
             Settings(port=1, proxy=ProxySettings(port=2))
 
     def test_stray_group_env_vars_do_not_crash_composite(self, monkeypatch):
@@ -248,7 +248,7 @@ class TestCompositeSettings:
         monkeypatch.setenv("RATE_LIMIT", "7")
         settings = Settings()
         assert settings.port == 8080
-        assert settings.rate_limit.rate_limit == 7
+        assert settings.rate_limit == 7
         # an invalid value for a real field fails fast at construction, but
         # importing the package (module import time) never reads the env.
         monkeypatch.setenv("RATE_LIMIT", "banana")

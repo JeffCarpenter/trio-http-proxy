@@ -5,8 +5,10 @@ from .circuit_breaker_manager import (
     canonicalize_destination,
 )
 from .circuit_permit import CircuitPermit
-from .circuit_state import CircuitState
-from .destination_circuit_breaker import DestinationCircuitBreaker
+from .destination_circuit_breaker import (
+    CircuitState,
+    DestinationCircuitBreaker,
+)
 
 __all__ = [
     "CircuitBreakerManager",

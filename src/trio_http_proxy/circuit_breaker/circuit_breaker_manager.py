@@ -9,8 +9,10 @@ from collections import OrderedDict
 
 from ..config import CircuitBreakerSettings, get_settings
 from .circuit_permit import CircuitPermit
-from .circuit_state import CircuitState
-from .destination_circuit_breaker import DestinationCircuitBreaker
+from .destination_circuit_breaker import (
+    CircuitState,
+    DestinationCircuitBreaker,
+)
 
 
 def canonicalize_destination(host: str, port: int) -> tuple[str, int]:

@@ -10,6 +10,7 @@ from trio_http_proxy import http
 from trio_http_proxy.cache import (
     CircuitBreakerOpen,
     ProxyCache,
+    ProxyCacheBuilder,
     RateLimitError,
     get_client_key,
 )
@@ -50,7 +51,7 @@ class StreamWithSocket:
 
 @tt.trio_test
 async def test_proxy_cache_basic_get_set():
-    async with ProxyCache(cache_url="mem://") as pc:
+    async with ProxyCacheBuilder().with_cache(url="mem://").build() as pc:
         key = f"{pc.namespace}:test-key"
         await pc.run(pc.cache.set, key, "test-val", expire="10s")
         val = await pc.run(pc.cache.get, key)
@@ -64,7 +65,7 @@ async def test_proxy_cache_basic_get_set():
 
 @tt.trio_test
 async def test_proxy_cache_sync_context_manager():
-    with ProxyCache(cache_url="mem://") as pc:
+    with ProxyCacheBuilder().with_cache(url="mem://").build() as pc:
         await pc.run(pc.cache.set, "k", 123)
         res = await pc.run(pc.cache.get, "k")
         assert res == 123
@@ -72,13 +73,17 @@ async def test_proxy_cache_sync_context_manager():
 
 @tt.trio_test
 async def test_proxy_cache_circuit_breaker_trips():
-    async with ProxyCache(
-        cache_url="mem://",
-        circuit_breaker_enabled=True,
-        circuit_breaker_errors_rate=50,
-        circuit_breaker_period="10s",
-        circuit_breaker_ttl="5s",
-        circuit_breaker_min_calls=2,
+    async with (
+        ProxyCacheBuilder()
+        .with_cache(url="mem://")
+        .with_circuit_breaker(
+            enabled=True,
+            errors_rate=50,
+            period="10s",
+            ttl="5s",
+            min_calls=2,
+        )
+        .build()
     ) as pc:
         # Initially circuit should be closed (healthy)
         await pc.check_circuit("broken.host", 443)
@@ -101,11 +106,11 @@ async def test_proxy_cache_circuit_breaker_trips():
 
 @tt.trio_test
 async def test_proxy_cache_rate_limiter():
-    async with ProxyCache(
-        cache_url="mem://",
-        rate_limit_enabled=True,
-        rate_limit=2,
-        rate_limit_period="10s",
+    async with (
+        ProxyCacheBuilder()
+        .with_cache(url="mem://")
+        .with_rate_limit(enabled=True, rate_limit=2, period="10s")
+        .build()
     ) as pc:
         await pc.check_rate_limit("client-1")
         await pc.check_rate_limit("client-1")
@@ -120,7 +125,9 @@ async def test_proxy_cache_rate_limiter():
 
 @tt.trio_test
 async def test_proxy_cache_resolve_host_ip_literal():
-    async with ProxyCache(cache_url="mem://", dns_cache_ttl="60s") as pc:
+    async with (
+        ProxyCacheBuilder().with_cache(url="mem://", dns_cache_ttl="60s").build()
+    ) as pc:
         # IPv4 literal bypasses DNS lookup
         ip4 = await pc.resolve_host("127.0.0.1")
         assert ip4 == "127.0.0.1"
@@ -132,7 +139,9 @@ async def test_proxy_cache_resolve_host_ip_literal():
 
 @tt.trio_test
 async def test_proxy_cache_resolve_host_cached():
-    async with ProxyCache(cache_url="mem://", dns_cache_ttl="60s") as pc:
+    async with (
+        ProxyCacheBuilder().with_cache(url="mem://", dns_cache_ttl="60s").build()
+    ) as pc:
         # Resolve localhost (resolves to 127.0.0.1 or ::1)
         res1 = await pc.resolve_host("localhost")
         assert res1 in ("127.0.0.1", "::1")
@@ -144,7 +153,7 @@ async def test_proxy_cache_resolve_host_cached():
 
 @tt.trio_test
 async def test_proxy_cache_disabled():
-    pc = ProxyCache(enabled=False)
+    pc = ProxyCacheBuilder().with_cache(enabled=False).build()
     # When disabled, resolve_host returns host unchanged
     assert await pc.resolve_host("unresolved.example.test") == "unresolved.example.test"
     # check_circuit and check_rate_limit do nothing
@@ -154,11 +163,15 @@ async def test_proxy_cache_disabled():
 
 @tt.trio_test
 async def test_tunnel_with_circuit_breaker_fast_fail():
-    async with ProxyCache(
-        cache_url="mem://",
-        circuit_breaker_enabled=True,
-        circuit_breaker_min_calls=1,
-        circuit_breaker_errors_rate=1,
+    async with (
+        ProxyCacheBuilder()
+        .with_cache(url="mem://")
+        .with_circuit_breaker(
+            enabled=True,
+            min_calls=1,
+            errors_rate=1,
+        )
+        .build()
     ) as pc:
         proxy_client, test_client = tt.memory_stream_pair()
 
@@ -186,11 +199,11 @@ async def test_tunnel_with_circuit_breaker_fast_fail():
 
 @tt.trio_test
 async def test_http_proxy_with_rate_limit_exceeded():
-    async with ProxyCache(
-        cache_url="mem://",
-        rate_limit_enabled=True,
-        rate_limit=1,
-        rate_limit_period="10s",
+    async with (
+        ProxyCacheBuilder()
+        .with_cache(url="mem://")
+        .with_rate_limit(enabled=True, rate_limit=1, period="10s")
+        .build()
     ) as pc:
         # Pre-consume the client's rate limit quota
         await pc.check_rate_limit("192.168.1.50")

@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import enum
 import logging
 import threading
 import time
 from collections import deque
 
 from .circuit_permit import CircuitPermit
-from .circuit_state import CircuitState
 
 logger = logging.getLogger(__name__)
+
+
+class CircuitState(str, enum.Enum):
+    """Enumeration of circuit breaker operational states."""
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
 
 class DestinationCircuitBreaker:
@@ -213,4 +221,7 @@ class DestinationCircuitBreaker:
                         self._window_error_count = 0
 
 
-__all__ = ["DestinationCircuitBreaker"]
+__all__ = [
+    "CircuitState",
+    "DestinationCircuitBreaker",
+]

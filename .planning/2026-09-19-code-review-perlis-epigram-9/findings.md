@@ -69,13 +69,19 @@ In [`src/trio_http_proxy/config/settings.py`](file:///home/jeff/code/fork/trio_h
 def port(self) -> int:
     return self.proxy.port
 
+
 @property
 def bufmaxsz(self) -> int:
     return self.proxy.bufmaxsz
+
+
 ...
+
+
 @property
 def circuit_breaker_ttl_seconds(self) -> float:
     return self.circuit_breaker.circuit_breaker_ttl_seconds
+
 
 @property
 def rate_limit_ttl_seconds(self) -> float:
@@ -224,7 +230,12 @@ While exceptions and enums were fragmented, two large modules combine disparate 
   ```python
   class ProxyCacheProtocol(typing.Protocol):
       async def record_connection_result(
-          self, host: str, port: int, exc: Exception | None, *, permit: CircuitPermit | None = None
+          self,
+          host: str,
+          port: int,
+          exc: Exception | None,
+          *,
+          permit: CircuitPermit | None = None,
       ) -> None: ...
       async def check_circuit(self, host: str, port: int) -> CircuitPermit | None: ...
       async def check_rate_limit(self, client_key: str) -> None: ...
@@ -239,3 +250,13 @@ While exceptions and enums were fragmented, two large modules combine disparate 
 - Extract HTTP/1.1 CONNECT wire parsing ([`process_as_connect_request`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L572)) into a dedicated `protocol.py`.
 - Extract bidirectional streaming ([`pipe`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L655), [`pipe_with_timeout`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py#L688)) into a dedicated `streaming.py`.
 - Restrict [`proxy.py`](file:///home/jeff/code/fork/trio_http_proxy/src/trio_http_proxy/proxy.py) to server loop orchestration to improve cohesion.
+
+## 7. Execution Pivot & Coordinator Reflections
+During the execution of this refactoring plan via hierarchical delegation, a few key insights emerged:
+
+1. **The Illusion of Independence**: While Tranches 1-4 seemed conceptually independent, conflict analysis revealed that Tranches 1, 2, and 3 all collided on `proxy_cache.py`, and Tranches 2 and 4 collided on `proxy.py`. The "decoupled" architecture was actually tightly tangled, requiring strict serialization to prevent parallel workers from trampling each other.
+2. **The Epigram 9 Tension (Builder API Pivot)**: After successfully unifying the monolithic `Settings` object in Tranche 1 (improving cohesion and eliminating 31 properties), the resulting caller friction became apparent. The user ordered a pivot away from a bare `ProxyCacheProtocol` toward a `ProxyCacheBuilder` and `ConnectionResultBuilder`. This pivot perfectly resolves the tension between Perlis's Epigram 9 (unified data structures) and developer ergonomics: the fluent builder interface provides expressive composition at the call site while compiling straight down into the single, consolidated `Settings` model underneath.
+3. **Compiler-Grade Constraints**: Enforcing the use of `mcpls` tools via the `STRICT_SCOPE_DIRECTIVE` fundamentally changed the reliability of the delegation. Workers behaved more like deterministic compilation tasks rather than erratic explorers.
+4. **Structural Diffing as a Review Superpower**: Traditional diffs can obscure deep semantic changes under formatting noise. Generating raw AST edit actions (`delete-tree` for specific `inspect.signature` blocks) allowed me to verify exactly what semantic structures were removed without reading hunks of Python. It proves that a code concept was successfully excised.
+5. **The Power of Proven Parallelism**: By doing upfront scope conflict analysis, we successfully determined that Tranches 1, 2.1, and 2.2 shared overlapping files and had to be serialized. Conversely, Tranches 3 (`errors/`) and 4 (`protocol.py`/`streaming.py`) were mathematically disjoint. Dispatching multiple subagents concurrently with absolute confidence they wouldn't collide is only possible when following strict, scope-bounded hierarchical delegation.
+6. **False Alarms vs. Compiler-Grade Truth**: A momentary scare occurred when `pyright` threw 26 type errors during my verification step. It turned out `pyright` was scanning the temporary `tmp.XXXXXX` isolated scratch directories I had created for structural diffing. When run exclusively on the actual `src/` and `tests/` directories, `pyright` reported 0 errors. This underscores that the workers' aggressive use of `mcpls` tools results in perfectly typed refactors, even when making massive structural pivots.
