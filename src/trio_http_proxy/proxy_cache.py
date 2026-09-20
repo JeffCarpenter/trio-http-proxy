@@ -192,6 +192,22 @@ class ProxyCacheProtocol(Protocol):
         """Verify a client's quota and attach backend expiry on rejection."""
         ...
 
+    async def resolve_host(self, host: str) -> str:
+        """Resolve a destination host to one IP string."""
+        ...
+
+    async def resolve_hosts(self, host: str) -> list[str]:
+        """Resolve a destination host, returning all resolved IP strings."""
+        ...
+
+    def start(self) -> None:
+        """Start the proxy cache bridge."""
+        ...
+
+    def stop(self) -> None:
+        """Stop the proxy cache bridge."""
+        ...
+
 
 class ProxyCache:
     """Bridges cashews caching, Trio-native circuit breaking, and rate limiting.
@@ -214,11 +230,18 @@ class ProxyCache:
 
     def __init__(
         self,
-        settings: Settings | ProxyCacheBuilder | None = None,
+        settings: Settings | ProxyCacheBuilder | str | None = None,
         *,
         builder: ProxyCacheBuilder | None = None,
         **kwargs: Any,
     ) -> None:
+        if "url" in kwargs and "cache_url" not in kwargs:
+            kwargs["cache_url"] = kwargs.pop("url")
+
+        if isinstance(settings, str):
+            kwargs["cache_url"] = settings
+            settings = None
+
         if isinstance(settings, ProxyCacheBuilder):
             builder = settings
             settings = None

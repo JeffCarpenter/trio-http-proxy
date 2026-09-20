@@ -13,12 +13,22 @@ if TYPE_CHECKING:
 
 def _normalize_cache_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     norm = dict(kwargs)
+    if "url" in norm and "cache_url" not in norm:
+        norm["cache_url"] = norm.pop("url")
     if "enabled" in norm and "cache_enabled" not in norm:
         norm["cache_enabled"] = norm.pop("enabled")
     if "namespace" in norm and "cache_namespace" not in norm:
         norm["cache_namespace"] = norm.pop("namespace")
     if "failure_policy" in norm and "cache_failure_policy" not in norm:
         norm["cache_failure_policy"] = norm.pop("failure_policy")
+    if "limit" in norm and "rate_limit" not in norm:
+        norm["rate_limit"] = norm.pop("limit")
+    if "errors_rate" in norm and "circuit_breaker_errors_rate" not in norm:
+        norm["circuit_breaker_errors_rate"] = norm.pop("errors_rate")
+    if "min_calls" in norm and "circuit_breaker_min_calls" not in norm:
+        norm["circuit_breaker_min_calls"] = norm.pop("min_calls")
+    if "max_destinations" in norm and "circuit_breaker_max_destinations" not in norm:
+        norm["circuit_breaker_max_destinations"] = norm.pop("max_destinations")
     return norm
 
 
@@ -35,12 +45,7 @@ class SettingsBuilderMixin:
 
     def build_settings(self) -> Settings:
         if self._base_settings is not None:
-            data = {
-                k: getattr(self._base_settings, k)
-                for k in self._base_settings.model_fields_set
-            }
-            data.update(self._overrides)
-            return Settings(**data)
+            return self._base_settings.model_copy(update=self._overrides)
         return Settings(**self._overrides)
 
 
@@ -51,7 +56,12 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
     on top of the consolidated Settings data model.
     """
 
-    def __init__(self, settings: Settings | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self, settings: Settings | str | None = None, **kwargs: Any
+    ) -> None:
+        if isinstance(settings, str):
+            kwargs["cache_url"] = settings
+            settings = None
         self._base_settings: Settings | None = settings
         self._overrides: dict[str, Any] = _normalize_cache_kwargs(kwargs)
         self._built_cache: ProxyCache | None = None

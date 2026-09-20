@@ -47,6 +47,7 @@ from .protocol import process_as_connect_request
 from .proxy_cache import (
     ConnectionRecord,
     ConnectionResultBuilder,
+    ProxyCacheProtocol,
     get_default_proxy_cache,
 )
 from .streaming import pipe, pipe_with_timeout
@@ -96,7 +97,7 @@ async def http_proxy(
     idle_timeout: float | None = None,
     send_timeout: float | None = None,
     limiter: trio.CapacityLimiter | None = None,
-    proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
+    proxy_cache: ProxyCacheProtocol | None | Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
     _proxy_cfg = get_settings()
     idle_timeout = (
@@ -296,7 +297,9 @@ class ProxyBuilder(SettingsBuilderMixin):
     def __init__(self, settings: Settings | None = None, **kwargs: Any) -> None:
         self._base_settings: Settings | None = settings
         self._overrides: dict[str, Any] = dict(kwargs)
-        self._proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL
+        self._proxy_cache: ProxyCacheProtocol | ProxyCacheBuilder | None | Any = (
+            _DEFAULT_PROXY_CACHE_SENTINEL
+        )
         self._limiter: trio.CapacityLimiter | None = None
         self._server: Any = http_proxy
 
@@ -340,7 +343,9 @@ class ProxyBuilder(SettingsBuilderMixin):
         self._overrides["log_level"] = log_level
         return self
 
-    def with_cache(self, cache: Any) -> Self:
+    def with_cache(
+        self, cache: ProxyCacheProtocol | ProxyCacheBuilder | None | Any
+    ) -> Self:
         self._proxy_cache = cache
         return self
 
@@ -438,7 +443,9 @@ async def start_server(
     server: Any = http_proxy,
     port: int | None = None,
     _serve: Any = None,
-    proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
+    proxy_cache: ProxyCacheProtocol | ProxyCacheBuilder | None | Any = (
+        _DEFAULT_PROXY_CACHE_SENTINEL
+    ),
     limiter: trio.CapacityLimiter | None = None,
     task_status: trio.TaskStatus[Any] = trio.TASK_STATUS_IGNORED,
 ) -> None:
@@ -451,7 +458,7 @@ async def start_server(
 
 
 async def _record_connection_result(
-    proxy_cache: Any,
+    proxy_cache: ProxyCacheProtocol | None | Any,
     host_or_builder: str | ConnectionResultBuilder | ConnectionRecord,
     port: int | None = None,
     exc: Exception | None = None,
@@ -490,7 +497,7 @@ async def tunnel(
     _connect=trio.open_tcp_stream,
     read_timeout: float | None = None,
     dest_connect_timeout: float | None = None,
-    proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
+    proxy_cache: ProxyCacheProtocol | None | Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
     """Given a stream from a client containing an HTTP CONNECT request,
     open a connection to the destination server specified in the CONNECT request,
@@ -710,6 +717,7 @@ __all__ = [
     "ConnectionResultBuilder",
     "ProxyBuilder",
     "ProxyCacheBuilder",
+    "ProxyCacheProtocol",
     "ProxyProtocolError",
     "ProxySettings",
     "RequestTooLargeError",

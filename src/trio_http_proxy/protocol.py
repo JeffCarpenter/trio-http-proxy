@@ -16,11 +16,12 @@ import trio
 
 from . import http
 from .config import get_settings
-from .connection import ConnectionLoggerAdapter
+from .connection import ConnectionFilter, ConnectionLoggerAdapter
 from .errors import ProxyProtocolError, RequestTooLargeError
 
 LOGGER_NAME = "trio_http_proxy"
 _raw_logger = logging.getLogger(LOGGER_NAME)
+_raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
 

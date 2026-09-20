@@ -12,10 +12,11 @@ import logging
 import trio
 
 from .config import get_settings
-from .connection import CV_PIPE_FROM, ConnectionLoggerAdapter
+from .connection import CV_PIPE_FROM, ConnectionFilter, ConnectionLoggerAdapter
 
 LOGGER_NAME = "trio_http_proxy"
 _raw_logger = logging.getLogger(LOGGER_NAME)
+_raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
 
