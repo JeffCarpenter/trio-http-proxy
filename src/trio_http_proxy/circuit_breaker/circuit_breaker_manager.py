@@ -115,9 +115,6 @@ class CircuitBreakerManager:
     ) -> CircuitPermit | None:
         return self.get_breaker(host, port).acquire_permit(now=now)
 
-    def can_execute(self, host: str, port: int, now: float | None = None) -> bool:
-        return self.get_breaker(host, port).can_execute(now=now)
-
     def record_result(
         self,
         host: str,

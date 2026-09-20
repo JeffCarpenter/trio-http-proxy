@@ -235,24 +235,15 @@ class Settings(EnvSettings):
     def _validate_rate_limit_ttl(cls, value: str | None) -> str | None:
         return normalize_optional_duration(value, field="rate_limit_ttl")
 
-    @field_validator("startup_timeout")
+    @field_validator("startup_timeout", "circuit_breaker_min_calls", "rate_limit")
     @classmethod
-    def _validate_startup_timeout(cls, value: float) -> float:
-        if value <= 0:
+    def _validate_numeric_bounds(cls, value: Any, info: ValidationInfo) -> Any:
+        field = info.field_name
+        if field == "startup_timeout" and value <= 0:
             raise ValueError(f"startup_timeout must be > 0, got {value}")
-        return value
-
-    @field_validator("circuit_breaker_min_calls")
-    @classmethod
-    def _validate_circuit_breaker_min_calls(cls, value: int) -> int:
-        if value < 1:
+        if field == "circuit_breaker_min_calls" and value < 1:
             raise ValueError(f"circuit_breaker_min_calls must be >= 1, got {value}")
-        return value
-
-    @field_validator("rate_limit")
-    @classmethod
-    def _validate_rate_limit(cls, value: int) -> int:
-        if value < 0:
+        if field == "rate_limit" and value < 0:
             raise ValueError(f"rate_limit must be >= 0, got {value}")
         return value
 

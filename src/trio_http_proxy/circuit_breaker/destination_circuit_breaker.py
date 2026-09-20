@@ -112,37 +112,6 @@ class DestinationCircuitBreaker:
                 is_probe=False,
             )
 
-    def can_execute(self, now: float | None = None) -> bool:
-        """Legacy check returning boolean (does not track permit identity)."""
-        if now is None:
-            now = time.monotonic()
-        with self._lock:
-            if self.state == CircuitState.OPEN:
-                opened_at = self.opened_at
-                if opened_at is not None and now - opened_at >= self.ttl:
-                    self.state = CircuitState.HALF_OPEN
-                    self._half_open_in_flight = False
-                    self._active_probe_id = None
-                    self._probe_started_at = None
-                else:
-                    return False
-
-            if self.state == CircuitState.HALF_OPEN:
-                if self._half_open_in_flight:
-                    if (
-                        self._probe_started_at is not None
-                        and now - self._probe_started_at >= self.ttl
-                    ):
-                        self._half_open_in_flight = False
-                        self._active_probe_id = None
-                    else:
-                        return False
-                self._half_open_in_flight = True
-                self._probe_started_at = now
-                return True
-
-            return True
-
     def _abort_permit(self, permit: CircuitPermit) -> None:
         with self._lock:
             if (

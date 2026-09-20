@@ -392,7 +392,7 @@ def test_destination_circuit_breaker_state_machine():
     )
     t0 = 1000.0
     assert cb.state == CircuitState.CLOSED
-    assert cb.can_execute(now=t0) is True
+    assert cb.acquire_permit(now=t0) is not None
 
     # Call 1: failure
     cb.record_result(OSError("fail 1"), now=t0 + 1.0)
@@ -404,7 +404,7 @@ def test_destination_circuit_breaker_state_machine():
     assert cb.opened_at == t0 + 2.0
 
     # In OPEN state before TTL: rejected
-    assert cb.can_execute(now=t0 + 4.0) is False
+    assert cb.acquire_permit(now=t0 + 4.0) is None
 
     # After TTL: transitions to HALF_OPEN
     # Probe discipline: first caller gets True (probe in flight)
@@ -414,7 +414,6 @@ def test_destination_circuit_breaker_state_machine():
 
     # Concurrent second caller while probe is in flight is gated/rejected!
     assert cb.acquire_permit(now=t0 + 7.2) is None
-    assert cb.can_execute(now=t0 + 7.2) is False
 
     # If probe fails: transitions back to OPEN
     cb.record_result(OSError("probe failed"), now=t0 + 7.3, permit=permit)
@@ -429,7 +428,7 @@ def test_destination_circuit_breaker_state_machine():
     cb.record_result(None, now=t0 + 13.2, permit=permit2)
     assert cb.state == CircuitState.CLOSED
     assert cb.opened_at is None
-    assert cb.can_execute(now=t0 + 13.2) is True
+    assert cb.acquire_permit(now=t0 + 13.2) is not None
 
 
 @tt.trio_test
