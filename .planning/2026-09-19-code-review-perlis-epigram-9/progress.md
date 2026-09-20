@@ -11,3 +11,9 @@
 
 ## Active and Pending Tranches
 *(All tranches completed successfully!)*
+
+## Final Cleanup
+- [x] Removed stale tests and legacy API coverage from the prototype.
+- [x] Preserved and adapted all three stress tests to the current record API.
+- [x] Validation passed: 243 tests, Ruff, Ty, Pyright, and mcpls diagnostics.
+- [x] Committed as `b633ff2`.
