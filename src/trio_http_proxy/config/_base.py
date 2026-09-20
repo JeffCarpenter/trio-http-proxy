@@ -7,24 +7,9 @@ the single source of truth for duration-string parsing (cashews TTL syntax).
 
 from __future__ import annotations
 
-import re
-
-from pydantic import AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ENV_PREFIX = "TRIO_HTTP_PROXY_"
-
-
-def prefixed(*names: str) -> AliasChoices:
-    """Env aliases for a field: canonical prefixed name first, legacy name second.
-
-    ``prefixed("circuit_breaker_period")`` yields the aliases
-    ``TRIO_HTTP_PROXY_CIRCUIT_BREAKER_PERIOD`` (canonical, wins) and
-    ``CIRCUIT_BREAKER_PERIOD`` (legacy). Field-name initialization keeps working
-    via ``populate_by_name``.
-    """
-    ups = [name.upper() for name in names]
-    return AliasChoices(*(f"{ENV_PREFIX}{u}" for u in ups), *ups)
 
 
 def parse_duration_seconds(
@@ -45,7 +30,7 @@ def parse_duration_seconds(
     else:
         try:
             parsed = ttl_to_seconds(stripped)
-        except (ValueError, TypeError) as err:
+        except (ValueError, TypeError, OverflowError) as err:
             raise ValueError(
                 f"Invalid duration for {field}: {value!r}. "
                 "Expected an integer amount with an s/m/h/d suffix (e.g. '60s', '5m')."
@@ -61,13 +46,15 @@ def parse_duration_seconds(
 
 
 def normalize_optional_duration(value: str | None, *, field: str) -> str | None:
-    """Normalize an optional duration string; ``None``/``""``/``"0s"`` mean disabled."""
+    """Normalize an optional duration string; None/empty/0-evaluating mean disabled."""
     if value is None:
         return None
     stripped = value.strip()
-    if not stripped or stripped == "0s":
+    if not stripped:
         return None
-    parse_duration_seconds(stripped, field=field, allow_zero=False)
+    seconds = parse_duration_seconds(stripped, field=field, allow_zero=True)
+    if seconds == 0.0:
+        return None
     return stripped
 
 
@@ -84,7 +71,9 @@ def validate_duration_string(
     return stripped
 
 
-NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+_ALLOWED_NAMESPACE_CHARS: frozenset[str] = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
 
 _FAILURE_POLICIES = frozenset({"fail-open", "fail-closed"})
 
@@ -94,7 +83,7 @@ def validate_namespace(value: str) -> str:
     stripped = value.strip()
     if not stripped:
         raise ValueError("Cache namespace must be a non-empty string")
-    if not NAMESPACE_PATTERN.match(stripped):
+    if not all(c in _ALLOWED_NAMESPACE_CHARS for c in stripped):
         raise ValueError(
             f"Cache namespace must match '^[a-zA-Z0-9_-]+$', got {value!r}"
         )
@@ -121,6 +110,7 @@ class EnvSettings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
+        env_prefix=ENV_PREFIX,
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
@@ -133,12 +123,10 @@ class EnvSettings(BaseSettings):
 
 __all__ = [
     "ENV_PREFIX",
-    "NAMESPACE_PATTERN",
     "EnvSettings",
     "normalize_failure_policy",
     "normalize_optional_duration",
     "parse_duration_seconds",
-    "prefixed",
     "validate_duration_string",
     "validate_namespace",
 ]

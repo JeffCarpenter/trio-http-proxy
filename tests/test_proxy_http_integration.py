@@ -5,7 +5,7 @@ import trio
 import trio.testing as tt
 
 from trio_http_proxy import http, proxy
-from trio_http_proxy.cache import CacheBackendUnavailable, RateLimitError
+from trio_http_proxy.errors import CacheBackendUnavailable, RateLimitError
 
 
 def connect_request(target: bytes = b"example.com:443") -> bytes:
@@ -91,9 +91,7 @@ async def test_http_proxy_post_connect_cache_failure_closes_destination() -> Non
         async def resolve_hosts(self, host: str) -> list[str]:
             return [host]
 
-        async def record_connection_result(
-            self, _host: str, _port: int, _error: Exception | None
-        ) -> None:
+        async def record_connection_result(self, _record: object) -> None:
             raise CacheBackendUnavailable("result backend down")
 
     async def fake_connect(_host: str, _port: int) -> Any:
@@ -114,6 +112,7 @@ async def test_http_proxy_post_connect_cache_failure_closes_destination() -> Non
     await destination_peer.aclose()
 
 
+@pytest.mark.trio
 async def test_http_proxy_tunnels_to_real_destination_server(
     dest_server_port: int,
 ) -> None:

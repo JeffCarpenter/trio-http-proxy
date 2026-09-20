@@ -9,7 +9,21 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy import http, proxy
+from trio_http_proxy import (
+    CV_CLIENT_STREAM,
+    CV_CONN_ID,
+    CV_DEST_STREAM,
+    CV_DESTHOST,
+    CV_PIPE_FROM,
+    Settings,
+    format_conn_prefix,
+    http,
+    pipe,
+    pipe_with_timeout,
+    proxy,
+)
+from trio_http_proxy.config import reset_settings_cache
+from trio_http_proxy.connection import CV_PROXY_CACHE
 
 
 def run_isolated(fn, *args, **kwargs):
@@ -47,9 +61,9 @@ def _enable_log_capture(caplog):
 @pytest.fixture(autouse=True)
 def _disable_cache_in_proxy_tests():
     """Default cache resolution yields None: no cashews backend in proxy tests."""
-    token = proxy.CV_PROXY_CACHE.set(None)
+    token = CV_PROXY_CACHE.set(None)
     yield
-    proxy.CV_PROXY_CACHE.reset(token)
+    CV_PROXY_CACHE.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +297,36 @@ async def test_tunnel_success_connects_and_replies_200():
 
 
 @tt.trio_test
+async def test_tunnel_closes_destination_when_result_recording_fails():
+    proxy_client, test_client = tt.memory_stream_pair()
+    dest_stream, _dest_peer = tt.memory_stream_pair()
+
+    class FailingCache:
+        async def check_circuit(self, _host, _port):
+            return None
+
+        async def resolve_hosts(self, host):
+            return [host]
+
+        async def record_connection_result(self, _record):
+            raise RuntimeError("result backend unavailable")
+
+    async def fake_open_tcp_stream(_host, _port):
+        return dest_stream
+
+    await test_client.send_all(connect_request(target=b"example.com:443"))
+    with pytest.raises(RuntimeError, match="result backend unavailable"):
+        await proxy.tunnel(
+            proxy_client,
+            _connect=fake_open_tcp_stream,
+            proxy_cache=FailingCache(),
+        )
+
+    with pytest.raises((trio.ClosedResourceError, trio.BrokenResourceError)):
+        await dest_stream.send_all(b"must not remain open")
+
+
+@tt.trio_test
 async def test_tunnel_bad_request_sends_400_and_raises_without_connecting():
     proxy_client, test_client = tt.memory_stream_pair()
     called = False
@@ -384,9 +428,7 @@ async def test_tunnel_oversized_request_sends_414_not_bare_400():
     # indistinguishable 400 Bad Request instead of a status that actually
     # tells the client its request was too big.
     proxy_client, test_client = tt.memory_stream_pair()
-    oversized_target = (
-        b"a" * (proxy.ProxySettings.model_fields["maxreqsz"].default + 1) + b":443"
-    )
+    oversized_target = b"a" * (Settings.model_fields["maxreqsz"].default + 1) + b":443"
     await test_client.send_all(connect_request(target=oversized_target))
 
     async def fake_open_tcp_stream(_host, _port):
@@ -418,7 +460,7 @@ async def test_pipe_forwards_multiple_chunks_in_order(caplog):
         await from_test.aclose()
 
     async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.pipe, from_proxy, to_proxy)
+        nursery.start_soon(pipe, from_proxy, to_proxy)
         nursery.start_soon(feed)
 
     # pipe() only reads until EOF; it never closes to_stream itself, so we
@@ -443,7 +485,7 @@ async def test_pipe_immediate_eof_forwards_nothing():
     to_proxy, to_test = tt.memory_stream_pair()
     await from_test.aclose()
 
-    await proxy.pipe(from_proxy, to_proxy)
+    await pipe(from_proxy, to_proxy)
 
     await to_proxy.aclose()
     remainder = await to_test.receive_some(4096)
@@ -517,9 +559,7 @@ async def test_pipe_calls_on_receive_and_on_send_hooks_per_chunk():
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(
-            partial(
-                proxy.pipe, from_proxy, to_proxy, on_receive=on_receive, on_send=on_send
-            )
+            partial(pipe, from_proxy, to_proxy, on_receive=on_receive, on_send=on_send)
         )
         nursery.start_soon(feed)
 
@@ -563,7 +603,7 @@ async def test_http_proxy_forwards_large_payload_across_chunk_boundaries():
     proxy_client.receive_stream.receive_some_hook = count_client_to_dest_reads
     dest_proxy_side.receive_stream.receive_some_hook = count_dest_to_client_reads
 
-    payload_size = proxy.ProxySettings.model_fields["bufmaxsz"].default * 3 + 777
+    payload_size = Settings.model_fields["bufmaxsz"].default * 3 + 777
     client_payload = random.Random(1).randbytes(payload_size)
     dest_payload = random.Random(2).randbytes(payload_size)
 
@@ -1117,11 +1157,11 @@ def test_log_with_dest_but_no_pipe_from_shows_bidirectional_arrow(caplog):
 def test_log_direction_arrow_points_away_from_client_when_piping_from_client(caplog):
     def body():
         client = fake_stream()
-        proxy.CV_CONN_ID.set(2)
-        proxy.CV_CLIENT_STREAM.set(client)
-        proxy.CV_DEST_STREAM.set(fake_stream())
-        proxy.CV_DESTHOST.set("example.com")
-        proxy.CV_PIPE_FROM.set(client)
+        CV_CONN_ID.set(2)
+        CV_CLIENT_STREAM.set(client)
+        CV_DEST_STREAM.set(fake_stream())
+        CV_DESTHOST.set("example.com")
+        CV_PIPE_FROM.set(client)
         proxy.logger.info("hello")
 
     run_isolated(body)
@@ -1132,11 +1172,11 @@ def test_log_direction_arrow_points_toward_client_when_piping_from_dest(caplog):
     def body():
         client = fake_stream()
         dest = fake_stream()
-        proxy.CV_CONN_ID.set(3)
-        proxy.CV_CLIENT_STREAM.set(client)
-        proxy.CV_DEST_STREAM.set(dest)
-        proxy.CV_DESTHOST.set("example.com")
-        proxy.CV_PIPE_FROM.set(dest)
+        CV_CONN_ID.set(3)
+        CV_CLIENT_STREAM.set(client)
+        CV_DEST_STREAM.set(dest)
+        CV_DESTHOST.set("example.com")
+        CV_PIPE_FROM.set(dest)
         proxy.logger.info("hello")
 
     run_isolated(body)
@@ -1147,11 +1187,11 @@ def test_log_injects_structured_context_into_record_extra(caplog):
     def body():
         client = fake_stream()
         dest = fake_stream()
-        proxy.CV_CONN_ID.set(42)
-        proxy.CV_CLIENT_STREAM.set(client)
-        proxy.CV_DEST_STREAM.set(dest)
-        proxy.CV_DESTHOST.set("structured.example.com")
-        proxy.CV_PIPE_FROM.set(client)
+        CV_CONN_ID.set(42)
+        CV_CLIENT_STREAM.set(client)
+        CV_DEST_STREAM.set(dest)
+        CV_DESTHOST.set("structured.example.com")
+        CV_PIPE_FROM.set(client)
         proxy.logger.info("structured check")
 
     run_isolated(body)
@@ -1164,16 +1204,16 @@ def test_log_injects_structured_context_into_record_extra(caplog):
 
 def test_format_conn_prefix_helper():
     def body():
-        assert proxy.format_conn_prefix() == ""
+        assert format_conn_prefix() == ""
         client = fake_stream()
-        proxy.CV_CLIENT_STREAM.set(client)
-        proxy.CV_CONN_ID.set(10)
-        assert proxy.format_conn_prefix() == "[conn10]"
-        proxy.CV_DEST_STREAM.set(fake_stream())
-        proxy.CV_DESTHOST.set("example.org")
-        assert proxy.format_conn_prefix() == "[conn10 <> example.org]"
-        proxy.CV_PIPE_FROM.set(client)
-        assert proxy.format_conn_prefix() == "[conn10 -> example.org]"
+        CV_CLIENT_STREAM.set(client)
+        CV_CONN_ID.set(10)
+        assert format_conn_prefix() == "[conn10]"
+        CV_DEST_STREAM.set(fake_stream())
+        CV_DESTHOST.set("example.org")
+        assert format_conn_prefix() == "[conn10 <> example.org]"
+        CV_PIPE_FROM.set(client)
+        assert format_conn_prefix() == "[conn10 -> example.org]"
 
     run_isolated(body)
 
@@ -1222,32 +1262,66 @@ async def test_start_server_swallows_keyboard_interrupt(caplog):
     assert "Goodbye for now." in caplog.text
 
 
+@pytest.mark.trio
+async def test_start_server_maxconns_one_no_deadlock(dest_server_port, monkeypatch):
+    """Verify maxconns=1 deadlock prevention with default connection limiter.
+
+    When start_server runs with maxconns=1, _serve_tcp_gated acquires the single
+    available capacity permit on behalf of the connection. http_proxy receives
+    limiter=None (via ProxyBuilder), preventing it from attempting to re-acquire
+    get_conn_limiter() and deadlocking.
+    """
+    monkeypatch.setenv("TRIO_HTTP_PROXY_MAXCONNS", "1")
+    reset_settings_cache()
+    proxy.reset_conn_limiter()
+
+    async with trio.open_nursery() as nursery:
+        listeners = await nursery.start(partial(proxy.start_server, port=0))
+        proxy_port = listeners[0].socket.getsockname()[1]
+
+        client_stream = await trio.open_tcp_stream("127.0.0.1", proxy_port)
+        async with client_stream:
+            target = f"127.0.0.1:{dest_server_port}".encode()
+            await client_stream.send_all(connect_request(target=target))
+            reply = await client_stream.receive_some(4096)
+            assert reply == b"HTTP/1.1 200 Connection established\r\n\r\n"
+
+            await client_stream.send_all(b"PING")
+            response = await client_stream.receive_some(4096)
+            assert b"HTTP/1.1 200 OK" in response
+
+        nursery.cancel_scope.cancel()
+
+
 # ---------------------------------------------------------------------------
-# ProxySettings configuration
+# Settings configuration
 # ---------------------------------------------------------------------------
 
 
 def test_port_defaults_to_8080_when_env_unset():
-    assert proxy.ProxySettings().port == 8080
+    assert Settings().port == 8080
 
 
 def test_port_reads_from_env_var(monkeypatch):
     monkeypatch.setenv("PORT", "9191")
-    assert proxy.ProxySettings().port == 9191
+    monkeypatch.setenv("TRIO_HTTP_PROXY_PORT", "9191")
+    assert Settings().port == 9191
 
 
 def test_maxconns_defaults_to_1000_when_env_unset():
-    assert proxy.ProxySettings().maxconns == 1000
+    assert Settings().maxconns == 1000
 
 
 def test_maxconns_reads_from_env_var(monkeypatch):
     monkeypatch.setenv("MAXCONNS", "2000")
-    assert proxy.ProxySettings().maxconns == 2000
+    monkeypatch.setenv("TRIO_HTTP_PROXY_MAXCONNS", "2000")
+    assert Settings().maxconns == 2000
 
 
 def test_timeouts_read_from_env(monkeypatch):
     monkeypatch.setenv("CONNECT_READ_TIMEOUT", "1.5")
-    assert proxy.ProxySettings().connect_read_timeout == 1.5
+    monkeypatch.setenv("TRIO_HTTP_PROXY_CONNECT_READ_TIMEOUT", "1.5")
+    assert Settings().connect_read_timeout == 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -1271,9 +1345,7 @@ async def test_tunnel_logs_warning_with_exc_info_on_bad_request(caplog):
 @tt.trio_test
 async def test_tunnel_logs_warning_with_exc_info_on_oversized_request(caplog):
     proxy_client, test_client = tt.memory_stream_pair()
-    oversized = (
-        b"a" * (proxy.ProxySettings.model_fields["maxreqsz"].default + 1) + b":443"
-    )
+    oversized = b"a" * (Settings.model_fields["maxreqsz"].default + 1) + b":443"
     await test_client.send_all(connect_request(target=oversized))
     with pytest.raises(proxy.RequestTooLargeError):
         await proxy.tunnel(proxy_client)
@@ -1322,7 +1394,7 @@ async def test_pipe_with_timeout_logs_warning_on_timeout(caplog, mock_clock):
     to_proxy, _to_test = tt.memory_stream_pair()
 
     with pytest.raises(trio.TooSlowError):
-        await proxy.pipe_with_timeout(from_proxy, to_proxy, idle_timeout=2)
+        await pipe_with_timeout(from_proxy, to_proxy, idle_timeout=2)
 
     rec = next(r for r in caplog.records if "closing tunnel" in r.message)
     assert rec.levelname == "WARNING"
@@ -1344,9 +1416,9 @@ def test_logger_adapter_delegates_handlers_and_filters():
     assert test_filter not in proxy.logger.logger.filters
 
 
-def test_log_level_defaults_and_env(proxy_settings):
-    assert proxy_settings.log_level == "INFO"
-    assert proxy.ProxySettings.VALID_LOG_LEVELS <= {
+def test_log_level_defaults_and_env(settings: Settings):
+    assert settings.log_level == "INFO"
+    assert Settings.VALID_LOG_LEVELS <= {
         "DEBUG",
         "INFO",
         "WARNING",
@@ -1361,8 +1433,8 @@ def test_log_level_defaults_and_env(proxy_settings):
 def test_raw_logger_filter_populates_attributes(caplog):
     def body():
         client = fake_stream()
-        proxy.CV_CONN_ID.set(55)
-        proxy.CV_CLIENT_STREAM.set(client)
+        CV_CONN_ID.set(55)
+        CV_CLIENT_STREAM.set(client)
         proxy._raw_logger.info("raw logger message")
 
     run_isolated(body)
@@ -1372,6 +1444,7 @@ def test_raw_logger_filter_populates_attributes(caplog):
 
 
 def test_extracted_protocol_and_streaming_modules():
+    import trio_http_proxy
     from trio_http_proxy.protocol import (
         ProxyProtocolError,
         RequestTooLargeError,
@@ -1384,6 +1457,8 @@ def test_extracted_protocol_and_streaming_modules():
     assert callable(pipe_with_timeout)
     assert issubclass(ProxyProtocolError, Exception)
     assert issubclass(RequestTooLargeError, Exception)
+    assert trio_http_proxy.process_as_connect_request is process_as_connect_request
+    assert trio_http_proxy.pipe is pipe
+    assert trio_http_proxy.pipe_with_timeout is pipe_with_timeout
     assert proxy.process_as_connect_request is process_as_connect_request
-    assert proxy.pipe is pipe
     assert proxy.pipe_with_timeout is pipe_with_timeout

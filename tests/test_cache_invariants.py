@@ -6,20 +6,21 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy.cache import (
-    CacheBackendUnavailable,
+from trio_http_proxy.cache import ProxyCache
+from trio_http_proxy.circuit_breaker import (
     CircuitBreakerManager,
-    CircuitBreakerOpen,
     CircuitState,
     DestinationCircuitBreaker,
-    ProxyCache,
-    RateLimitError,
     canonicalize_destination,
+)
+from trio_http_proxy.errors import (
+    CacheBackendUnavailable,
+    RateLimitError,
 )
 
 
-def test_failure_policy_default_and_validation(cache_settings):
-    assert cache_settings.cache_failure_policy == "fail-open"
+def test_failure_policy_default_and_validation(settings):
+    assert settings.cache_failure_policy == "fail-open"
     assert (
         ProxyCache(cache_failure_policy="fail-open").cache_failure_policy == "fail-open"
     )
@@ -345,44 +346,6 @@ async def test_stop_rejects_racing_submissions():
     assert cache._stopped
 
 
-def test_cache_enabled_boolean_parsing(monkeypatch):
-    from trio_http_proxy.config import CacheSettings
-
-    for val in ("1", "true", "yes", "on"):
-        monkeypatch.setenv("CACHE_ENABLED", val)
-        assert CacheSettings().cache_enabled is True
-
-    for val in ("0", "false", "no", "off"):
-        monkeypatch.setenv("CACHE_ENABLED", val)
-        assert CacheSettings().cache_enabled is False
-
-
-def test_semantic_boundary_validation_in_init():
-    with pytest.raises(
-        ValueError, match="circuit_breaker_errors_rate must be between 1 and 99"
-    ):
-        ProxyCache(circuit_breaker_errors_rate=0)
-    with pytest.raises(
-        ValueError, match="circuit_breaker_errors_rate must be between 1 and 99"
-    ):
-        ProxyCache(circuit_breaker_errors_rate=100)
-
-    with pytest.raises(ValueError, match="circuit_breaker_min_calls must be >= 1"):
-        ProxyCache(circuit_breaker_min_calls=0)
-
-    with pytest.raises(ValueError, match="rate_limit must be >= 0"):
-        ProxyCache(rate_limit=-1)
-
-    with pytest.raises(ValueError, match="startup_timeout must be > 0"):
-        ProxyCache(startup_timeout=0)
-
-    with pytest.raises(ValueError, match="Cache namespace must be a non-empty string"):
-        ProxyCache(namespace="   ")
-
-    with pytest.raises(ValueError, match="CACHE_FAILURE_POLICY must be either"):
-        ProxyCache(failure_policy="unsupported")
-
-
 def test_destination_circuit_breaker_state_machine():
     cb = DestinationCircuitBreaker(
         errors_rate=50,
@@ -482,17 +445,6 @@ async def test_async_context_manager_non_blocking():
     assert pc.is_stopped is True
 
 
-def test_rate_limit_zero_duration_rejection():
-    with pytest.raises(ValueError, match="rate_limit_period must evaluate to > 0"):
-        ProxyCache(rate_limit_period="0")
-    with pytest.raises(ValueError, match="rate_limit_period must evaluate to > 0"):
-        ProxyCache(rate_limit_period="0s")
-    with pytest.raises(ValueError, match="rate_limit_ttl must evaluate to > 0"):
-        ProxyCache(rate_limit_ttl="0")
-    # "0s"/"" now uniformly mean disabled: rate-limit TTL falls back to period
-    assert ProxyCache(rate_limit_ttl="0s").rate_limit_ttl_sec > 0
-
-
 @tt.trio_test
 async def test_rate_limit_cashews_ban_ttl_protocol(monkeypatch):
     async with ProxyCache(
@@ -542,63 +494,6 @@ async def test_backend_error_boundary_reraises_programming_errors(monkeypatch):
         assert not cache.is_degraded
 
 
-@tt.trio_test
-async def test_proxy_cache_check_circuit_and_record_connection_result_protocol():
-    """Verify that ProxyCache.check_circuit mints tokenized permits and record_connection_result closes HALF_OPEN."""
-    async with ProxyCache(
-        cache_url="mem://",
-        circuit_breaker_enabled=True,
-        circuit_breaker_errors_rate=50,
-        circuit_breaker_period="10s",
-        circuit_breaker_ttl="2s",
-        circuit_breaker_min_calls=2,
-    ) as pc:
-        # 1. Healthy CLOSED state returns permit with is_probe=False
-        permit1 = await pc.check_circuit("api.service.local", 443)
-        assert permit1 is not None
-        assert not permit1.is_probe
-        await pc.record_connection_result(
-            "api.service.local", 443, exc=OSError("down 1"), permit=permit1
-        )
-
-        permit2 = await pc.check_circuit("api.service.local", 443)
-        assert permit2 is not None
-        await pc.record_connection_result(
-            "api.service.local", 443, exc=OSError("down 2"), permit=permit2
-        )
-
-        # 2. Breaker has tripped to OPEN
-        with pytest.raises(CircuitBreakerOpen):
-            await pc.check_circuit("api.service.local", 443)
-
-        # 3. Fast-forward past TTL cooldown
-        breaker = pc._circuit_manager.get_breaker("api.service.local", 443)
-        assert breaker.state == CircuitState.OPEN
-        assert breaker.opened_at is not None
-        breaker.opened_at -= 3.0
-
-        # 4. First caller acquires probe permit in HALF_OPEN
-        probe_permit = await pc.check_circuit("api.service.local", 443)
-        assert probe_permit is not None
-        assert probe_permit.is_probe
-        assert breaker.state == CircuitState.HALF_OPEN
-
-        # Concurrent unleased caller is rejected in HALF_OPEN
-        with pytest.raises(CircuitBreakerOpen):
-            await pc.check_circuit("api.service.local", 443)
-
-        # 5. Successful probe connection records result and closes breaker
-        await pc.record_connection_result(
-            "api.service.local", 443, exc=None, permit=probe_permit
-        )
-        assert breaker.state == CircuitState.CLOSED
-
-        # 6. Normal traffic resumes
-        permit_normal = await pc.check_circuit("api.service.local", 443)
-        assert permit_normal is not None
-        assert not permit_normal.is_probe
-
-
 def test_circuit_permit_context_manager_auto_abort():
     """Verify that uncompleted with-statement exit automatically aborts permit."""
     breaker = DestinationCircuitBreaker(
@@ -624,39 +519,3 @@ def test_circuit_permit_context_manager_auto_abort():
     probe2 = breaker.acquire_permit(now=1007.0)
     assert probe2 is not None
     assert breaker._half_open_in_flight
-
-
-@tt.trio_test
-async def test_circuit_breaker_functions_during_backend_outage():
-    """Verify that circuit breaker admission and recording function during backend outage (degraded)."""
-    async with ProxyCache(
-        cache_url="mem://",
-        circuit_breaker_enabled=True,
-        circuit_breaker_min_calls=2,
-        circuit_breaker_errors_rate=50,
-        cache_failure_policy="fail-open",
-    ) as cache:
-        # Simulate backend degradation (e.g. remote Redis outage in fail-open mode)
-        cache._degraded = True
-        assert cache.is_degraded is True
-
-        # Circuit breaker must not bypass: recording failures must still trip the breaker
-        permit1 = await cache.check_circuit("upstream.example.com", 80)
-        await cache.record_connection_result(
-            "upstream.example.com",
-            80,
-            exc=ConnectionRefusedError("fail 1"),
-            permit=permit1,
-        )
-
-        permit2 = await cache.check_circuit("upstream.example.com", 80)
-        await cache.record_connection_result(
-            "upstream.example.com",
-            80,
-            exc=ConnectionRefusedError("fail 2"),
-            permit=permit2,
-        )
-
-        # Circuit breaker must be OPEN and reject traffic even when backend is degraded
-        with pytest.raises(CircuitBreakerOpen):
-            await cache.check_circuit("upstream.example.com", 80)

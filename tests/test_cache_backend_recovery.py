@@ -8,10 +8,8 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy.cache import (
-    ProxyCache,
-    RateLimitError,
-)
+from trio_http_proxy.cache import ProxyCache
+from trio_http_proxy.errors import RateLimitError
 
 
 class MockClock:

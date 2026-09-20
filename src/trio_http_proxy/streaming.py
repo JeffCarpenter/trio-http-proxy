@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import trio
 
@@ -21,8 +22,12 @@ logger = ConnectionLoggerAdapter(_raw_logger, {})
 
 
 async def pipe(
-    from_stream, to_stream, bufmaxsz: int | None = None, on_receive=None, on_send=None
-):
+    from_stream: trio.abc.ReceiveStream,
+    to_stream: trio.abc.SendStream,
+    bufmaxsz: int | None = None,
+    on_receive: Callable[[], None] | None = None,
+    on_send: Callable[[], None] | None = None,
+) -> None:
     """Forward chunks from from_stream to to_stream until EOF.
     on_receive and on_send, when given, are called with no arguments right
     after each successful receive_some()/send_all(). pipe() itself knows
@@ -45,7 +50,7 @@ async def pipe(
         if on_send is not None:
             on_send()
         logger.debug("Forwarded %d bytes", len(chunk))
-    if hasattr(to_stream, "send_eof"):
+    if isinstance(to_stream, trio.abc.HalfCloseableStream):
         try:
             await to_stream.send_eof()
         except trio.BrokenResourceError, trio.ClosedResourceError:
@@ -54,12 +59,12 @@ async def pipe(
 
 
 async def pipe_with_timeout(
-    from_stream,
-    to_stream,
+    from_stream: trio.abc.ReceiveStream,
+    to_stream: trio.abc.SendStream,
     bufmaxsz: int | None = None,
     idle_timeout: float | None = None,
     send_timeout: float | None = None,
-):
+) -> None:
     """Run pipe(from_stream, to_stream), raising trio.TooSlowError if
     idle_timeout seconds pass with no data received, or send_timeout
     seconds pass with to_stream not accepting a chunk already read --

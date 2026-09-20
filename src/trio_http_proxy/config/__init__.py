@@ -12,21 +12,15 @@ plus its legacy unprefixed name for backward compatibility.
 
 from ._base import (
     ENV_PREFIX,
-    NAMESPACE_PATTERN,
     EnvSettings,
     normalize_failure_policy,
     normalize_optional_duration,
     parse_duration_seconds,
-    prefixed,
     validate_duration_string,
     validate_namespace,
 )
-from .builder import ProxyCacheBuilder
+from .builder import ProxyCacheBuilder, SettingsBuilderMixin
 from .settings import (
-    CacheSettings,
-    CircuitBreakerSettings,
-    ProxySettings,
-    RateLimitSettings,
     Settings,
     get_settings,
     reset_settings_cache,
@@ -34,19 +28,14 @@ from .settings import (
 
 __all__ = [
     "ENV_PREFIX",
-    "NAMESPACE_PATTERN",
-    "CacheSettings",
-    "CircuitBreakerSettings",
     "EnvSettings",
     "ProxyCacheBuilder",
-    "ProxySettings",
-    "RateLimitSettings",
     "Settings",
+    "SettingsBuilderMixin",
     "get_settings",
     "normalize_failure_policy",
     "normalize_optional_duration",
     "parse_duration_seconds",
-    "prefixed",
     "reset_settings_cache",
     "validate_duration_string",
     "validate_namespace",

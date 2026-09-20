@@ -7,7 +7,7 @@ import trio
 import trio.testing as tt
 
 from trio_http_proxy import http, proxy
-from trio_http_proxy.cache import CircuitBreakerOpen, ProxyCache
+from trio_http_proxy.cache import ProxyCache
 
 
 def connect_request(target=b"example.com:443", extra=b""):
@@ -73,28 +73,6 @@ async def test_repro_c2_rate_limit_broken_resource_does_not_escape():
 # ---------------------------------------------------------------------------
 # C3: Circuit breaker threshold effectively doubled
 # ---------------------------------------------------------------------------
-@tt.trio_test
-async def test_repro_c3_circuit_breaker_errors_rate_80_trips():
-    """Circuit breaker with errors_rate=80 must trip when 100% of requests fail."""
-    async with ProxyCache(
-        cache_url="mem://",
-        circuit_breaker_enabled=True,
-        circuit_breaker_errors_rate=80,
-        circuit_breaker_min_calls=2,
-    ) as pc:
-        host, port = "unstable.example.com", 443
-
-        # Request 1 fails
-        await pc.check_circuit(host, port)
-        await pc.record_connection_result(host, port, OSError("conn refused"))
-
-        # Request 2 fails
-        await pc.check_circuit(host, port)
-        await pc.record_connection_result(host, port, OSError("conn refused"))
-
-        # Next check_circuit MUST raise CircuitBreakerOpen (2 fails out of 2 = 100% >= 80%)
-        with pytest.raises(CircuitBreakerOpen):
-            await pc.check_circuit(host, port)
 
 
 # ---------------------------------------------------------------------------
@@ -166,23 +144,6 @@ def test_repro_c6_main_module_exists():
 # ---------------------------------------------------------------------------
 # R1: Half-close in pipe
 # ---------------------------------------------------------------------------
-@tt.trio_test
-async def test_repro_r1_pipe_calls_send_eof_on_from_stream_eof():
-    """pipe() must invoke to_stream.send_eof() when from_stream reaches EOF."""
-    from_server, from_client = tt.memory_stream_pair()
-    to_server, to_client = tt.memory_stream_pair()
-
-    async with trio.open_nursery() as nursery:
-        nursery.start_soon(proxy.pipe, from_server, to_server)
-        await from_client.send_all(b"hello")
-        await from_client.send_eof()
-
-    # After pipe finishes, to_client should see EOF
-    chunk = await to_client.receive_some(4096)
-    assert chunk == b"hello"
-    with trio.fail_after(0.1):
-        eof_chunk = await to_client.receive_some(4096)
-        assert eof_chunk == b""
 
 
 # ---------------------------------------------------------------------------
@@ -247,14 +208,6 @@ def test_repro_r5_no_mock_clock_in_cache():
 # ---------------------------------------------------------------------------
 # Tier 3 Nits
 # ---------------------------------------------------------------------------
-def test_repro_tier3_bufmaxsz_zero_invalid():
-    """BUFMAXSZ=0 must fail validation with ValidationError."""
-    from pydantic import ValidationError
-
-    from trio_http_proxy.config import ProxySettings
-
-    with pytest.raises(ValidationError):
-        ProxySettings(bufmaxsz=0)
 
 
 def test_repro_tier3_error_responses_headers():

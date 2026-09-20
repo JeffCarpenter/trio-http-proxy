@@ -5,10 +5,6 @@ from pydantic import ValidationError
 
 from trio_http_proxy.circuit_breaker import CircuitBreakerManager
 from trio_http_proxy.config import (
-    CacheSettings,
-    CircuitBreakerSettings,
-    ProxySettings,
-    RateLimitSettings,
     Settings,
     get_settings,
     reset_settings_cache,
@@ -17,10 +13,10 @@ from trio_http_proxy.proxy_cache import ProxyCache
 
 
 class TestProxySettings:
-    """Tests for ProxySettings model."""
+    """Tests for proxy networking settings on Settings model."""
 
     def test_defaults(self):
-        settings = ProxySettings()
+        settings = Settings()
         assert settings.port == 8080
         assert settings.maxconns == 1000
         assert settings.maxreqsz == 16384
@@ -31,12 +27,12 @@ class TestProxySettings:
         assert settings.log_level == "INFO"
 
     def test_env_override(self, monkeypatch):
-        monkeypatch.setenv("PORT", "9999")
-        monkeypatch.setenv("MAXCONNS", "2500")
-        monkeypatch.setenv("CONNECT_READ_TIMEOUT", "4.5")
-        monkeypatch.setenv("LOG_LEVEL", "debug")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_PORT", "9999")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_MAXCONNS", "2500")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_CONNECT_READ_TIMEOUT", "4.5")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_LOG_LEVEL", "debug")
 
-        settings = ProxySettings()
+        settings = Settings()
         assert settings.port == 9999
         assert settings.maxconns == 2500
         assert settings.connect_read_timeout == 4.5
@@ -44,39 +40,39 @@ class TestProxySettings:
 
     def test_port_validation(self):
         with pytest.raises(ValidationError):
-            ProxySettings(port=-1)
+            Settings(port=-1)
         with pytest.raises(ValidationError):
-            ProxySettings(port=70000)
+            Settings(port=70000)
 
     def test_buffer_and_request_size_validation(self):
         with pytest.raises(ValidationError):
-            ProxySettings(bufmaxsz=0)
+            Settings(bufmaxsz=0)
         with pytest.raises(ValidationError):
-            ProxySettings(maxreqsz=0)
+            Settings(maxreqsz=0)
 
     def test_timeout_validation(self):
         with pytest.raises(ValidationError):
-            ProxySettings(connect_read_timeout=0.0)
+            Settings(connect_read_timeout=0.0)
         with pytest.raises(ValidationError):
-            ProxySettings(pipe_idle_timeout=-1.0)
+            Settings(pipe_idle_timeout=-1.0)
 
     def test_maxconns_validation(self):
         with pytest.raises(ValidationError):
-            ProxySettings(maxconns=0)
+            Settings(maxconns=0)
 
     def test_log_level_validation(self):
-        settings = ProxySettings(log_level="warn")
+        settings = Settings(log_level="warn")
         assert settings.log_level == "WARN"
 
         with pytest.raises(ValidationError):
-            ProxySettings(log_level="INVALID_LEVEL")
+            Settings(log_level="INVALID_LEVEL")
 
 
 class TestCacheSettings:
-    """Tests for CacheSettings model."""
+    """Tests for cache settings on Settings model."""
 
     def test_defaults(self):
-        settings = CacheSettings()
+        settings = Settings()
         assert settings.cache_url == "mem://"
         assert settings.cache_enabled is True
         assert settings.cache_namespace == "trio_http_proxy"
@@ -86,12 +82,12 @@ class TestCacheSettings:
         assert settings.startup_timeout == 5.0
 
     def test_env_override(self, monkeypatch):
-        monkeypatch.setenv("CACHE_URL", "redis://localhost:6379/1")
-        monkeypatch.setenv("CACHE_ENABLED", "0")
-        monkeypatch.setenv("CACHE_NAMESPACE", "custom_proxy")
-        monkeypatch.setenv("CACHE_FAILURE_POLICY", "FAIL-CLOSED")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_CACHE_URL", "redis://localhost:6379/1")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_CACHE_ENABLED", "0")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_CACHE_NAMESPACE", "custom_proxy")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_CACHE_FAILURE_POLICY", "FAIL-CLOSED")
 
-        settings = CacheSettings()
+        settings = Settings()
         assert settings.cache_url == "redis://localhost:6379/1"
         assert settings.cache_enabled is False
         assert settings.cache_namespace == "custom_proxy"
@@ -99,40 +95,39 @@ class TestCacheSettings:
 
     def test_namespace_validation(self):
         with pytest.raises(ValidationError):
-            CacheSettings(cache_namespace="")
+            Settings(cache_namespace="")
         with pytest.raises(ValidationError):
-            CacheSettings(cache_namespace="   ")
+            Settings(cache_namespace="   ")
         with pytest.raises(ValidationError):
-            CacheSettings(cache_namespace="invalid namespace with spaces")
+            Settings(cache_namespace="invalid namespace with spaces")
         with pytest.raises(ValidationError):
-            CacheSettings(cache_namespace="invalid$char!")
+            Settings(cache_namespace="invalid$char!")
 
-        # Valid characters: alphanumeric, underscore, hyphen
-        settings = CacheSettings(cache_namespace=" valid-ns_123 ")
+        settings = Settings(cache_namespace=" valid-ns_123 ")
         assert settings.cache_namespace == "valid-ns_123"
 
     def test_dns_cache_ttl_validation(self):
-        settings = CacheSettings(dns_cache_ttl="5m")
+        settings = Settings(dns_cache_ttl="5m")
         assert settings.dns_cache_ttl == "5m"
 
         with pytest.raises(ValidationError):
-            CacheSettings(dns_cache_ttl="invalid_duration")
+            Settings(dns_cache_ttl="invalid_duration")
 
     def test_failure_policy_validation(self):
         from typing import Any, cast
 
-        settings = CacheSettings(cache_failure_policy=cast(Any, " FAIL-OPEN "))
+        settings = Settings(cache_failure_policy=cast(Any, " FAIL-OPEN "))
         assert settings.cache_failure_policy == "fail-open"
 
         with pytest.raises(ValidationError):
-            CacheSettings(cache_failure_policy=cast(Any, "fail-silent"))
+            Settings(cache_failure_policy=cast(Any, "fail-silent"))
 
 
 class TestCircuitBreakerSettings:
-    """Tests for CircuitBreakerSettings model."""
+    """Tests for circuit breaker settings on Settings model."""
 
     def test_defaults(self):
-        settings = CircuitBreakerSettings()
+        settings = Settings()
         assert settings.circuit_breaker_enabled is True
         assert settings.circuit_breaker_errors_rate == 50
         assert settings.circuit_breaker_period == "60s"
@@ -142,24 +137,24 @@ class TestCircuitBreakerSettings:
 
     def test_errors_rate_validation(self):
         with pytest.raises(ValidationError):
-            CircuitBreakerSettings(circuit_breaker_errors_rate=0)
+            Settings(circuit_breaker_errors_rate=0)
         with pytest.raises(ValidationError):
-            CircuitBreakerSettings(circuit_breaker_errors_rate=100)
+            Settings(circuit_breaker_errors_rate=100)
 
     def test_period_and_ttl_validation(self):
         with pytest.raises(ValidationError):
-            CircuitBreakerSettings(circuit_breaker_period="0s")
+            Settings(circuit_breaker_period="0s")
         with pytest.raises(ValidationError):
-            CircuitBreakerSettings(circuit_breaker_ttl="0s")
+            Settings(circuit_breaker_ttl="0s")
         with pytest.raises(ValidationError):
-            CircuitBreakerSettings(circuit_breaker_period="not_a_ttl")
+            Settings(circuit_breaker_period="not_a_ttl")
 
 
 class TestRateLimitSettings:
-    """Tests for RateLimitSettings model."""
+    """Tests for rate limiting settings on Settings model."""
 
     def test_defaults(self):
-        settings = RateLimitSettings()
+        settings = Settings()
         assert settings.rate_limit_enabled is False
         assert settings.rate_limit == 0
         assert settings.rate_limit_period == "60s"
@@ -167,11 +162,11 @@ class TestRateLimitSettings:
 
     def test_validation(self):
         with pytest.raises(ValidationError):
-            RateLimitSettings(rate_limit=-1)
+            Settings(rate_limit=-1)
         with pytest.raises(ValidationError):
-            RateLimitSettings(rate_limit_period="0s")
+            Settings(rate_limit_period="0s")
         # "0s"/"" normalize to None (disabled) rather than raising
-        assert RateLimitSettings(rate_limit_ttl="0s").rate_limit_ttl is None
+        assert Settings(rate_limit_ttl="0s").rate_limit_ttl is None
 
 
 class TestCompositeSettings:
@@ -185,7 +180,7 @@ class TestCompositeSettings:
         assert settings.rate_limit_enabled is False
         assert settings.circuit_breaker_period == "60s"
 
-    def test_kwarg_distribution(self):
+    def test_kwarg_initialization(self):
         settings = Settings(
             port=9191,
             cache_url="redis://localhost",
@@ -193,9 +188,8 @@ class TestCompositeSettings:
             rate_limit=100,
         )
         assert settings.port == 9191
-        assert settings.proxy.port == 9191
-        assert settings.cache.cache_url == "redis://localhost"
-        assert settings.circuit_breaker.circuit_breaker_errors_rate == 75
+        assert settings.cache_url == "redis://localhost"
+        assert settings.circuit_breaker_errors_rate == 75
         assert settings.rate_limit == 100
 
     def test_get_settings_cached(self):
@@ -208,50 +202,45 @@ class TestCompositeSettings:
         assert get_settings() is not settings
         reset_settings_cache()
 
-    def test_prefixed_env_wins_over_legacy(self, monkeypatch):
+    def test_prefixed_env(self, monkeypatch):
         monkeypatch.setenv("TRIO_HTTP_PROXY_PORT", "2222")
-        monkeypatch.setenv("PORT", "1111")
-        assert ProxySettings().port == 2222
         assert Settings().port == 2222
 
-    def test_env_file_forwarded_to_groups(self, tmp_path, monkeypatch):
+    def test_env_file_support(self, tmp_path, monkeypatch):
         env_file = tmp_path / "test.env"
-        env_file.write_text("MAXREQSZ=424242\nUNRELATED_VAR=zzz\n")
-        monkeypatch.delenv("MAXREQSZ", raising=False)
+        env_file.write_text("TRIO_HTTP_PROXY_MAXREQSZ=424242\nUNRELATED_VAR=zzz\n")
+        monkeypatch.delenv("TRIO_HTTP_PROXY_MAXREQSZ", raising=False)
         settings = Settings(_env_file=str(env_file))
-        assert settings.proxy.maxreqsz == 424242
-        assert settings.cache.cache_url == "mem://"
+        assert settings.maxreqsz == 424242
+        assert settings.cache_url == "mem://"
 
     def test_env_file_none_disables_dotenv(self, tmp_path, monkeypatch):
         env_file = tmp_path / "override.env"
-        env_file.write_text("MAXREQSZ=424242\n")
-        monkeypatch.delenv("MAXREQSZ", raising=False)
-        assert Settings(_env_file=None).proxy.maxreqsz == 16384
+        env_file.write_text("TRIO_HTTP_PROXY_MAXREQSZ=424242\n")
+        monkeypatch.delenv("TRIO_HTTP_PROXY_MAXREQSZ", raising=False)
+        assert Settings(_env_file=None).maxreqsz == 16384
 
     def test_settings_are_frozen(self):
         settings = Settings()
         with pytest.raises(ValidationError):
-            settings.proxy.port = 1
+            settings.port = 1  # type: ignore[misc]
 
-    def test_unknown_kwarg_rejected_with_hint(self):
+    def test_unknown_kwarg_rejected(self):
         with pytest.raises(ValidationError):
-            Settings(potr=1)
+            Settings(potr=1)  # type: ignore[call-arg]
 
-    def test_flat_kwarg_and_group_collision_rejected(self):
+    def test_legacy_submodel_kwarg_rejected(self):
         with pytest.raises(ValidationError):
-            Settings(port=1, proxy=ProxySettings(port=2))
+            Settings(port=1, proxy=1)  # type: ignore[call-arg]
 
-    def test_stray_group_env_vars_do_not_crash_composite(self, monkeypatch):
-        # PROXY/CACHE name no settings field, so the env source ignores them.
+    def test_stray_env_vars_do_not_crash(self, monkeypatch):
         monkeypatch.setenv("PROXY", "not-a-settings-object")
         monkeypatch.setenv("CACHE", "banana")
-        monkeypatch.setenv("RATE_LIMIT", "7")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_RATE_LIMIT", "7")
         settings = Settings()
         assert settings.port == 8080
         assert settings.rate_limit == 7
-        # an invalid value for a real field fails fast at construction, but
-        # importing the package (module import time) never reads the env.
-        monkeypatch.setenv("RATE_LIMIT", "banana")
+        monkeypatch.setenv("TRIO_HTTP_PROXY_RATE_LIMIT", "banana")
         with pytest.raises(ValidationError):
             Settings()
 
@@ -264,22 +253,22 @@ class TestCompositeSettings:
             capture_output=True,
             text=True,
             check=False,
-            env={"PORT": "abc", "PATH": "/usr/bin"},
+            env={"TRIO_HTTP_PROXY_PORT": "abc", "PATH": "/usr/bin"},
         )
         assert result.returncode == 0, result.stderr
 
     def test_infinite_and_nan_timeouts_rejected(self):
         with pytest.raises(ValidationError):
-            ProxySettings(pipe_idle_timeout=float("inf"))
+            Settings(pipe_idle_timeout=float("inf"))
         with pytest.raises(ValidationError):
-            ProxySettings(connect_read_timeout=float("nan"))
+            Settings(connect_read_timeout=float("nan"))
 
 
 class TestIntegration:
     """Tests for settings integration with ProxyCache and CircuitBreakerManager."""
 
     def test_circuit_breaker_manager_accepts_settings(self):
-        cb_settings = CircuitBreakerSettings(
+        cb_settings = Settings(
             circuit_breaker_errors_rate=30,
             circuit_breaker_period="120s",
             circuit_breaker_ttl="45s",
@@ -308,13 +297,13 @@ class TestIntegration:
         assert cache.rate_limit == 50
         assert cache.rate_limit_period_sec == 30.0
 
-    def test_proxy_cache_accepts_cache_settings(self):
-        cache_settings = CacheSettings(
+    def test_proxy_cache_accepts_settings_with_failure_policy(self):
+        settings = Settings(
             cache_url="mem://test",
             cache_namespace="test_ns",
             cache_failure_policy="fail-closed",
         )
-        cache = ProxyCache(settings=cache_settings)
+        cache = ProxyCache(settings=settings)
         assert cache.cache_url == "mem://test"
         assert cache.namespace == "test_ns"
         assert cache.failure_policy == "fail-closed"
@@ -324,55 +313,59 @@ class TestDurationSemantics:
     """Uniform duration-string handling across settings groups."""
 
     def test_dns_cache_ttl_zero_and_empty_mean_disabled(self):
-        assert CacheSettings(dns_cache_ttl="0s").dns_cache_ttl_seconds == 0.0
-        assert CacheSettings(dns_cache_ttl="").dns_cache_ttl == "0s"
-        assert CacheSettings(dns_cache_ttl="").dns_cache_ttl_seconds == 0.0
-        assert CacheSettings(dns_cache_ttl=" 5m ").dns_cache_ttl_seconds == 300.0
+        assert Settings(dns_cache_ttl="0s").dns_cache_ttl_seconds == 0.0
+        assert Settings(dns_cache_ttl="").dns_cache_ttl == "0s"
+        assert Settings(dns_cache_ttl="").dns_cache_ttl_seconds == 0.0
+        assert Settings(dns_cache_ttl=" 5m ").dns_cache_ttl_seconds == 300.0
 
     def test_rate_limit_ttl_none_empty_zero_mean_disabled(self):
-        assert RateLimitSettings().rate_limit_ttl is None
-        assert RateLimitSettings(rate_limit_ttl="").rate_limit_ttl is None
-        assert RateLimitSettings(rate_limit_ttl="0s").rate_limit_ttl is None
-        assert RateLimitSettings(rate_limit_ttl=None).rate_limit_ttl_seconds is None
-        assert RateLimitSettings(rate_limit_ttl="90s").rate_limit_ttl_seconds == 90.0
+        assert Settings().rate_limit_ttl is None
+        assert Settings(rate_limit_ttl="").rate_limit_ttl is None
+        assert Settings(rate_limit_ttl="0s").rate_limit_ttl is None
+        assert Settings(rate_limit_ttl=None).rate_limit_ttl_seconds is None
+        assert Settings(rate_limit_ttl="90s").rate_limit_ttl_seconds == 90.0
 
     def test_positive_periods_parsed_once_into_seconds(self):
-        cb = CircuitBreakerSettings(
-            circuit_breaker_period="2m", circuit_breaker_ttl="1h"
-        )
+        cb = Settings(circuit_breaker_period="2m", circuit_breaker_ttl="1h")
         assert cb.circuit_breaker_period_seconds == 120.0
         assert cb.circuit_breaker_ttl_seconds == 3600.0
-        rl = RateLimitSettings(rate_limit_period="5m")
+        rl = Settings(rate_limit_period="5m")
         assert rl.rate_limit_period_seconds == 300.0
 
     def test_empty_period_rejected(self):
         with pytest.raises(ValidationError):
-            CircuitBreakerSettings(circuit_breaker_period="   ")
+            Settings(circuit_breaker_period="   ")
         with pytest.raises(ValidationError):
-            RateLimitSettings(rate_limit_period="")
+            Settings(rate_limit_period="")
 
     def test_invalid_durations_rejected_with_field_names(self):
         for bad in ("-5s", "0.5s", "1w", "forever"):
             with pytest.raises(ValidationError, match="circuit_breaker_ttl"):
-                CircuitBreakerSettings(circuit_breaker_ttl=bad)
+                Settings(circuit_breaker_ttl=bad)
 
 
 class TestProxyCacheDurationIntegration:
     """ProxyCache consumes uniform duration semantics."""
 
     def test_rate_limit_ttl_falls_back_to_period(self):
-        cache = ProxyCache(rate_limit=10, rate_limit_period="30s", rate_limit_ttl=None)
+        cache = ProxyCache(
+            settings=Settings(
+                rate_limit=10, rate_limit_period="30s", rate_limit_ttl=None
+            )
+        )
         assert cache.rate_limit_ttl_sec == 30.0
 
     def test_rate_limit_ttl_disabled_values_fall_back(self):
         for ttl in ("", "0s"):
             cache = ProxyCache(
-                rate_limit=10, rate_limit_period="45s", rate_limit_ttl=ttl
+                settings=Settings(
+                    rate_limit=10, rate_limit_period="45s", rate_limit_ttl=ttl
+                )
             )
             assert cache.rate_limit_ttl_sec == 45.0
 
     def test_proxy_cache_rejects_invalid_durations(self):
-        with pytest.raises(ValueError, match="rate_limit_period"):
-            ProxyCache(rate_limit_period="1w")
-        with pytest.raises(ValueError, match="dns_cache_ttl"):
-            ProxyCache(dns_cache_ttl="soon")
+        with pytest.raises(ValidationError, match="rate_limit_period"):
+            ProxyCache(settings=Settings(rate_limit_period="1w"))
+        with pytest.raises(ValidationError, match="dns_cache_ttl"):
+            ProxyCache(settings=Settings(dns_cache_ttl="soon"))

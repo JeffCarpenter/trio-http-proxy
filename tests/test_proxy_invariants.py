@@ -375,7 +375,7 @@ async def test_invariant_7_overall_connect_timeout_bounded(mock_clock):
         async def check_circuit(self, host: str, port: int):
             pass
 
-        async def record_connection_result(self, host: str, port: int, exc: object):
+        async def record_connection_result(self, _record: object):
             pass
 
     await test_client.send_all(connect_request(target=b"multi.example.com:443"))

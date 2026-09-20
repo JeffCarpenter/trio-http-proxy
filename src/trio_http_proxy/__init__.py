@@ -1,30 +1,43 @@
 from . import circuit_breaker, config, connection, errors
 from .cache import (
-    CacheBackendUnavailable,
-    CircuitBreakerManager,
-    CircuitBreakerOpen,
-    CircuitPermit,
-    CircuitState,
-    DestinationCircuitBreaker,
     LifecycleState,
     ProxyCache,
     ProxyCacheBuilder,
     ProxyCacheProtocol,
-    RateLimitError,
     get_client_key,
     get_default_proxy_cache,
 )
+from .circuit_breaker import (
+    CircuitBreakerManager,
+    CircuitPermit,
+    CircuitState,
+    DestinationCircuitBreaker,
+)
 from .config import (
-    NAMESPACE_PATTERN,
-    CacheSettings,
-    CircuitBreakerSettings,
-    ProxySettings,
-    RateLimitSettings,
     Settings,
     get_settings,
     normalize_failure_policy,
+    normalize_optional_duration,
     parse_duration_seconds,
+    validate_duration_string,
     validate_namespace,
+)
+from .connection import (
+    CV_CLIENT_STREAM,
+    CV_CONN_ID,
+    CV_DEST_STREAM,
+    CV_DESTHOST,
+    CV_PIPE_FROM,
+    ConnectionFilter,
+    ConnectionLoggerAdapter,
+    format_conn_prefix,
+)
+from .errors import (
+    CacheBackendUnavailable,
+    CircuitBreakerOpen,
+    ProxyProtocolError,
+    RateLimitError,
+    RequestTooLargeError,
 )
 from .http import (
     http_200_connection_established,
@@ -37,28 +50,19 @@ from .http import (
     http_504_gateway_timeout,
     http_method_connect,
 )
+from .protocol import process_as_connect_request
 from .proxy import (
-    CV_CLIENT_STREAM,
-    CV_CONN_ID,
-    CV_DEST_STREAM,
-    CV_DESTHOST,
-    CV_PIPE_FROM,
-    ConnectionFilter,
-    ConnectionLoggerAdapter,
+    ConnectionRecord,
+    ConnectionResultBuilder,
     ProxyBuilder,
-    ProxyProtocolError,
-    RequestTooLargeError,
-    format_conn_prefix,
     get_conn_limiter,
     http_proxy,
     main,
-    pipe,
-    pipe_with_timeout,
-    process_as_connect_request,
     reset_conn_limiter,
     start_server,
     tunnel,
 )
+from .streaming import pipe, pipe_with_timeout
 
 __all__ = [
     "CV_CLIENT_STREAM",
@@ -66,16 +70,15 @@ __all__ = [
     "CV_DESTHOST",
     "CV_DEST_STREAM",
     "CV_PIPE_FROM",
-    "NAMESPACE_PATTERN",
     "CacheBackendUnavailable",
-    "CacheSettings",
     "CircuitBreakerManager",
     "CircuitBreakerOpen",
-    "CircuitBreakerSettings",
     "CircuitPermit",
     "CircuitState",
     "ConnectionFilter",
     "ConnectionLoggerAdapter",
+    "ConnectionRecord",
+    "ConnectionResultBuilder",
     "DestinationCircuitBreaker",
     "LifecycleState",
     "ProxyBuilder",
@@ -83,9 +86,7 @@ __all__ = [
     "ProxyCacheBuilder",
     "ProxyCacheProtocol",
     "ProxyProtocolError",
-    "ProxySettings",
     "RateLimitError",
-    "RateLimitSettings",
     "RequestTooLargeError",
     "Settings",
     "circuit_breaker",
@@ -109,6 +110,7 @@ __all__ = [
     "http_proxy",
     "main",
     "normalize_failure_policy",
+    "normalize_optional_duration",
     "parse_duration_seconds",
     "pipe",
     "pipe_with_timeout",
@@ -116,5 +118,6 @@ __all__ = [
     "reset_conn_limiter",
     "start_server",
     "tunnel",
+    "validate_duration_string",
     "validate_namespace",
 ]

@@ -42,24 +42,12 @@ class LifecycleState(enum.Enum):
 T = TypeVar("T")
 
 from .config import (
-    NAMESPACE_PATTERN,
     Settings,
     normalize_failure_policy,
     parse_duration_seconds,
     validate_namespace,
 )
 from .config.builder import ProxyCacheBuilder
-
-
-def normalize_optional_duration_local(value: str | None) -> str | None:
-    if value is None:
-        return None
-    stripped = value.strip()
-    if not stripped or stripped == "0s":
-        return None
-    parse_duration_seconds(stripped, field="rate_limit_ttl")
-    return stripped
-
 
 BACKEND_EXCEPTIONS: tuple[type[Exception], ...] = (
     cashews.exceptions.CacheError,
@@ -78,11 +66,6 @@ class ConnectionRecord:
     port: int
     error: Exception | None = None
     permit: CircuitPermit | None = None
-
-    @property
-    def exc(self) -> Exception | None:
-        """Backward-compatible alias for error."""
-        return self.error
 
     @property
     def is_success(self) -> bool:
@@ -104,12 +87,10 @@ class ConnectionResultBuilder:
         port: int | None = None,
         error: Exception | None = None,
         permit: CircuitPermit | None = None,
-        *,
-        exc: Exception | None = None,
     ) -> None:
         self._host: str | None = host
         self._port: int | None = port
-        self._error: Exception | None = exc if exc is not None else error
+        self._error: Exception | None = error
         self._permit: CircuitPermit | None = permit
 
     def with_host(self, host: str) -> Self:
@@ -127,10 +108,6 @@ class ConnectionResultBuilder:
 
     def with_error(self, error: Exception | None) -> Self:
         self._error = error
-        return self
-
-    def with_exc(self, exc: Exception | None) -> Self:
-        self._error = exc
         return self
 
     def with_success(self) -> Self:
@@ -158,16 +135,7 @@ class ConnectionResultBuilder:
         if proxy_cache is None:
             return
         record = self.build()
-        if hasattr(proxy_cache, "record_connection_result"):
-            try:
-                await proxy_cache.record_connection_result(record)
-            except TypeError as err:
-                if err.__traceback__ is not None and err.__traceback__.tb_next is None:
-                    await proxy_cache.record_connection_result(
-                        record.host, record.port, record.error
-                    )
-                else:
-                    raise
+        await proxy_cache.record_connection_result(record)
 
 
 @runtime_checkable
@@ -176,10 +144,7 @@ class ProxyCacheProtocol(Protocol):
 
     async def record_connection_result(
         self,
-        result: ConnectionRecord | ConnectionResultBuilder | str,
-        port: int | None = None,
-        exc: Exception | None = None,
-        permit: CircuitPermit | None = None,
+        record: ConnectionRecord | ConnectionResultBuilder,
     ) -> None:
         """Record a connection outcome for circuit breaker tracking."""
         ...
@@ -230,60 +195,30 @@ class ProxyCache:
 
     def __init__(
         self,
-        settings: Settings | ProxyCacheBuilder | str | None = None,
-        *,
-        builder: ProxyCacheBuilder | None = None,
+        settings: Settings | None = None,
         **kwargs: Any,
     ) -> None:
-        if "url" in kwargs and "cache_url" not in kwargs:
-            kwargs["cache_url"] = kwargs.pop("url")
-
-        if isinstance(settings, str):
-            kwargs["cache_url"] = settings
-            settings = None
-
-        if isinstance(settings, ProxyCacheBuilder):
-            builder = settings
-            settings = None
-
-        if builder is not None:
-            if settings is not None or kwargs:
-                raise ValueError(
-                    "Cannot specify both builder and settings/kwargs to ProxyCache"
-                )
-            resolved_settings = builder.build_settings()
-        elif settings is not None:
+        if settings is not None:
             if kwargs:
-                raise ValueError(
-                    "Cannot pass both settings and keyword arguments to ProxyCache"
-                )
-            resolved_settings = settings
+                self.settings = settings.model_copy(update=kwargs)
+            else:
+                self.settings = settings
         elif kwargs:
-            resolved_settings = ProxyCacheBuilder(**kwargs).build_settings()
+            mapped = dict(kwargs)
+            if "namespace" in mapped and "cache_namespace" not in mapped:
+                mapped["cache_namespace"] = mapped.pop("namespace")
+            if "failure_policy" in mapped and "cache_failure_policy" not in mapped:
+                mapped["cache_failure_policy"] = mapped.pop("failure_policy")
+            if "enabled" in mapped and "cache_enabled" not in mapped:
+                mapped["cache_enabled"] = mapped.pop("enabled")
+            self.settings = Settings(**mapped)
         else:
-            resolved_settings = ProxyCacheBuilder().build_settings()
-
-        self.settings: Settings = resolved_settings
-        s = resolved_settings
-
-        # Semantic boundary validation in constructor
-        _stripped_namespace = validate_namespace(s.cache_namespace)
-        if not 1 <= s.circuit_breaker_errors_rate <= 99:
-            raise ValueError(
-                f"circuit_breaker_errors_rate must be between 1 and 99, got {s.circuit_breaker_errors_rate}"
-            )
-        if s.circuit_breaker_min_calls < 1:
-            raise ValueError(
-                f"circuit_breaker_min_calls must be >= 1, got {s.circuit_breaker_min_calls}"
-            )
-        if s.rate_limit < 0:
-            raise ValueError(f"rate_limit must be >= 0, got {s.rate_limit}")
-        if s.startup_timeout <= 0:
-            raise ValueError(f"startup_timeout must be > 0, got {s.startup_timeout}")
+            self.settings = Settings()
+        s = self.settings
 
         self.cache_url: str = s.cache_url
         self.enabled: bool = s.cache_enabled
-        self.namespace: str = _stripped_namespace
+        self.namespace: str = s.cache_namespace
         self._explicit_dns_cache_ttl: bool = "dns_cache_ttl" in s.model_fields_set
         self.dns_cache_ttl: str = s.dns_cache_ttl
         self.circuit_breaker_enabled: bool = s.circuit_breaker_enabled
@@ -295,18 +230,16 @@ class ProxyCache:
         self.rate_limit_enabled: bool = s.rate_limit_enabled
         self.rate_limit: int = s.rate_limit
         self.rate_limit_period: str = s.rate_limit_period
-        _rl_ttl = normalize_optional_duration_local(s.rate_limit_ttl)
         self.rate_limit_ttl: str | None = (
-            _rl_ttl if _rl_ttl is not None else self.rate_limit_period
+            s.rate_limit_ttl if s.rate_limit_ttl is not None else self.rate_limit_period
         )
         self.rate_limit_period_sec: float = s.rate_limit_period_seconds
-        if _rl_ttl is not None and s.rate_limit_ttl_seconds is not None:
+        if s.rate_limit_ttl is not None and s.rate_limit_ttl_seconds is not None:
             self.rate_limit_ttl_sec: float = s.rate_limit_ttl_seconds
         else:
             self.rate_limit_ttl_sec: float = s.rate_limit_period_seconds
         self.dns_cache_ttl_sec: float = s.dns_cache_ttl_seconds
-        self.failure_policy: str = s.cache_failure_policy
-        self.cache_failure_policy: str = self.failure_policy
+        self.cache_failure_policy: str = s.cache_failure_policy
         self.probe_interval: float = s.probe_interval
         self.startup_timeout: float = s.startup_timeout
 
@@ -335,6 +268,10 @@ class ProxyCache:
         self._resolve_dns_fn: Callable[[str], Coroutine[Any, Any, list[str]]] | None = (
             None
         )
+
+    @property
+    def failure_policy(self) -> str:
+        return self.cache_failure_policy
 
     def _has_backend_features(self) -> bool:
         """True if remote backend caching features are active and not explicitly disabled."""
@@ -810,32 +747,24 @@ class ProxyCache:
         """Return a new ConnectionResultBuilder initialized with optional target."""
         return ConnectionResultBuilder(host=host, port=port)
 
+    async def aclose(self) -> None:
+        """Asynchronously stop and release background cache resources."""
+        await trio.to_thread.run_sync(self.stop)
+
     async def record_connection_result(
         self,
-        result: ConnectionRecord | ConnectionResultBuilder | str,
-        port: int | None = None,
-        exc: Exception | None = None,
-        permit: CircuitPermit | None = None,
+        record: ConnectionRecord | ConnectionResultBuilder,
     ) -> None:
         """Record a connection result in the Trio-native circuit breaker."""
         self._ensure_started()
         if not self.circuit_breaker_enabled:
             return
-        if isinstance(result, ConnectionRecord):
-            record = result
-        elif isinstance(result, ConnectionResultBuilder):
-            record = result.build()
+        if isinstance(record, ConnectionResultBuilder):
+            rec = record.build()
         else:
-            record = (
-                ConnectionResultBuilder()
-                .with_host(result)
-                .with_port(port)  # type: ignore[arg-type]
-                .with_error(exc)
-                .with_permit(permit)
-                .build()
-            )
+            rec = record
         self._circuit_manager.record_result(
-            record.host, record.port, record.error, permit=record.permit
+            rec.host, rec.port, rec.error, permit=rec.permit
         )
 
     async def check_rate_limit(self, key: str) -> None:
@@ -956,7 +885,6 @@ def get_default_proxy_cache() -> ProxyCache:
 
 __all__ = [
     "BACKEND_EXCEPTIONS",
-    "NAMESPACE_PATTERN",
     "ConnectionRecord",
     "ConnectionResultBuilder",
     "LifecycleState",
@@ -966,6 +894,5 @@ __all__ = [
     "get_client_key",
     "get_default_proxy_cache",
     "normalize_failure_policy",
-    "normalize_optional_duration_local",
     "validate_namespace",
 ]

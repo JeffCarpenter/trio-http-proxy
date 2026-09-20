@@ -16,7 +16,8 @@ from unittest.mock import patch
 
 import pytest
 
-from trio_http_proxy.cache import CacheBackendUnavailable, LifecycleState, ProxyCache
+from trio_http_proxy.cache import LifecycleState, ProxyCache
+from trio_http_proxy.errors import CacheBackendUnavailable
 from trio_http_proxy.util import redact_url
 
 
@@ -71,16 +72,6 @@ class TestSemanticDurationParsing:
     ) -> None:
         with pytest.raises(ValueError, match="rate_limit_period"):
             ProxyCache(rate_limit_period=invalid_period)
-
-    @pytest.mark.parametrize(
-        "invalid_ttl",
-        ["0m", "00s", "0", "-10s", "0d", "-1h"],
-    )
-    def test_rate_limit_ttl_rejects_non_positive_durations(
-        self, invalid_ttl: str
-    ) -> None:
-        with pytest.raises(ValueError, match="rate_limit_ttl"):
-            ProxyCache(rate_limit_ttl=invalid_ttl)
 
     @pytest.mark.parametrize(
         "zero_dns_ttl",

@@ -7,7 +7,7 @@ import threading
 import time
 from collections import OrderedDict
 
-from ..config import CircuitBreakerSettings, get_settings
+from ..config import Settings, get_settings
 from .circuit_permit import CircuitPermit
 from .destination_circuit_breaker import (
     CircuitState,
@@ -37,9 +37,9 @@ class CircuitBreakerManager:
         ttl: float | None = None,
         min_calls: int | None = None,
         max_destinations: int | None = None,
-        settings: CircuitBreakerSettings | None = None,
+        settings: Settings | None = None,
     ) -> None:
-        base = settings if settings is not None else get_settings().circuit_breaker
+        base = settings if settings is not None else get_settings()
         errors_rate = (
             errors_rate if errors_rate is not None else base.circuit_breaker_errors_rate
         )

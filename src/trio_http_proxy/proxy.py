@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import errno
+import inspect
 import logging
 from contextlib import nullcontext
 from functools import cache, partial
@@ -21,13 +22,10 @@ import trio
 
 from . import http
 from .cache import (
-    CacheBackendUnavailable,
-    CircuitBreakerOpen,
-    CircuitPermit,
-    RateLimitError,
     get_client_key,
 )
-from .config import ProxySettings, Settings, get_settings
+from .circuit_breaker import CircuitPermit
+from .config import Settings, get_settings
 from .config.builder import ProxyCacheBuilder, SettingsBuilderMixin
 from .connection import (
     _DEFAULT_PROXY_CACHE_SENTINEL,
@@ -35,14 +33,19 @@ from .connection import (
     CV_CONN_ID,
     CV_DEST_STREAM,
     CV_DESTHOST,
-    CV_PIPE_FROM,
     CV_PROXY_CACHE,
     ConnectionFilter,
     ConnectionLoggerAdapter,
     _conn_ids,
     format_conn_prefix,
 )
-from .errors import ProxyProtocolError, RequestTooLargeError
+from .errors import (
+    CacheBackendUnavailable,
+    CircuitBreakerOpen,
+    ProxyProtocolError,
+    RateLimitError,
+    RequestTooLargeError,
+)
 from .protocol import process_as_connect_request
 from .proxy_cache import (
     ConnectionRecord,
@@ -50,7 +53,7 @@ from .proxy_cache import (
     ProxyCacheProtocol,
     get_default_proxy_cache,
 )
-from .streaming import pipe, pipe_with_timeout
+from .streaming import pipe_with_timeout
 
 
 @cache
@@ -80,7 +83,10 @@ def _http_429_response(retry_after: Any = None) -> bytes:
                 f"HTTP/1.1 429 Too Many Requests\r\nRetry-After: {seconds}\r\n"
                 f"Connection: close\r\nContent-Length: 0\r\n\r\n"
             ).encode()
-    return http.http_429_too_many_requests % retry_after
+    return (
+        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n"
+        b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+    )
 
 
 LOGGER_NAME = "trio_http_proxy"
@@ -89,6 +95,8 @@ _raw_logger.addHandler(logging.NullHandler())
 _raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
+_DEFAULT_LIMITER = object()
+
 
 async def http_proxy(
     client_stream,
@@ -96,7 +104,7 @@ async def http_proxy(
     _connect=trio.open_tcp_stream,
     idle_timeout: float | None = None,
     send_timeout: float | None = None,
-    limiter: trio.CapacityLimiter | None = None,
+    limiter: trio.CapacityLimiter | None | object = _DEFAULT_LIMITER,
     proxy_cache: ProxyCacheProtocol | None | Any = _DEFAULT_PROXY_CACHE_SENTINEL,
 ):
     _proxy_cfg = get_settings()
@@ -106,7 +114,13 @@ async def http_proxy(
     send_timeout = (
         send_timeout if send_timeout is not None else _proxy_cfg.pipe_send_timeout
     )
-    limiter = limiter if limiter is not None else get_conn_limiter()
+    active_limiter: trio.CapacityLimiter | None = (
+        get_conn_limiter()
+        if limiter is _DEFAULT_LIMITER
+        else limiter
+        if isinstance(limiter, trio.CapacityLimiter)
+        else None
+    )
     if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
         cv_cache = CV_PROXY_CACHE.get()
         if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
@@ -115,7 +129,7 @@ async def http_proxy(
             proxy_cache = get_default_proxy_cache()
     CV_CONN_ID.set(_nextid())
     CV_CLIENT_STREAM.set(client_stream)
-    limiter_ctx = limiter if limiter is not None else nullcontext()
+    limiter_ctx = active_limiter if active_limiter is not None else nullcontext()
     try:
         async with client_stream, limiter_ctx:
             if proxy_cache is not None:
@@ -379,7 +393,7 @@ class ProxyBuilder(SettingsBuilderMixin):
         cache_token = CV_PROXY_CACHE.set(proxy_cache)
         try:
             if proxy_cache is not None and hasattr(proxy_cache, "start"):
-                proxy_cache.start()
+                await trio.to_thread.run_sync(proxy_cache.start)
             logger.info(
                 "* Starting %s on port %s...",
                 getattr(self._server, "__name__", str(self._server)),
@@ -394,47 +408,35 @@ class ProxyBuilder(SettingsBuilderMixin):
                     proxy_cache=proxy_cache,
                 )
             else:
-                code = getattr(self._server, "__code__", None)
-                if (
-                    code is not None
-                    and "proxy_cache"
-                    in code.co_varnames[: code.co_argcount + code.co_kwonlyargcount]
+                try:
+                    parameters = inspect.signature(handler).parameters.values()
+                except TypeError, ValueError:
+                    parameters = ()
+                if any(
+                    parameter.name == "proxy_cache"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
                 ):
-                    handler = partial(self._server, proxy_cache=proxy_cache)
+                    handler = partial(handler, proxy_cache=proxy_cache)
 
-            try:
-                if _serve is not None:
-                    code = getattr(_serve, "__code__", None)
-                    if (
-                        code is not None
-                        and "task_status"
-                        in code.co_varnames[: code.co_argcount + code.co_kwonlyargcount]
-                    ):
-                        await _serve(handler, port, task_status=task_status)
-                    else:
-                        try:
-                            await _serve(handler, port, task_status=task_status)
-                        except TypeError as err:
-                            if (
-                                err.__traceback__ is not None
-                                and err.__traceback__.tb_next is None
-                            ):
-                                await _serve(handler, port)
-                            else:
-                                raise
-                else:
-                    await _serve_tcp_gated(
-                        handler,
-                        port,
-                        limiter=limiter,
-                        task_status=task_status,
-                    )
-            except* KeyboardInterrupt:
-                logger.info("Goodbye for now.")
+            if _serve is not None:
+                try:
+                    await _serve(handler, port, task_status=task_status)
+                except TypeError:
+                    await _serve(handler, port)
+            else:
+                await _serve_tcp_gated(
+                    handler,
+                    port,
+                    limiter=limiter,
+                    task_status=task_status,
+                )
+        except* KeyboardInterrupt:
+            logger.info("Goodbye for now.")
         finally:
             try:
                 if proxy_cache is not None and hasattr(proxy_cache, "stop"):
-                    proxy_cache.stop()
+                    await trio.to_thread.run_sync(proxy_cache.stop)
             finally:
                 CV_PROXY_CACHE.reset(cache_token)
 
@@ -459,37 +461,11 @@ async def start_server(
 
 async def _record_connection_result(
     proxy_cache: ProxyCacheProtocol | None | Any,
-    host_or_builder: str | ConnectionResultBuilder | ConnectionRecord,
-    port: int | None = None,
-    exc: Exception | None = None,
-    permit: CircuitPermit | None = None,
+    record: ConnectionRecord | ConnectionResultBuilder,
 ) -> None:
     if proxy_cache is None:
         return
-    if isinstance(host_or_builder, ConnectionRecord):
-        record = host_or_builder
-    elif isinstance(host_or_builder, ConnectionResultBuilder):
-        record = host_or_builder.build()
-    else:
-        record = (
-            ConnectionResultBuilder()
-            .with_host(host_or_builder)
-            .with_port(port)  # type: ignore[arg-type]
-            .with_error(exc)
-            .with_permit(permit)
-            .build()
-        )
-
-    if hasattr(proxy_cache, "record_connection_result"):
-        try:
-            await proxy_cache.record_connection_result(record)
-        except TypeError as err:
-            if err.__traceback__ is not None and err.__traceback__.tb_next is None:
-                await proxy_cache.record_connection_result(
-                    record.host, record.port, record.error
-                )
-            else:
-                raise
+    await proxy_cache.record_connection_result(record)
 
 
 async def tunnel(
@@ -516,14 +492,9 @@ async def tunnel(
         else:
             proxy_cache = get_default_proxy_cache()
     try:
-        connect_res = await process_as_connect_request(
+        desthost, destport, trailing_data = await process_as_connect_request(
             client_stream, read_timeout=read_timeout
         )
-        if len(connect_res) == 3:
-            desthost, destport, trailing_data = connect_res
-        else:
-            desthost, destport = connect_res[0], connect_res[1]
-            trailing_data = b""
     except RequestTooLargeError:
         logger.warning(
             "Oversized CONNECT request, sending 414 to client...", exc_info=True
@@ -580,17 +551,12 @@ async def tunnel(
         target_hosts = [desthost]
         if proxy_cache is not None:
             try:
-                if hasattr(proxy_cache, "resolve_hosts"):
-                    target_hosts = await proxy_cache.resolve_hosts(desthost)
-                else:
-                    resolved = await proxy_cache.resolve_host(desthost)
-                    target_hosts = [resolved]
+                target_hosts = await proxy_cache.resolve_hosts(desthost)
             except OSError as exc:
-                if proxy_cache is not None:
-                    await _record_connection_result(
-                        proxy_cache, result_builder.with_error(exc)
-                    )
-                    permit_recorded = True
+                await _record_connection_result(
+                    proxy_cache, result_builder.with_error(exc)
+                )
+                permit_recorded = True
                 logger.warning(
                     "Could not resolve %s, sending 502 to client...",
                     desthost,
@@ -649,9 +615,10 @@ async def tunnel(
                     )
                     permit_recorded = True
                 logger.warning(
-                    "Could not connect to %s:%d, sending 502 to client...",
+                    "Could not connect to %s:%d (%s), sending 502 to client...",
                     desthost,
                     destport,
+                    last_exc,
                 )
                 try:
                     await client_stream.send_all(http.http_502_bad_gateway)
@@ -662,7 +629,6 @@ async def tunnel(
         if proxy_cache is not None:
             await _record_connection_result(proxy_cache, result_builder.with_success())
             permit_recorded = True
-
         dest_connected = True
     finally:
         if permit is not None and not permit_recorded:
@@ -681,7 +647,8 @@ async def tunnel(
         return dest_stream
     except BaseException:
         if dest_stream is not None:
-            await dest_stream.aclose()
+            with trio.CancelScope(shield=True):
+                await dest_stream.aclose()
         raise
 
 
@@ -705,30 +672,16 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "CV_CLIENT_STREAM",
-    "CV_CONN_ID",
-    "CV_DESTHOST",
-    "CV_DEST_STREAM",
-    "CV_PIPE_FROM",
-    "CV_PROXY_CACHE",
-    "ConnectionFilter",
-    "ConnectionLoggerAdapter",
     "ConnectionRecord",
     "ConnectionResultBuilder",
     "ProxyBuilder",
     "ProxyCacheBuilder",
     "ProxyCacheProtocol",
-    "ProxyProtocolError",
-    "ProxySettings",
-    "RequestTooLargeError",
     "format_conn_prefix",
     "get_conn_limiter",
     "get_default_proxy_cache",
     "http_proxy",
     "main",
-    "pipe",
-    "pipe_with_timeout",
-    "process_as_connect_request",
     "reset_conn_limiter",
     "start_server",
     "tunnel",

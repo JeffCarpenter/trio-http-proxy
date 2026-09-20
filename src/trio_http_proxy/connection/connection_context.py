@@ -8,13 +8,13 @@ from typing import Any
 
 import trio
 
-CV_CLIENT_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
+CV_CLIENT_STREAM: ContextVar[trio.abc.Stream | None] = ContextVar(
     "client_stream", default=None
 )
-CV_DEST_STREAM: ContextVar[trio.SocketStream | None] = ContextVar(
+CV_DEST_STREAM: ContextVar[trio.abc.Stream | None] = ContextVar(
     "dest_stream", default=None
 )
-CV_PIPE_FROM: ContextVar[trio.SocketStream | None] = ContextVar(
+CV_PIPE_FROM: ContextVar[trio.abc.ReceiveStream | None] = ContextVar(
     "pipe_from", default=None
 )
 CV_DESTHOST: ContextVar[str | None] = ContextVar("desthost", default=None)

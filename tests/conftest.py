@@ -32,26 +32,15 @@ async def dest_server_port(nursery: trio.Nursery) -> int:
 
 from trio_http_proxy.cache import ProxyCache, ProxyCacheBuilder
 from trio_http_proxy.config import (
-    CacheSettings,
-    CircuitBreakerSettings,
-    ProxySettings,
-    RateLimitSettings,
     Settings,
     get_settings,
     reset_settings_cache,
 )
 from trio_http_proxy.proxy import reset_conn_limiter
 
-_SETTING_GROUPS = (
-    ProxySettings,
-    CacheSettings,
-    CircuitBreakerSettings,
-    RateLimitSettings,
-)
 _CONFIG_ENV_VARS = frozenset(
     name.upper()
-    for cls in _SETTING_GROUPS
-    for field in cls.model_fields
+    for field in Settings.model_fields
     for name in (field, "TRIO_HTTP_PROXY_" + field)
 )
 
@@ -74,28 +63,8 @@ def _clean_config_env(monkeypatch):
 
 
 @pytest.fixture
-def proxy_settings() -> ProxySettings:
-    return ProxySettings()
-
-
-@pytest.fixture
-def cache_settings() -> CacheSettings:
-    return CacheSettings()
-
-
-@pytest.fixture
-def circuit_breaker_settings() -> CircuitBreakerSettings:
-    return CircuitBreakerSettings()
-
-
-@pytest.fixture
-def rate_limit_settings() -> RateLimitSettings:
-    return RateLimitSettings()
-
-
-@pytest.fixture
 def settings() -> Settings:
-    """Fresh composite Settings (env isolated by _clean_config_env)."""
+    """Fresh Settings (env isolated by _clean_config_env)."""
     return Settings()
 
 

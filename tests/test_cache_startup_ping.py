@@ -16,7 +16,8 @@ When backend caching is enabled (enabled=True, cache_url non-empty):
 
 import pytest
 
-from trio_http_proxy.cache import CacheBackendUnavailable, ProxyCache
+from trio_http_proxy.cache import ProxyCache
+from trio_http_proxy.errors import CacheBackendUnavailable
 
 
 def test_startup_ping_fail_closed_connection_error_fails_fast_and_cleans_up(

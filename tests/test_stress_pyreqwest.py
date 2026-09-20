@@ -17,7 +17,7 @@ from pyreqwest.client import Client, ClientBuilder
 from pyreqwest.exceptions import PyreqwestError
 from pyreqwest.proxy import ProxyBuilder
 
-from trio_http_proxy.cache import CircuitBreakerOpen, RateLimitError
+from trio_http_proxy.errors import CircuitBreakerOpen, RateLimitError
 from trio_http_proxy.proxy import http_proxy
 
 
@@ -425,9 +425,7 @@ async def test_pyreqwest_stress_massive_rate_limit_stampede(
         async def resolve_hosts(self, host: str) -> list[str]:
             return [host]
 
-        async def record_connection_result(
-            self, _host: str, _port: int, _error: Exception | None
-        ) -> None:
+        async def record_connection_result(self, _record: object) -> None:
             pass
 
     cache = AtomicCountingRateLimitCache(allow_max=rate_limit_allow_count)
@@ -482,9 +480,7 @@ async def test_pyreqwest_stress_circuit_breaker_storm(
         async def resolve_hosts(self, host: str) -> list[str]:
             return [host]
 
-        async def record_connection_result(
-            self, _host: str, _port: int, _error: Exception | None
-        ) -> None:
+        async def record_connection_result(self, _record: object) -> None:
             pass
 
     async with spawn_proxy_and_origin(
