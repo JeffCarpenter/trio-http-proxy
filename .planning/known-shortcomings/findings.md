@@ -80,3 +80,13 @@ tracked rather than silently assumed away.
 - **`test_process_as_connect_request_enforces_max_size` only overflows via target
   length**, not via an oversized header (e.g. a huge `Host:` value) — a more realistic
   overflow vector in practice.
+
+## Architectural & Design Shortcomings (Perlis Epigram 9 & Separation of Concerns)
+
+Documented in detail in `.planning/2026-09-19-code-review-perlis-epigram-9/findings.md`:
+
+- **Severe Epigram 9 Violation (Data Structure Proliferation):** 14 bespoke data structures across `src/` (custom classes, dataclasses, enums, exceptions, and Pydantic models) with an average ratio of **1.21 functions per data structure** (e.g. `RateLimitSettings`, `CircuitBreakerSettings`, `CircuitState`, `LifecycleState`, and 4 single-exception classes).
+- **Configuration Friction & Forwarding Overhead:** Segmenting configuration into 4 sub-models forced `Settings` to implement **31 manual forwarding properties** and a 56-line `_raw_groups` reconciliation loop, while `ProxyCache.__init__` accepts **18 unpacked parameters**.
+- **Hot-Path Dynamic Reflection (`inspect.signature`):** `proxy._record_connection_result` inspects `proxy_cache.record_connection_result` at runtime via `inspect.signature` on every destination connection result instead of relying on a stable interface or `typing.Protocol`.
+- **Covert Dependency Injection via `contextvars.ContextVar`:** 7 global context variables in `connection_context.py` are used as side-channels to pass application dependencies (like `CV_PROXY_CACHE`) across call frames.
+- **Inverted Cohesion:** 4 single-exception files and 2 single-enum files exist in isolation, while `proxy.py` (777 lines, 5 distinct architectural responsibilities) and `proxy_cache.py` (843 lines) remain heavy monoliths.

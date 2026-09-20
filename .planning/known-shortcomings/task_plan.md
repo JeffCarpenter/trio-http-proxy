@@ -54,3 +54,9 @@
 12. Structured logging (replace print) — cosmetic, no bug risk. [x]
 13. Fuzz/property testing on process_as_connect_reqain payoff given h11 already does parsing.
 14. memory-stream internals coupling note, __main__ line coverage — doc-only / accept as-is, not worth fixing.
+
+# Tier 5 — Architectural & Design Refactoring (Perlis Epigram 9)
+15. Unify configuration into single model; eliminate 31 forwarding properties and 18-param signature.
+16. Replace hot-path `inspect.signature` with `typing.Protocol` for `ProxyCache`.
+17. Consolidate `errors/*.py` and standalone enums to restore module-level cohesion.
+18. Modularize `proxy.py` into `protocol.py` (HTTP CONNECT wire parsing) and `streaming.py` (duplex piping).
