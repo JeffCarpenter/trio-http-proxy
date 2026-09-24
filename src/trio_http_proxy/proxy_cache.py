@@ -12,6 +12,7 @@ import queue
 import socket
 import threading
 import time
+import warnings
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, Protocol, Self, TypeVar, cast, runtime_checkable
@@ -68,6 +69,22 @@ class ConnectionRecord:
     error: Exception | None = None
     permit: CircuitPermit | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.host, str) or not self.host.strip():
+            raise ValueError("host must be specified to build ConnectionRecord")
+        if (
+            not isinstance(self.port, int)
+            or isinstance(self.port, bool)
+            or not (1 <= self.port <= 65535)
+        ):
+            raise ValueError(f"port must be between 1 and 65535, got {self.port}")
+        if self.error is not None and self.permit is not None:
+            raise ValueError(
+                "ConnectionRecord cannot simultaneously hold both an error and a permit"
+            )
+        if self.host != self.host.strip():
+            object.__setattr__(self, "host", self.host.strip())
+
     @property
     def is_success(self) -> bool:
         """Return True if connection succeeded without error."""
@@ -80,7 +97,7 @@ class ConnectionRecord:
 
 
 class ConnectionResultBuilder:
-    """Fluent builder for constructing ConnectionRecord instances."""
+    """[Deprecated] Fluent builder for constructing ConnectionRecord instances."""
 
     def __init__(
         self,
@@ -89,6 +106,11 @@ class ConnectionResultBuilder:
         error: Exception | None = None,
         permit: CircuitPermit | None = None,
     ) -> None:
+        warnings.warn(
+            "ConnectionResultBuilder is deprecated; construct ConnectionRecord directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._host: str | None = host
         self._port: int | None = port
         self._error: Exception | None = error
@@ -124,10 +146,8 @@ class ConnectionResultBuilder:
             raise ValueError("host must be specified to build ConnectionRecord")
         if self._port is None:
             raise ValueError("port must be specified to build ConnectionRecord")
-        if not (1 <= self._port <= 65535):
-            raise ValueError(f"port must be between 1 and 65535, got {self._port}")
         return ConnectionRecord(
-            host=self._host.strip(),
+            host=self._host,
             port=self._port,
             error=self._error,
             permit=self._permit,
@@ -784,7 +804,12 @@ class ProxyCache:
         host: str | None = None,
         port: int | None = None,
     ) -> ConnectionResultBuilder:
-        """Return a new ConnectionResultBuilder initialized with optional target."""
+        """[Deprecated] Return a new ConnectionResultBuilder initialized with optional target."""
+        warnings.warn(
+            "ProxyCache.result_builder is deprecated; construct ConnectionRecord directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return ConnectionResultBuilder(host=host, port=port)
 
     async def aclose(self) -> None:

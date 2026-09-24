@@ -102,26 +102,23 @@ class CircuitBreakerManager:
         now = time.monotonic()
         # 1. Look for idle CLOSED breaker with empty calls (after pruning) and no in-flight probe (§6.14)
         for k, b in self._breakers.items():
-            with b._lock:
-                if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
-                    b._prune_calls(now)
-                    if len(b._calls) == 0:
-                        del self._breakers[k]
-                        return
+            if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
+                b._prune_calls(now)
+                if len(b._calls) == 0:
+                    del self._breakers[k]
+                    return
 
         # 2. Fallback: any CLOSED breaker without active probe
         for k, b in self._breakers.items():
-            with b._lock:
-                if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
-                    del self._breakers[k]
-                    return
+            if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
+                del self._breakers[k]
+                return
 
         # 3. Fallback: any non-OPEN breaker
         for k, b in self._breakers.items():
-            with b._lock:
-                if b.state != CircuitState.OPEN and not b._half_open_in_flight:
-                    del self._breakers[k]
-                    return
+            if b.state != CircuitState.OPEN and not b._half_open_in_flight:
+                del self._breakers[k]
+                return
 
         # 4. Last resort: evict oldest entry.
         self._breakers.popitem(last=False)
@@ -144,14 +141,13 @@ class CircuitBreakerManager:
     def clear(self) -> None:
         with self._lock:
             for breaker in self._breakers.values():
-                with breaker._lock:
-                    breaker.epoch += 1
-                    breaker.state = CircuitState.CLOSED
-                    breaker._half_open_in_flight = False
-                    breaker._active_probe_id = None
-                    breaker._probe_started_at = None
-                    breaker._calls.clear()
-                    breaker._window_error_count = 0
+                breaker.epoch += 1
+                breaker.state = CircuitState.CLOSED
+                breaker._half_open_in_flight = False
+                breaker._active_probe_id = None
+                breaker._probe_started_at = None
+                breaker._calls.clear()
+                breaker._window_error_count = 0
             self._epoch_counter += 10
             self._breakers.clear()
 

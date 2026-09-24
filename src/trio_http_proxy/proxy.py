@@ -69,28 +69,27 @@ def get_conn_limiter() -> trio.CapacityLimiter:
 reset_conn_limiter = get_conn_limiter.cache_clear
 
 
-def _http_429_response(retry_after: Any = None) -> bytes:
+def _http_429_response(
+    retry_after: RateLimitError | float | int | Any = None,
+) -> bytes:
     """Build a rate-limit response using the rejection's expiry metadata."""
-    for value in (
-        getattr(retry_after, "retry_after_seconds", None),
-        getattr(retry_after, "retry_after", None),
-        retry_after,
-    ):
-        if value is None:
-            continue
+    if isinstance(retry_after, RateLimitError):
         try:
-            seconds = int(value)
+            seconds = max(1, int(retry_after.retry_after_seconds))
         except (TypeError, ValueError):
-            continue
-        if seconds >= 1:
-            return (
-                f"HTTP/1.1 429 Too Many Requests\r\nRetry-After: {seconds}\r\n"
-                f"Connection: close\r\nContent-Length: 0\r\n\r\n"
-            ).encode()
+            seconds = 1
+    elif isinstance(retry_after, (int, float)):
+        try:
+            seconds = max(1, int(retry_after))
+        except (TypeError, ValueError):
+            seconds = 1
+    else:
+        seconds = 1
+
     return (
-        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n"
-        b"Connection: close\r\nContent-Length: 0\r\n\r\n"
-    )
+        f"HTTP/1.1 429 Too Many Requests\r\nRetry-After: {seconds}\r\n"
+        f"Connection: close\r\nContent-Length: 0\r\n\r\n"
+    ).encode()
 
 
 LOGGER_NAME = "trio_http_proxy"
@@ -542,15 +541,24 @@ async def _record_connection_result(
     proxy_cache: ProxyCacheProtocol | None | Any,
     record: ConnectionRecord | ConnectionResultBuilder,
 ) -> None:
-    # Every call site here passes a ConnectionResultBuilder; delegate to its
-    # own record_to() dispatch (proxy_cache=None guard + legacy
-    # record_result()-only fallback) instead of duplicating that logic.
+    if proxy_cache is None:
+        return
     if isinstance(record, ConnectionResultBuilder):
         await record.record_to(proxy_cache)
         return
-    if proxy_cache is None:
-        return
-    await proxy_cache.record_connection_result(record)
+    if hasattr(proxy_cache, "record_connection_result"):
+        res = proxy_cache.record_connection_result(record)
+        if inspect.isawaitable(res):
+            await res
+    else:
+        cache_obj: Any = proxy_cache
+        record_result = getattr(cache_obj, "record_result", None)
+        if callable(record_result):
+            res = record_result(
+                record.host, record.port, record.error, permit=record.permit
+            )
+            if inspect.isawaitable(res):
+                await res
 
 
 async def tunnel(
@@ -624,12 +632,10 @@ async def tunnel(
         # the context-less legacy path needs this direct set.
         CV_DESTHOST.set(desthost)
 
-    result_builder = ConnectionResultBuilder().with_target(desthost, destport)
     permit: CircuitPermit | None = None
     if proxy_cache is not None:
         try:
             permit = await proxy_cache.check_circuit(desthost, destport)
-            result_builder.with_permit(permit)
         except CircuitBreakerOpen:
             logger.warning(
                 "Circuit breaker open for %s:%d, sending 502 to client...",
@@ -644,7 +650,6 @@ async def tunnel(
 
     logger.info("Got CONNECT request for %s:%d, connecting...", desthost, destport)
 
-    permit_recorded = False
     dest_stream = None
     dest_connected = False
     try:
@@ -654,9 +659,9 @@ async def tunnel(
                 target_hosts = await proxy_cache.resolve_hosts(desthost)
             except OSError as exc:
                 await _record_connection_result(
-                    proxy_cache, result_builder.with_error(exc)
+                    proxy_cache,
+                    ConnectionRecord(host=desthost, port=destport, error=exc),
                 )
-                permit_recorded = True
                 logger.warning(
                     "Could not resolve %s, sending 502 to client...",
                     desthost,
@@ -695,9 +700,9 @@ async def tunnel(
             if isinstance(last_exc, trio.TooSlowError):
                 if proxy_cache is not None:
                     await _record_connection_result(
-                        proxy_cache, result_builder.with_error(last_exc)
+                        proxy_cache,
+                        ConnectionRecord(host=desthost, port=destport, error=last_exc),
                     )
-                    permit_recorded = True
                 logger.warning(
                     "Timed out connecting to %s:%d, sending 504 to client...",
                     desthost,
@@ -711,9 +716,9 @@ async def tunnel(
             else:
                 if proxy_cache is not None:
                     await _record_connection_result(
-                        proxy_cache, result_builder.with_error(last_exc)
+                        proxy_cache,
+                        ConnectionRecord(host=desthost, port=destport, error=last_exc),
                     )
-                    permit_recorded = True
                 logger.warning(
                     "Could not connect to %s:%d (%s), sending 502 to client...",
                     desthost,
@@ -727,11 +732,13 @@ async def tunnel(
                 raise last_exc
 
         if proxy_cache is not None:
-            await _record_connection_result(proxy_cache, result_builder.with_success())
-            permit_recorded = True
+            await _record_connection_result(
+                proxy_cache,
+                ConnectionRecord(host=desthost, port=destport, permit=permit),
+            )
         dest_connected = True
     finally:
-        if permit is not None and not permit_recorded:
+        if permit is not None and not dest_connected:
             permit.abort()
         if dest_stream is not None and not dest_connected:
             await trio.aclose_forcefully(dest_stream)

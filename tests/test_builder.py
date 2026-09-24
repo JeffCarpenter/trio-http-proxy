@@ -11,6 +11,7 @@ from trio_http_proxy.cache import ProxyCache, ProxyCacheBuilder
 from trio_http_proxy.circuit_breaker import CircuitPermit
 from trio_http_proxy.config import Settings
 from trio_http_proxy.proxy import (
+    ConnectionRecord,
     ConnectionResultBuilder,
     ProxyBuilder,
 )
@@ -126,3 +127,62 @@ async def test_connection_result_builder_record_to():
     assert recorded[0].host == "test.local"
     assert recorded[0].port == 443
     assert recorded[0].is_success is True
+
+
+def test_connection_record_direct_kwargs():
+    record = ConnectionRecord(host="svc.local", port=80)
+    assert record.host == "svc.local"
+    assert record.port == 80
+    assert record.error is None
+    assert record.permit is None
+    assert record.is_success is True
+    assert record.has_permit is False
+
+    dummy_permit = cast(CircuitPermit, object())
+    record_with_permit = ConnectionRecord(
+        host="svc.local", port=443, permit=dummy_permit
+    )
+    assert record_with_permit.has_permit is True
+    assert record_with_permit.permit is dummy_permit
+    assert record_with_permit.is_success is True
+
+    err = OSError("connect failed")
+    record_with_error = ConnectionRecord(host="svc.local", port=443, error=err)
+    assert record_with_error.error is err
+    assert record_with_error.is_success is False
+    assert record_with_error.has_permit is False
+
+
+def test_connection_record_validation_invariants():
+    # Host must be non-empty string
+    with pytest.raises(ValueError, match="host must be specified"):
+        ConnectionRecord(host="", port=80)
+
+    with pytest.raises(ValueError, match="host must be specified"):
+        ConnectionRecord(host="   ", port=80)
+
+    # Whitespace in host is trimmed
+    rec = ConnectionRecord(host="  example.com  ", port=80)
+    assert rec.host == "example.com"
+
+    # Port range bounds
+    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+        ConnectionRecord(host="example.com", port=0)
+
+    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+        ConnectionRecord(host="example.com", port=65536)
+
+    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+        ConnectionRecord(host="example.com", port=cast(int, True))
+
+    # Error and permit are mutually exclusive (Philip Wadler's vision)
+    dummy_permit = cast(CircuitPermit, object())
+    with pytest.raises(
+        ValueError, match="cannot simultaneously hold both an error and a permit"
+    ):
+        ConnectionRecord(
+            host="example.com",
+            port=443,
+            error=OSError("fail"),
+            permit=dummy_permit,
+        )

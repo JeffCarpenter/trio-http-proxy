@@ -14,7 +14,6 @@ import trio
 
 from .config import Settings, resolve_settings
 from .connection import (
-    CV_PIPE_FROM,
     ConnectionContext,
     ConnectionFilter,
     ConnectionLoggerAdapter,
@@ -46,13 +45,12 @@ async def pipe(
     which keeps a reusable function like this one oblivious to them.
     On EOF, calls to_stream.send_eof() if supported to signal half-close.
     """
+    ctx = context or ConnectionContext.current()
     if bufmaxsz is None:
-        cfg = resolve_settings(settings, context)
+        cfg = resolve_settings(settings, ctx)
         bufmaxsz = cfg.bufmaxsz
-    if context is not None:
-        context.set_pipe_from(from_stream)
-    else:
-        CV_PIPE_FROM.set(from_stream)
+    if ctx is not None:
+        ctx.set_pipe_from(from_stream)
     while True:
         chunk = await from_stream.receive_some(bufmaxsz)
         if on_receive is not None:
@@ -89,7 +87,8 @@ async def pipe_with_timeout(
     caller, and nudges its deadline from pipe()'s on_receive/on_send hooks
     rather than making pipe() take a timeout= parameter of its own.
     """
-    cfg = resolve_settings(settings, context)
+    ctx = context or ConnectionContext.current()
+    cfg = resolve_settings(settings, ctx)
     pipe_buf_size: int = int(bufmaxsz) if bufmaxsz is not None else int(cfg.bufmaxsz)
     idle_val: float = (
         float(idle_timeout)
@@ -122,7 +121,7 @@ async def pipe_with_timeout(
             on_receive=on_receive,
             on_send=on_send,
             settings=cfg,
-            context=context,
+            context=ctx,
         )
     if cancel_scope.cancelled_caught:
         raw_timeout = send_timeout if phase == "send" else idle_timeout

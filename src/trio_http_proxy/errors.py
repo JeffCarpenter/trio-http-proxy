@@ -28,10 +28,14 @@ class RequestTooLargeError(ProxyProtocolError):
 class RateLimitError(cashews.RateLimitError):
     """Rate-limit rejection with an optional HTTP Retry-After value."""
 
+    retry_after_seconds: float = 1.0
+    retry_after: int | None = None
+
     def __init__(
         self,
         *args: Any,
-        retry_after: int | None = None,
+        retry_after_seconds: float = 1.0,
+        retry_after: float | int | None = None,
         **kwargs: Any,
     ) -> None:
         # cashews.RateLimitError inherits Exception.__init__(self, *args),
@@ -44,16 +48,24 @@ class RateLimitError(cashews.RateLimitError):
         # tell us they weren't accepted.
         del kwargs
         super().__init__(*args)
-        self.retry_after = retry_after
-
-    @property
-    def retry_after_seconds(self) -> float | None:
-        if self.retry_after is None:
-            return None
-        try:
-            return float(self.retry_after)
-        except (TypeError, ValueError):
-            return None
+        if retry_after is not None:
+            try:
+                self.retry_after_seconds = float(retry_after)
+            except (TypeError, ValueError):
+                self.retry_after_seconds = float(retry_after_seconds)
+            self.retry_after = (
+                int(retry_after) if isinstance(retry_after, (int, float)) else None
+            )
+        else:
+            try:
+                self.retry_after_seconds = float(retry_after_seconds)
+            except (TypeError, ValueError):
+                self.retry_after_seconds = 1.0
+            self.retry_after = (
+                int(self.retry_after_seconds)
+                if isinstance(retry_after_seconds, (int, float))
+                else None
+            )
 
 
 __all__ = [

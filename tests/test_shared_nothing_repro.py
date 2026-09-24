@@ -31,6 +31,7 @@ from trio_http_proxy.errors import ProxyProtocolError, RateLimitError
 from trio_http_proxy.protocol import process_as_connect_request
 from trio_http_proxy.proxy import (
     _DEFAULT_LIMITER,
+    ConnectionRecord,
     ConnectionResultBuilder,
     ProxyBuilder,
     _http_429_response,
@@ -194,6 +195,43 @@ async def test_connection_result_builder_fallback_forwards_permit():
 
     assert len(received_permit) == 1
     assert received_permit[0] is dummy_permit
+
+
+def test_connection_record_invariants_and_mutual_exclusion():
+    # Host validation
+    with pytest.raises(ValueError, match="host must be specified"):
+        ConnectionRecord(host="", port=80)
+    with pytest.raises(ValueError, match="host must be specified"):
+        ConnectionRecord(host="   ", port=80)
+
+    # Port validation
+    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+        ConnectionRecord(host="example.com", port=0)
+    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+        ConnectionRecord(host="example.com", port=65536)
+
+    # Mutual exclusion between error and permit
+    dummy_permit = cast(CircuitPermit, object())
+    with pytest.raises(
+        ValueError, match="cannot simultaneously hold both an error and a permit"
+    ):
+        ConnectionRecord(
+            host="example.com",
+            port=443,
+            error=OSError("connection refused"),
+            permit=dummy_permit,
+        )
+
+    # Valid records
+    rec_ok = ConnectionRecord(host="example.com", port=443, permit=dummy_permit)
+    assert rec_ok.is_success is True
+    assert rec_ok.has_permit is True
+
+    rec_err = ConnectionRecord(
+        host="example.com", port=443, error=OSError("connection refused")
+    )
+    assert rec_err.is_success is False
+    assert rec_err.has_permit is False
 
 
 # ---------------------------------------------------------------------------
