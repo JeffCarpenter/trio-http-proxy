@@ -20,12 +20,50 @@ CV_PIPE_FROM: ContextVar[trio.abc.ReceiveStream | None] = ContextVar(
 )
 CV_DESTHOST: ContextVar[str | None] = ContextVar("desthost", default=None)
 CV_CONN_ID: ContextVar[int | None] = ContextVar("conn_id", default=None)
-_DEFAULT_PROXY_CACHE_SENTINEL = object()
+class _DefaultProxyCacheSentinel:
+    """Sentinel indicating default proxy cache resolution."""
+
+    def __repr__(self) -> str:
+        return "<DEFAULT_PROXY_CACHE>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_DEFAULT_PROXY_CACHE_SENTINEL = _DefaultProxyCacheSentinel()
 CV_PROXY_CACHE: ContextVar[Any] = ContextVar(
     "proxy_cache", default=_DEFAULT_PROXY_CACHE_SENTINEL
 )
 
 _conn_ids = count(1)
+
+
+def resolve_proxy_cache(
+    proxy_cache: Any = _DEFAULT_PROXY_CACHE_SENTINEL,
+    context: ConnectionContext | None = None,
+    default_factory: Any = None,
+) -> Any:
+    """Resolve the effective ProxyCache instance.
+
+    Consolidates precedence order:
+    1. Explicitly provided `proxy_cache` parameter (if not the sentinel).
+    2. Context-bound `context.proxy_cache` (if not the sentinel).
+    3. Ambient `CV_PROXY_CACHE` ContextVar (if not the sentinel).
+    4. Default factory (e.g. `get_default_proxy_cache()`).
+    """
+    if proxy_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
+        return proxy_cache
+    if (
+        context is not None
+        and context.proxy_cache is not _DEFAULT_PROXY_CACHE_SENTINEL
+    ):
+        return context.proxy_cache
+    cv_cache = CV_PROXY_CACHE.get()
+    if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
+        return cv_cache
+    if default_factory is not None:
+        return default_factory()
+    return None
 
 
 class ConnectionContext:
@@ -180,4 +218,5 @@ __all__ = [
     "_conn_ids",
     "_connection_context",
     "format_conn_prefix",
+    "resolve_proxy_cache",
 ]

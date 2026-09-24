@@ -68,7 +68,11 @@ class DestinationCircuitBreaker:
         with self._lock:
             if self.state == CircuitState.OPEN:
                 opened_at = self.opened_at
-                if opened_at is not None and now - opened_at >= self.ttl:
+                if opened_at is None:
+                    # Invariant recovery: an OPEN state must have a non-None opened_at timestamp.
+                    self.opened_at = now
+                    opened_at = now
+                if now - opened_at >= self.ttl:
                     self.state = CircuitState.HALF_OPEN
                     self._half_open_in_flight = False
                     self._active_probe_id = None

@@ -11,9 +11,11 @@ from .connection_context import (
     CV_PIPE_FROM,
     CV_PROXY_CACHE,
     ConnectionContext,
+    _DefaultProxyCacheSentinel,
     _conn_ids,
     _connection_context,
     format_conn_prefix,
+    resolve_proxy_cache,
 )
 from .connection_filter import ConnectionFilter
 from .connection_logger_adapter import ConnectionLoggerAdapter
@@ -28,6 +30,7 @@ __all__ = [
     "CV_PROXY_CACHE",
     "ConnectionContext",
     "_DEFAULT_PROXY_CACHE_SENTINEL",
+    "_DefaultProxyCacheSentinel",
     "ConnectionFilter",
     "ConnectionLoggerAdapter",
     "_conn_ids",
@@ -36,4 +39,5 @@ __all__ = [
     "connection_filter",
     "connection_logger_adapter",
     "format_conn_prefix",
+    "resolve_proxy_cache",
 ]

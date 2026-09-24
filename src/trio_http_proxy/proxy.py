@@ -40,6 +40,7 @@ from .connection import (
     ConnectionLoggerAdapter,
     _conn_ids,
     format_conn_prefix,
+    resolve_proxy_cache,
 )
 from .errors import (
     CacheBackendUnavailable,
@@ -98,7 +99,17 @@ if not any(isinstance(f, ConnectionFilter) for f in _raw_logger.filters):
     _raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
-_DEFAULT_LIMITER = object()
+class _DefaultLimiterSentinel:
+    """Sentinel indicating default capacity limiter resolution."""
+
+    def __repr__(self) -> str:
+        return "<DEFAULT_LIMITER>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_DEFAULT_LIMITER = _DefaultLimiterSentinel()
 
 
 async def http_proxy(
@@ -107,7 +118,7 @@ async def http_proxy(
     _connect: Any = trio.open_tcp_stream,
     idle_timeout: float | None = None,
     send_timeout: float | None = None,
-    limiter: trio.CapacityLimiter | None | object = _DEFAULT_LIMITER,
+    limiter: trio.CapacityLimiter | None | _DefaultLimiterSentinel = _DEFAULT_LIMITER,
     proxy_cache: ProxyCacheProtocol | None | Any = _DEFAULT_PROXY_CACHE_SENTINEL,
     *,
     settings: Settings | None = None,
@@ -127,18 +138,9 @@ async def http_proxy(
         if isinstance(limiter, trio.CapacityLimiter)
         else None
     )
-    if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
-        if (
-            context is not None
-            and context.proxy_cache is not _DEFAULT_PROXY_CACHE_SENTINEL
-        ):
-            proxy_cache = context.proxy_cache
-        else:
-            cv_cache = CV_PROXY_CACHE.get()
-            if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
-                proxy_cache = cv_cache
-            else:
-                proxy_cache = get_default_proxy_cache()
+    proxy_cache = resolve_proxy_cache(
+        proxy_cache, context, default_factory=get_default_proxy_cache
+    )
 
     if context is None:
         context = ConnectionContext(
@@ -217,30 +219,44 @@ async def http_proxy(
 
                 try:
                     async with dest_stream, trio.open_nursery() as nursery:
-                        nursery.start_soon(
-                            partial(
-                                pipe_with_timeout,
-                                client_stream,
-                                dest_stream,
-                                bufmaxsz=_proxy_cfg.bufmaxsz,
-                                idle_timeout=idle_timeout,
-                                send_timeout=send_timeout,
-                                settings=_proxy_cfg,
-                                context=context,
-                            )
-                        )
-                        nursery.start_soon(
-                            partial(
-                                pipe_with_timeout,
-                                dest_stream,
-                                client_stream,
-                                bufmaxsz=_proxy_cfg.bufmaxsz,
-                                idle_timeout=idle_timeout,
-                                send_timeout=send_timeout,
-                                settings=_proxy_cfg,
-                                context=context,
-                            )
-                        )
+
+                        async def _forward_client_to_dest() -> None:
+                            try:
+                                await pipe_with_timeout(
+                                    client_stream,
+                                    dest_stream,
+                                    bufmaxsz=_proxy_cfg.bufmaxsz,
+                                    idle_timeout=idle_timeout,
+                                    send_timeout=send_timeout,
+                                    settings=_proxy_cfg,
+                                    context=context,
+                                )
+                            finally:
+                                # If dest_stream cannot support half-close, closing client sending
+                                # must terminate the entire tunnel immediately.
+                                if not isinstance(
+                                    dest_stream, trio.abc.HalfCloseableStream
+                                ):
+                                    nursery.cancel_scope.cancel()
+
+                        async def _forward_dest_to_client() -> None:
+                            try:
+                                await pipe_with_timeout(
+                                    dest_stream,
+                                    client_stream,
+                                    bufmaxsz=_proxy_cfg.bufmaxsz,
+                                    idle_timeout=idle_timeout,
+                                    send_timeout=send_timeout,
+                                    settings=_proxy_cfg,
+                                    context=context,
+                                )
+                            finally:
+                                # Per RFC 7231 §4.3.6: once destination closes, the tunnel is complete;
+                                # cancel remaining client->dest forwarding to avoid dangling on idle_timeout.
+                                nursery.cancel_scope.cancel()
+
+                        nursery.start_soon(_forward_client_to_dest)
+                        nursery.start_soon(_forward_dest_to_client)
                 except* (trio.BrokenResourceError, trio.ClosedResourceError):
                     logger.info("Peer disconnected")
                 except* trio.TooSlowError:
@@ -417,15 +433,12 @@ class ProxyBuilder(SettingsBuilderMixin):
             else trio.CapacityLimiter(settings.maxconns)
         )
         proxy_cache = self._proxy_cache
-        if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
-            cv_cache = CV_PROXY_CACHE.get()
-            proxy_cache = (
-                cv_cache
-                if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL
-                else get_default_proxy_cache()
-            )
-        elif isinstance(proxy_cache, ProxyCacheBuilder):
+        if isinstance(proxy_cache, ProxyCacheBuilder):
             proxy_cache = proxy_cache.build()
+        else:
+            proxy_cache = resolve_proxy_cache(
+                proxy_cache, default_factory=get_default_proxy_cache
+            )
 
         cache_token = CV_PROXY_CACHE.set(proxy_cache)
         try:
@@ -547,18 +560,9 @@ async def tunnel(
         else float(cfg.dest_connect_timeout)
     )
 
-    if proxy_cache is _DEFAULT_PROXY_CACHE_SENTINEL:
-        if (
-            context is not None
-            and context.proxy_cache is not _DEFAULT_PROXY_CACHE_SENTINEL
-        ):
-            proxy_cache = context.proxy_cache
-        else:
-            cv_cache = CV_PROXY_CACHE.get()
-            if cv_cache is not _DEFAULT_PROXY_CACHE_SENTINEL:
-                proxy_cache = cv_cache
-            else:
-                proxy_cache = get_default_proxy_cache()
+    proxy_cache = resolve_proxy_cache(
+        proxy_cache, context, default_factory=get_default_proxy_cache
+    )
     try:
         desthost, destport, trailing_data = await process_as_connect_request(
             client_stream,

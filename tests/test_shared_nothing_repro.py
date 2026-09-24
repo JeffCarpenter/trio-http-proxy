@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any, cast
 
 import pytest
@@ -12,20 +13,24 @@ from trio_http_proxy.circuit_breaker import (
     CircuitBreakerManager,
     CircuitPermit,
     CircuitState,
+    DestinationCircuitBreaker,
 )
 from trio_http_proxy.config import Settings
 from trio_http_proxy.config.builder import ProxyCacheBuilder
 from trio_http_proxy.connection import (
+    _DEFAULT_PROXY_CACHE_SENTINEL,
     CV_CLIENT_STREAM,
     CV_CONN_ID,
     CV_DESTHOST,
     CV_DEST_STREAM,
     ConnectionContext,
     format_conn_prefix,
+    resolve_proxy_cache,
 )
 from trio_http_proxy.errors import ProxyProtocolError, RateLimitError
 from trio_http_proxy.protocol import process_as_connect_request
 from trio_http_proxy.proxy import (
+    _DEFAULT_LIMITER,
     ConnectionResultBuilder,
     ProxyBuilder,
     _http_429_response,
@@ -295,3 +300,86 @@ def test_settings_rate_limit_backward_compatibility():
     settings = Settings(rate_limit=42)
     assert settings.rate_limit == 42
     assert settings.rate_limit_count == 42
+
+
+# ---------------------------------------------------------------------------
+# 10. Luminaries' Review Rectifications: Sentinels, Resolution, and Teardown
+# ---------------------------------------------------------------------------
+def test_sentinels_representation_and_boolean_falsiness():
+    assert repr(_DEFAULT_LIMITER) == "<DEFAULT_LIMITER>"
+    assert not _DEFAULT_LIMITER
+    assert repr(_DEFAULT_PROXY_CACHE_SENTINEL) == "<DEFAULT_PROXY_CACHE>"
+    assert not _DEFAULT_PROXY_CACHE_SENTINEL
+
+
+def test_resolve_proxy_cache_precedence():
+    # 1. Explicit argument wins
+    custom_cache = object()
+    assert resolve_proxy_cache(custom_cache) is custom_cache
+
+    # 2. Context settings win over ambient/fallback
+    ctx_cache = object()
+    ctx = ConnectionContext(proxy_cache=ctx_cache)
+    assert resolve_proxy_cache(context=ctx) is ctx_cache
+
+    # 3. Default factory when nothing is provided
+    default_obj = object()
+    assert (
+        resolve_proxy_cache(default_factory=lambda: default_obj)
+        is default_obj
+    )
+
+
+def test_circuit_breaker_open_state_none_opened_at_recovery():
+    breaker = DestinationCircuitBreaker()
+    breaker.state = CircuitState.OPEN
+    breaker.opened_at = None
+    # acquire_permit should recover opened_at without deadlock or error
+    now = 100.0
+    permit = breaker.acquire_permit(now=now)
+    assert permit is None
+    assert breaker.opened_at == now
+    # After TTL, it transitions to HALF_OPEN
+    permit2 = breaker.acquire_permit(now=now + breaker.ttl + 1.0)
+    assert permit2 is not None
+    assert breaker.state == CircuitState.HALF_OPEN
+
+
+async def test_http_proxy_prompt_teardown_on_dest_eof():
+    # Tests Leslie Lamport's invariant: prompt teardown when destination stream closes
+    # Verify that client->dest pump doesn't hang for idle timeout when dest closes.
+    client_stream, client_peer = tt.memory_stream_pair()
+    dest_stream, dest_peer = tt.memory_stream_pair()
+
+    async def fake_connect(host: str, port: int):
+        return dest_stream
+
+    # Client sends CONNECT request with mandatory Host header
+    await client_peer.send_all(
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+    )
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(
+            partial(
+                http_proxy,
+                client_stream,
+                _connect=fake_connect,
+                proxy_cache=None,
+                limiter=None,
+            )
+        )
+
+        # Wait for 200 Connection Established
+        established = await client_peer.receive_some(1024)
+        assert b"200 Connection established" in established
+
+        # Destination sends some payload then closes (origin server hangup)
+        await dest_peer.send_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        await dest_peer.aclose()
+
+        # Destination data should arrive on client_peer
+        data = await client_peer.receive_some(1024)
+        assert b"HTTP/1.1 200 OK" in data
+
+        # http_proxy should terminate promptly without hanging
