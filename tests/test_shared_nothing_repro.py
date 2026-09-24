@@ -161,19 +161,29 @@ async def test_proxy_cache_builder_reentrant_context_manager():
 # 5. ConnectionResultBuilder validation & permit forwarding (Findings 20, 27)
 # ---------------------------------------------------------------------------
 def test_connection_result_builder_validation():
-    with pytest.raises(ValueError, match="host must be specified"):
+    with pytest.deprecated_call(), pytest.raises(
+        ValueError, match="host must be specified"
+    ):
         ConnectionResultBuilder(host="", port=80).build()
 
-    with pytest.raises(ValueError, match="host must be specified"):
+    with pytest.deprecated_call(), pytest.raises(
+        ValueError, match="host must be specified"
+    ):
         ConnectionResultBuilder(host="   ", port=80).build()
 
-    with pytest.raises(ValueError, match="port must be specified"):
+    with pytest.deprecated_call(), pytest.raises(
+        ValueError, match="port must be specified"
+    ):
         ConnectionResultBuilder(host="example.com").build()
 
-    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+    with pytest.deprecated_call(), pytest.raises(
+        ValueError, match="port must be between 1 and 65535"
+    ):
         ConnectionResultBuilder(host="example.com", port=0).build()
 
-    with pytest.raises(ValueError, match="port must be between 1 and 65535"):
+    with pytest.deprecated_call(), pytest.raises(
+        ValueError, match="port must be between 1 and 65535"
+    ):
         ConnectionResultBuilder(host="example.com", port=70000).build()
 
 
@@ -186,11 +196,12 @@ async def test_connection_result_builder_fallback_forwards_permit():
             received_permit.append(permit)
 
     dummy_permit = cast(CircuitPermit, object())
-    builder = (
-        ConnectionResultBuilder("dest.local", 443)
-        .with_success()
-        .with_permit(dummy_permit)
-    )
+    with pytest.deprecated_call():
+        builder = (
+            ConnectionResultBuilder("dest.local", 443)
+            .with_success()
+            .with_permit(dummy_permit)
+        )
     await builder.record_to(LegacyRecorder())
 
     assert len(received_permit) == 1

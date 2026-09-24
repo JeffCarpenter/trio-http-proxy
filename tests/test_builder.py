@@ -87,24 +87,30 @@ def test_proxy_builder_configuration():
 
 def test_connection_result_builder_permit():
     dummy_permit = cast(CircuitPermit, object())
-    builder = ConnectionResultBuilder(host="svc.local", port=80).with_permit(
-        dummy_permit
-    )
+    with pytest.deprecated_call():
+        builder = ConnectionResultBuilder(host="svc.local", port=80).with_permit(
+            dummy_permit
+        )
     record = builder.build()
     assert record.has_permit is True
     assert record.permit is dummy_permit
 
 
 def test_connection_result_builder_validation():
-    with pytest.raises(ValueError, match="host must be specified"):
+    with pytest.deprecated_call(), pytest.raises(
+        ValueError, match="host must be specified"
+    ):
         ConnectionResultBuilder().with_port(80).build()
 
-    with pytest.raises(ValueError, match="port must be specified"):
+    with pytest.deprecated_call(), pytest.raises(
+        ValueError, match="port must be specified"
+    ):
         ConnectionResultBuilder().with_host("example.com").build()
 
 
 def test_proxy_cache_classmethod_result_builder():
-    builder = ProxyCache.result_builder("dest.com", 9000)
+    with pytest.deprecated_call():
+        builder = ProxyCache.result_builder("dest.com", 9000)
     record = builder.with_success().build()
     assert record.host == "dest.com"
     assert record.port == 9000
@@ -120,8 +126,27 @@ async def test_connection_result_builder_record_to():
             recorded.append(record)
 
     cache = MockCache()
-    builder = ConnectionResultBuilder("test.local", 443).with_success()
+    with pytest.deprecated_call():
+        builder = ConnectionResultBuilder("test.local", 443).with_success()
     await builder.record_to(cache)
+
+    assert len(recorded) == 1
+    assert recorded[0].host == "test.local"
+    assert recorded[0].port == 443
+    assert recorded[0].is_success is True
+
+
+@tt.trio_test
+async def test_connection_record_direct_recording():
+    recorded = []
+
+    class MockCache:
+        async def record_connection_result(self, record):
+            recorded.append(record)
+
+    cache = MockCache()
+    record = ConnectionRecord("test.local", 443)
+    await cache.record_connection_result(record)
 
     assert len(recorded) == 1
     assert recorded[0].host == "test.local"
