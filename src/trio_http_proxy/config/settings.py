@@ -238,6 +238,11 @@ class Settings(EnvSettings):
             return None
         return parse_duration_seconds(self.rate_limit_ttl, field="rate_limit_ttl")
 
+    @property
+    def rate_limit_count(self) -> int:
+        """Alias for rate_limit count for backward compatibility."""
+        return self.rate_limit
+
     def __init__(
         self,
         *args: Any,
@@ -245,12 +250,23 @@ class Settings(EnvSettings):
         _env_file_encoding: Any = _UNSET,
         **values: Any,
     ) -> None:
+        if args:
+            raise TypeError(
+                f"Settings takes no positional arguments, got {len(args)}"
+            )
+        for key in ("proxy", "cache", "circuit_breaker", "rate_limit"):
+            if key in values and isinstance(values[key], dict):
+                sub = values.pop(key)
+                values.update(sub)
+            elif key in values and hasattr(values[key], "model_dump"):
+                sub = values.pop(key)
+                values.update(sub.model_dump())
         kwargs: dict[str, Any] = {}
         if _env_file is not _UNSET:
             kwargs["_env_file"] = _env_file
         if _env_file_encoding is not _UNSET:
             kwargs["_env_file_encoding"] = _env_file_encoding
-        super().__init__(*args, **kwargs, **values)
+        super().__init__(**kwargs, **values)
 
 
 @cache

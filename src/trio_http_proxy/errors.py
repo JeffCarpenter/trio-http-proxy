@@ -34,12 +34,20 @@ class RateLimitError(cashews.RateLimitError):
         retry_after: int | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        try:
+            super().__init__(*args, **kwargs)
+        except TypeError:
+            super().__init__(*args)
         self.retry_after = retry_after
 
     @property
     def retry_after_seconds(self) -> float | None:
-        return float(self.retry_after) if self.retry_after is not None else None
+        if self.retry_after is None:
+            return None
+        try:
+            return float(self.retry_after)
+        except (TypeError, ValueError):
+            return None
 
 
 __all__ = [

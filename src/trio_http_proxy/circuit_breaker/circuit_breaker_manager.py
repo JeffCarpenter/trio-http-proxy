@@ -59,7 +59,7 @@ class CircuitBreakerManager:
         self.period = period
         self.ttl = ttl
         self.min_calls = min_calls
-        self.max_destinations = max_destinations
+        self.max_destinations = max(1, max_destinations)
         self._breakers: OrderedDict[tuple[str, int], DestinationCircuitBreaker] = (
             OrderedDict()
         )
@@ -89,10 +89,12 @@ class CircuitBreakerManager:
             return breaker
 
     def _evict_one_locked(self) -> None:
-        """Evict an idle CLOSED breaker or oldest entry if none idle."""
+        """Evict an idle CLOSED breaker, avoiding eviction of active OPEN breakers."""
+        if not self._breakers:
+            return
         now = time.monotonic()
         # 1. Look for idle CLOSED breaker with empty calls (after pruning) and no in-flight probe (§6.14)
-        for k, b in self._breakers.items():
+        for k, b in list(self._breakers.items()):
             with b._lock:
                 if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
                     b._prune_calls(now)
@@ -101,14 +103,22 @@ class CircuitBreakerManager:
                         return
 
         # 2. Fallback: any CLOSED breaker without active probe
-        for k, b in self._breakers.items():
+        for k, b in list(self._breakers.items()):
             with b._lock:
                 if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
                     del self._breakers[k]
                     return
 
-        # 3. Last resort: evict oldest entry
-        self._breakers.popitem(last=False)
+        # 3. Fallback: any non-OPEN breaker
+        for k, b in list(self._breakers.items()):
+            with b._lock:
+                if b.state != CircuitState.OPEN and not b._half_open_in_flight:
+                    del self._breakers[k]
+                    return
+
+        # 4. Last resort: evict oldest entry if any exist
+        if self._breakers:
+            self._breakers.popitem(last=False)
 
     def acquire_permit(
         self, host: str, port: int, now: float | None = None

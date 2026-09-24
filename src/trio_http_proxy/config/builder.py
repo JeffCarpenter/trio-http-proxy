@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 from .settings import Settings
@@ -9,6 +10,10 @@ from .settings import Settings
 if TYPE_CHECKING:
     from ..proxy import ProxyBuilder
     from ..proxy_cache import ProxyCache
+
+_CV_BUILDER_CACHE_STACK: ContextVar[list[Any] | None] = ContextVar(
+    "_builder_cache_stack", default=None
+)
 
 
 class SettingsBuilderMixin:
@@ -40,7 +45,6 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
     def __init__(self, settings: Settings | None = None, **overrides: Any) -> None:
         self._base_settings: Settings | None = settings
         self._overrides: dict[str, Any] = dict(overrides)
-        self._built_cache: ProxyCache | None = None
 
     def with_cache(
         self,
@@ -187,20 +191,34 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
         return builder
 
     async def __aenter__(self) -> ProxyCache:
-        self._built_cache = self.build()
-        return await self._built_cache.__aenter__()
+        cache = self.build()
+        stack = _CV_BUILDER_CACHE_STACK.get()
+        if stack is None:
+            stack = []
+            _CV_BUILDER_CACHE_STACK.set(stack)
+        stack.append(cache)
+        return await cache.__aenter__()
 
     async def __aexit__(self, *args: object) -> None:
-        if self._built_cache is not None:
-            await self._built_cache.__aexit__(*args)
+        stack = _CV_BUILDER_CACHE_STACK.get()
+        if stack:
+            cache = stack.pop()
+            await cache.__aexit__(*args)
 
     def __enter__(self) -> ProxyCache:
-        self._built_cache = self.build()
-        return self._built_cache.__enter__()
+        cache = self.build()
+        stack = _CV_BUILDER_CACHE_STACK.get()
+        if stack is None:
+            stack = []
+            _CV_BUILDER_CACHE_STACK.set(stack)
+        stack.append(cache)
+        return cache.__enter__()
 
     def __exit__(self, *args: object) -> None:
-        if self._built_cache is not None:
-            self._built_cache.__exit__(*args)
+        stack = _CV_BUILDER_CACHE_STACK.get()
+        if stack:
+            cache = stack.pop()
+            cache.__exit__(*args)
 
 
 __all__ = [

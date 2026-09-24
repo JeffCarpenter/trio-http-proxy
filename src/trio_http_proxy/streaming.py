@@ -12,12 +12,18 @@ from collections.abc import Callable
 
 import trio
 
-from .config import get_settings
-from .connection import CV_PIPE_FROM, ConnectionFilter, ConnectionLoggerAdapter
+from .config import Settings, get_settings
+from .connection import (
+    CV_PIPE_FROM,
+    ConnectionContext,
+    ConnectionFilter,
+    ConnectionLoggerAdapter,
+)
 
 LOGGER_NAME = "trio_http_proxy"
 _raw_logger = logging.getLogger(LOGGER_NAME)
-_raw_logger.addFilter(ConnectionFilter())
+if not any(isinstance(f, ConnectionFilter) for f in _raw_logger.filters):
+    _raw_logger.addFilter(ConnectionFilter())
 logger = ConnectionLoggerAdapter(_raw_logger, {})
 
 
@@ -27,6 +33,9 @@ async def pipe(
     bufmaxsz: int | None = None,
     on_receive: Callable[[], None] | None = None,
     on_send: Callable[[], None] | None = None,
+    *,
+    settings: Settings | None = None,
+    context: ConnectionContext | None = None,
 ) -> None:
     """Forward chunks from from_stream to to_stream until EOF.
     on_receive and on_send, when given, are called with no arguments right
@@ -38,8 +47,16 @@ async def pipe(
     On EOF, calls to_stream.send_eof() if supported to signal half-close.
     """
     if bufmaxsz is None:
-        bufmaxsz = get_settings().bufmaxsz
-    CV_PIPE_FROM.set(from_stream)
+        cfg = (
+            settings
+            if settings is not None
+            else (context.settings if context and context.settings else get_settings())
+        )
+        bufmaxsz = cfg.bufmaxsz
+    if context is not None:
+        context.set_pipe_from(from_stream)
+    else:
+        CV_PIPE_FROM.set(from_stream)
     while True:
         chunk = await from_stream.receive_some(bufmaxsz)
         if on_receive is not None:
@@ -53,7 +70,7 @@ async def pipe(
     if isinstance(to_stream, trio.abc.HalfCloseableStream):
         try:
             await to_stream.send_eof()
-        except trio.BrokenResourceError, trio.ClosedResourceError:
+        except (trio.BrokenResourceError, trio.ClosedResourceError):
             pass
     logger.debug("Pipe finished")
 
@@ -64,6 +81,9 @@ async def pipe_with_timeout(
     bufmaxsz: int | None = None,
     idle_timeout: float | None = None,
     send_timeout: float | None = None,
+    *,
+    settings: Settings | None = None,
+    context: ConnectionContext | None = None,
 ) -> None:
     """Run pipe(from_stream, to_stream), raising trio.TooSlowError if
     idle_timeout seconds pass with no data received, or send_timeout
@@ -73,32 +93,48 @@ async def pipe_with_timeout(
     caller, and nudges its deadline from pipe()'s on_receive/on_send hooks
     rather than making pipe() take a timeout= parameter of its own.
     """
-    _proxy_cfg = get_settings()
-    if bufmaxsz is None:
-        bufmaxsz = _proxy_cfg.bufmaxsz
-    if idle_timeout is None:
-        idle_timeout = _proxy_cfg.pipe_idle_timeout
-    if send_timeout is None:
-        send_timeout = _proxy_cfg.pipe_send_timeout
+    cfg = (
+        settings
+        if settings is not None
+        else (context.settings if context and context.settings else get_settings())
+    )
+    pipe_buf_size: int = int(bufmaxsz) if bufmaxsz is not None else int(cfg.bufmaxsz)
+    idle_val: float = (
+        float(idle_timeout)
+        if idle_timeout is not None
+        else float(cfg.pipe_idle_timeout)
+    )
+    send_val: float = (
+        float(send_timeout)
+        if send_timeout is not None
+        else float(cfg.pipe_send_timeout)
+    )
     phase = "idle"
 
     def on_receive():
         nonlocal phase
         phase = "send"
-        cancel_scope.deadline = trio.current_time() + send_timeout
+        cancel_scope.deadline = trio.current_time() + send_val
 
     def on_send():
         nonlocal phase
         phase = "idle"
-        cancel_scope.deadline = trio.current_time() + idle_timeout
+        cancel_scope.deadline = trio.current_time() + idle_val
 
     with trio.CancelScope() as cancel_scope:
-        cancel_scope.deadline = trio.current_time() + idle_timeout
+        cancel_scope.deadline = trio.current_time() + idle_val
         await pipe(
-            from_stream, to_stream, bufmaxsz, on_receive=on_receive, on_send=on_send
+            from_stream,
+            to_stream,
+            bufmaxsz=pipe_buf_size,
+            on_receive=on_receive,
+            on_send=on_send,
+            settings=cfg,
+            context=context,
         )
     if cancel_scope.cancelled_caught:
-        timeout = send_timeout if phase == "send" else idle_timeout
+        raw_timeout = send_timeout if phase == "send" else idle_timeout
+        timeout = raw_timeout if raw_timeout is not None else (send_val if phase == "send" else idle_val)
         reason = "send stalled" if phase == "send" else "idle"
         logger.warning("Pipe %s for %ss, closing tunnel", reason, timeout)
         raise trio.TooSlowError(f"Pipe {reason} for {timeout}s")

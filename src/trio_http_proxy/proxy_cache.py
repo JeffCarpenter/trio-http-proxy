@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import inspect
 import ipaddress
 import logging
 import math
@@ -119,12 +120,14 @@ class ConnectionResultBuilder:
         return self
 
     def build(self) -> ConnectionRecord:
-        if self._host is None:
+        if self._host is None or not self._host.strip():
             raise ValueError("host must be specified to build ConnectionRecord")
         if self._port is None:
             raise ValueError("port must be specified to build ConnectionRecord")
+        if not (1 <= self._port <= 65535):
+            raise ValueError(f"port must be between 1 and 65535, got {self._port}")
         return ConnectionRecord(
-            host=self._host,
+            host=self._host.strip(),
             port=self._port,
             error=self._error,
             permit=self._permit,
@@ -135,7 +138,16 @@ class ConnectionResultBuilder:
         if proxy_cache is None:
             return
         record = self.build()
-        await proxy_cache.record_connection_result(record)
+        if hasattr(proxy_cache, "record_connection_result"):
+            res = proxy_cache.record_connection_result(record)
+            if inspect.isawaitable(res):
+                await res
+        elif hasattr(proxy_cache, "record_result"):
+            res = proxy_cache.record_result(
+                record.host, record.port, record.error, permit=record.permit
+            )
+            if inspect.isawaitable(res):
+                await res
 
 
 @runtime_checkable
@@ -392,14 +404,23 @@ class ProxyCache:
                 # ProxyCache is the sole owner of fail-open vs fail-closed policy.
                 self.cache.setup(self.cache_url, suppress=False)
                 self._register_decorators()
-                fut = asyncio.run_coroutine_threadsafe(self.cache.ping(), self._loop)
+            except Exception as exc:  # noqa: BLE001
+                setup_error = exc
+
+        # Lock is released during blocking network ping to prevent freezing event loops (Finding 19)
+        if setup_error is None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self.cache.ping(), loop)
                 fut.result(timeout=self.startup_timeout)
             except Exception as exc:  # noqa: BLE001
                 setup_error = exc
+
+        with self._lock:
+            if setup_error is not None:
                 logger.warning(
                     "Failed to setup cashews cache or startup ping failed with %s: %s",
                     redact_url(self.cache_url),
-                    exc,
+                    setup_error,
                 )
                 if self.cache_failure_policy == "fail-closed":
                     self._stopped = True
@@ -422,9 +443,9 @@ class ProxyCache:
             if stop_parts is not None:
                 self._finish_stop(*stop_parts)
             if self.cache_failure_policy == "fail-open":
-                self._degraded = True
-                self._last_probe_time = time.monotonic()
                 with self._lock:
+                    self._degraded = True
+                    self._last_probe_time = time.monotonic()
                     self._stopped = False
                     self._started = True
                     self._lifecycle_state = LifecycleState.RUNNING
@@ -668,8 +689,9 @@ class ProxyCache:
                 operation,
                 exc,
             )
-            self._degraded = True
-            self._last_probe_time = time.monotonic()
+            with self._lock:
+                self._degraded = True
+                self._last_probe_time = time.monotonic()
             return
         raise self._backend_error(operation, exc) from exc
 
@@ -696,7 +718,8 @@ class ProxyCache:
             logger.debug("Cache backend probe ping failed: %s", exc)
         else:
             logger.info("Cache backend recovered; restored normal operations")
-            self._degraded = False
+            with self._lock:
+                self._degraded = False
 
     async def resolve_hosts(self, host: str) -> list[str]:
         """Resolve a destination host, bypassing cache on fail-open outages or degraded state."""
@@ -781,21 +804,13 @@ class ProxyCache:
             return
 
         rate_key = f"{self.namespace}:rate:{key}"
-        parsed_period = parse_duration_seconds(
-            self.rate_limit_period, field="rate_limit_period"
-        )
-        period_sec = int(parsed_period)
-        parsed_ttl = (
-            parse_duration_seconds(self.rate_limit_ttl, field="rate_limit_ttl")
-            if self.rate_limit_ttl is not None
-            else None
-        )
-        ttl_sec = int(parsed_ttl) if parsed_ttl is not None else period_sec
+        period_sec = int(self.rate_limit_period_sec)
+        ttl_sec = int(self.rate_limit_ttl_sec)
 
         async def _rate_limit_backend() -> int | None:
             count = await self.cache.incr(rate_key, expire=period_sec)
             if count > self.rate_limit:
-                if count == self.rate_limit + 1:
+                if count >= self.rate_limit + 1:
                     await self.cache.expire(rate_key, ttl_sec)
                 expiry = await self.cache.get_expire(rate_key)
                 if expiry is None or expiry <= 0:
