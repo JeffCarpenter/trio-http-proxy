@@ -24,12 +24,18 @@ class CircuitState(str, enum.Enum):
 class DestinationCircuitBreaker:
     """Explicit Trio-native circuit breaker for a destination (host, port).
 
-    Implements:
-    - Tokenized lease admission via CircuitPermit preventing pre-open completion theft.
-    - Strict half-open single-probe discipline with probe lease tracking.
-    - Deadlock recovery for dropped probe permits after TTL expiration.
-    - O(1) amortized sliding window via collections.deque and rolling error counts.
-    - Strict breaker and epoch identity checking on completion recording.
+    Formal State Invariants:
+    - Invariant I1 (Mutual Exclusion of Probes): In state HALF_OPEN, at most
+      one valid probe lease permit may be active for the current epoch.
+    - Invariant I2 (Epoch Monotonicity): Any state transition or probe lease
+      timeout revocation strictly increases `epoch`, fencing off and invalidating
+      all outstanding permits from prior epochs or expired probe leases.
+    - Invariant I3 (Atomicity & Thread Safety): In-memory mutations are protected
+      by an internal lock, and methods are strictly non-blocking (free of async
+      suspension / await points) to ensure predictable, atomized state transitions.
+    - Invariant I4 (Completion Identity): A completion may only alter circuit state
+      if `permit.breaker is self`, `permit.epoch == self.epoch`, `permit.mark_completed()`
+      succeeds, and (in HALF_OPEN) `permit.permit_id == self._active_probe_id`.
     """
 
     def __init__(
@@ -88,12 +94,16 @@ class DestinationCircuitBreaker:
                         and now - self._probe_started_at >= self.ttl
                     ):
                         logger.warning(
-                            "Probe lease %s timed out after %ss in HALF_OPEN; admitting new probe",
+                            "Probe lease %s timed out after %ss in HALF_OPEN; invalidating lease and admitting new probe",
                             self._active_probe_id,
                             self.ttl,
                         )
                         self._half_open_in_flight = False
                         self._active_probe_id = None
+                        self._probe_started_at = None
+                        # Invariant I2: Increment epoch to fence off any late completion
+                        # from the timed-out probe permit.
+                        self.epoch += 1
                     else:
                         return None
                 self._half_open_in_flight = True
@@ -124,8 +134,8 @@ class DestinationCircuitBreaker:
                 and self.state == CircuitState.HALF_OPEN
                 and permit.is_probe
                 and (
-                    self._active_probe_id is None
-                    or self._active_probe_id == permit.permit_id
+                    self._active_probe_id is not None
+                    and self._active_probe_id == permit.permit_id
                 )
             ):
                 self._half_open_in_flight = False
@@ -160,10 +170,17 @@ class DestinationCircuitBreaker:
                         permit,
                     )
                     return
+                # Invariant I1: Only the actively authorized probe permit for the current
+                # epoch can complete and transition state out of HALF_OPEN.
                 if (
-                    self._active_probe_id is not None
-                    and permit.permit_id != self._active_probe_id
+                    self._active_probe_id is None
+                    or permit.permit_id != self._active_probe_id
                 ):
+                    logger.debug(
+                        "Permit probe_id %s does not match active probe_id %s; ignoring",
+                        permit.permit_id,
+                        self._active_probe_id,
+                    )
                     return
 
                 self._half_open_in_flight = False

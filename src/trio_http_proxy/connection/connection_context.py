@@ -165,21 +165,21 @@ CV_CURRENT_CONTEXT: ContextVar[ConnectionContext | None] = ContextVar(
 
 
 def _connection_context() -> dict[str, Any]:
+    """Retrieve connection context attributes for logging and filtering.
+
+    When an active ConnectionContext is present (the standard architecture),
+    it is the authoritative single source of truth. Ambient loose ContextVars
+    are consulted solely as a fallback for legacy context-less callers.
+    """
     ctx = CV_CURRENT_CONTEXT.get()
     if ctx is not None:
-        conn_id = CV_CONN_ID.get()
-        if conn_id is None:
-            conn_id = ctx.conn_id
-        client_stream = CV_CLIENT_STREAM.get() or ctx.client_stream
-        dest_stream = CV_DEST_STREAM.get() or ctx.dest_stream
-        desthost = CV_DESTHOST.get() or ctx.desthost
-        pipe_from = CV_PIPE_FROM.get() or ctx.pipe_from
-    else:
-        conn_id = CV_CONN_ID.get()
-        client_stream = CV_CLIENT_STREAM.get()
-        dest_stream = CV_DEST_STREAM.get()
-        desthost = CV_DESTHOST.get()
-        pipe_from = CV_PIPE_FROM.get()
+        return ctx.to_dict()
+
+    conn_id = CV_CONN_ID.get()
+    client_stream = CV_CLIENT_STREAM.get()
+    dest_stream = CV_DEST_STREAM.get()
+    desthost = CV_DESTHOST.get()
+    pipe_from = CV_PIPE_FROM.get()
 
     direction = None
     prefix = ""
