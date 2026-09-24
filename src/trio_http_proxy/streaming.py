@@ -12,7 +12,7 @@ from collections.abc import Callable
 
 import trio
 
-from .config import Settings, get_settings
+from .config import Settings, resolve_settings
 from .connection import (
     CV_PIPE_FROM,
     ConnectionContext,
@@ -47,11 +47,7 @@ async def pipe(
     On EOF, calls to_stream.send_eof() if supported to signal half-close.
     """
     if bufmaxsz is None:
-        cfg = (
-            settings
-            if settings is not None
-            else (context.settings if context and context.settings else get_settings())
-        )
+        cfg = resolve_settings(settings, context)
         bufmaxsz = cfg.bufmaxsz
     if context is not None:
         context.set_pipe_from(from_stream)
@@ -93,11 +89,7 @@ async def pipe_with_timeout(
     caller, and nudges its deadline from pipe()'s on_receive/on_send hooks
     rather than making pipe() take a timeout= parameter of its own.
     """
-    cfg = (
-        settings
-        if settings is not None
-        else (context.settings if context and context.settings else get_settings())
-    )
+    cfg = resolve_settings(settings, context)
     pipe_buf_size: int = int(bufmaxsz) if bufmaxsz is not None else int(cfg.bufmaxsz)
     idle_val: float = (
         float(idle_timeout)

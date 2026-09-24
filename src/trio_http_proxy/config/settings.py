@@ -282,8 +282,25 @@ def get_settings() -> Settings:
 reset_settings_cache = get_settings.cache_clear
 
 
+def resolve_settings(settings: Settings | None, context: Any = None) -> Settings:
+    """Resolve the effective Settings for a call: explicit ``settings=`` wins,
+    then a ``context.settings`` (if truthy), then the process-wide default.
+
+    Centralizes the precedence duplicated across http_proxy/tunnel/pipe/
+    pipe_with_timeout/process_as_connect_request so it only needs fixing
+    in one place.
+    """
+    if settings is not None:
+        return settings
+    context_settings = getattr(context, "settings", None)
+    if context_settings:
+        return context_settings
+    return get_settings()
+
+
 __all__ = [
     "Settings",
     "get_settings",
     "reset_settings_cache",
+    "resolve_settings",
 ]

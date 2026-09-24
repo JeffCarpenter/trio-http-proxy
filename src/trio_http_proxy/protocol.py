@@ -14,7 +14,7 @@ import h11
 import trio
 
 from . import http
-from .config import Settings, get_settings
+from .config import Settings, resolve_settings
 from .connection import ConnectionContext, ConnectionFilter, ConnectionLoggerAdapter
 from .errors import ProxyProtocolError, RequestTooLargeError
 
@@ -42,11 +42,7 @@ async def process_as_connect_request(
     Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout
     seconds.
     """
-    cfg = (
-        settings
-        if settings is not None
-        else (context.settings if context and context.settings else get_settings())
-    )
+    cfg = resolve_settings(settings, context)
     req_bufmaxsz: int = int(bufmaxsz) if bufmaxsz is not None else int(cfg.bufmaxsz)
     req_maxreqsz: int = int(maxreqsz) if maxreqsz is not None else int(cfg.maxreqsz)
     req_read_timeout: float = (

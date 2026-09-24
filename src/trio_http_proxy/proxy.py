@@ -25,7 +25,7 @@ from .cache import (
     get_client_key,
 )
 from .circuit_breaker import CircuitPermit
-from .config import Settings, get_settings
+from .config import Settings, get_settings, resolve_settings
 from .config.builder import ProxyCacheBuilder, SettingsBuilderMixin
 from .connection import (
     _DEFAULT_PROXY_CACHE_SENTINEL,
@@ -113,11 +113,7 @@ async def http_proxy(
     settings: Settings | None = None,
     context: ConnectionContext | None = None,
 ) -> None:
-    _proxy_cfg = (
-        settings
-        if settings is not None
-        else (context.settings if context and context.settings else get_settings())
-    )
+    _proxy_cfg = resolve_settings(settings, context)
     idle_timeout = (
         idle_timeout if idle_timeout is not None else _proxy_cfg.pipe_idle_timeout
     )
@@ -513,6 +509,12 @@ async def _record_connection_result(
     proxy_cache: ProxyCacheProtocol | None | Any,
     record: ConnectionRecord | ConnectionResultBuilder,
 ) -> None:
+    # Every call site here passes a ConnectionResultBuilder; delegate to its
+    # own record_to() dispatch (proxy_cache=None guard + legacy
+    # record_result()-only fallback) instead of duplicating that logic.
+    if isinstance(record, ConnectionResultBuilder):
+        await record.record_to(proxy_cache)
+        return
     if proxy_cache is None:
         return
     await proxy_cache.record_connection_result(record)
@@ -533,11 +535,7 @@ async def tunnel(
     and notify the client when the end-to-end connection has been established.
     Return the destination stream.
     """
-    cfg = (
-        settings
-        if settings is not None
-        else (context.settings if context and context.settings else get_settings())
-    )
+    cfg = resolve_settings(settings, context)
     req_read_timeout: float = (
         float(read_timeout)
         if read_timeout is not None
@@ -595,9 +593,11 @@ async def tunnel(
             pass
         raise
 
-    CV_DESTHOST.set(desthost)
-    if context is not None:
-        context.set_desthost(desthost, destport)
+    if context is None:
+        # When a context is present, process_as_connect_request() already
+        # called context.set_desthost() (which sets CV_DESTHOST too); only
+        # the context-less legacy path needs this direct set.
+        CV_DESTHOST.set(desthost)
 
     result_builder = ConnectionResultBuilder().with_target(desthost, destport)
     permit: CircuitPermit | None = None
@@ -713,9 +713,11 @@ async def tunnel(
 
     assert dest_stream is not None
     try:
-        CV_DEST_STREAM.set(dest_stream)
         if context is not None:
+            # set_dest_stream() already sets CV_DEST_STREAM internally.
             context.set_dest_stream(dest_stream)
+        else:
+            CV_DEST_STREAM.set(dest_stream)
         logger.info("Connected to %s, sending 200 to client...", desthost)
         await client_stream.send_all(http.http_200_connection_established)
         if trailing_data:

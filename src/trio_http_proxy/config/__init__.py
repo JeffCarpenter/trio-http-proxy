@@ -24,6 +24,7 @@ from .settings import (
     Settings,
     get_settings,
     reset_settings_cache,
+    resolve_settings,
 )
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "normalize_optional_duration",
     "parse_duration_seconds",
     "reset_settings_cache",
+    "resolve_settings",
     "validate_duration_string",
     "validate_namespace",
 ]

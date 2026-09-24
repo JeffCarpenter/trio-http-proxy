@@ -89,12 +89,19 @@ class CircuitBreakerManager:
             return breaker
 
     def _evict_one_locked(self) -> None:
-        """Evict an idle CLOSED breaker, avoiding eviction of active OPEN breakers."""
-        if not self._breakers:
-            return
+        """Evict an idle CLOSED breaker, avoiding eviction of active OPEN breakers.
+
+        The sole caller (get_breaker) only invokes this when
+        `len(self._breakers) >= self.max_destinations >= 1`, so `self._breakers`
+        is always non-empty on entry; steps 1-3 below only ever delete (never
+        add), so it stays non-empty through step 4. Each loop below returns
+        immediately after its one `del`, so iterating `self._breakers.items()`
+        directly (no `list(...)` copy) is safe -- iteration never resumes
+        after that mutation.
+        """
         now = time.monotonic()
         # 1. Look for idle CLOSED breaker with empty calls (after pruning) and no in-flight probe (§6.14)
-        for k, b in list(self._breakers.items()):
+        for k, b in self._breakers.items():
             with b._lock:
                 if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
                     b._prune_calls(now)
@@ -103,22 +110,21 @@ class CircuitBreakerManager:
                         return
 
         # 2. Fallback: any CLOSED breaker without active probe
-        for k, b in list(self._breakers.items()):
+        for k, b in self._breakers.items():
             with b._lock:
                 if b.state == CircuitState.CLOSED and not b._half_open_in_flight:
                     del self._breakers[k]
                     return
 
         # 3. Fallback: any non-OPEN breaker
-        for k, b in list(self._breakers.items()):
+        for k, b in self._breakers.items():
             with b._lock:
                 if b.state != CircuitState.OPEN and not b._half_open_in_flight:
                     del self._breakers[k]
                     return
 
-        # 4. Last resort: evict oldest entry if any exist
-        if self._breakers:
-            self._breakers.popitem(last=False)
+        # 4. Last resort: evict oldest entry.
+        self._breakers.popitem(last=False)
 
     def acquire_permit(
         self, host: str, port: int, now: float | None = None

@@ -34,10 +34,16 @@ class RateLimitError(cashews.RateLimitError):
         retry_after: int | None = None,
         **kwargs: Any,
     ) -> None:
-        try:
-            super().__init__(*args, **kwargs)
-        except TypeError:
-            super().__init__(*args)
+        # cashews.RateLimitError inherits Exception.__init__(self, *args),
+        # which accepts no keyword arguments at all -- so **kwargs here only
+        # exists to let callers pass (and this class discard) unrecognized
+        # legacy kwargs without raising, not to actually forward them.
+        # A blanket `except TypeError` around the super().__init__() call
+        # would also mask a genuine TypeError unrelated to kwargs, so just
+        # drop kwargs explicitly instead of relying on the exception to
+        # tell us they weren't accepted.
+        del kwargs
+        super().__init__(*args)
         self.retry_after = retry_after
 
     @property
