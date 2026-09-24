@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 from .settings import Settings
@@ -10,10 +9,6 @@ from .settings import Settings
 if TYPE_CHECKING:
     from ..proxy import ProxyBuilder
     from ..proxy_cache import ProxyCache
-
-_CV_BUILDER_CACHE_STACK: ContextVar[list[Any] | None] = ContextVar(
-    "_builder_cache_stack", default=None
-)
 
 
 class SettingsBuilderMixin:
@@ -45,6 +40,11 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
     def __init__(self, settings: Settings | None = None, **overrides: Any) -> None:
         self._base_settings: Settings | None = settings
         self._overrides: dict[str, Any] = dict(overrides)
+        # Per-instance LIFO stack (not shared with other builder instances or
+        # tasks): supports reentering the *same* builder instance in nested
+        # `async with`/`with` blocks without one entry's cache clobbering
+        # another's on exit.
+        self._active_caches: list[ProxyCache] = []
 
     def with_cache(
         self,
@@ -192,32 +192,22 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
 
     async def __aenter__(self) -> ProxyCache:
         cache = self.build()
-        stack = _CV_BUILDER_CACHE_STACK.get()
-        if stack is None:
-            stack = []
-            _CV_BUILDER_CACHE_STACK.set(stack)
-        stack.append(cache)
+        self._active_caches.append(cache)
         return await cache.__aenter__()
 
     async def __aexit__(self, *args: object) -> None:
-        stack = _CV_BUILDER_CACHE_STACK.get()
-        if stack:
-            cache = stack.pop()
+        if self._active_caches:
+            cache = self._active_caches.pop()
             await cache.__aexit__(*args)
 
     def __enter__(self) -> ProxyCache:
         cache = self.build()
-        stack = _CV_BUILDER_CACHE_STACK.get()
-        if stack is None:
-            stack = []
-            _CV_BUILDER_CACHE_STACK.set(stack)
-        stack.append(cache)
+        self._active_caches.append(cache)
         return cache.__enter__()
 
     def __exit__(self, *args: object) -> None:
-        stack = _CV_BUILDER_CACHE_STACK.get()
-        if stack:
-            cache = stack.pop()
+        if self._active_caches:
+            cache = self._active_caches.pop()
             cache.__exit__(*args)
 
 

@@ -416,7 +416,16 @@ class ProxyCache:
                 setup_error = exc
 
         with self._lock:
-            if setup_error is not None:
+            # A concurrent stop() may have already closed the loop/thread while
+            # this lock was released for the ping above. If so, don't clobber
+            # its STOPPING/STOPPED state back to RUNNING -- the loop is gone.
+            already_stopping = self._lifecycle_state in (
+                LifecycleState.STOPPING,
+                LifecycleState.STOPPED,
+            )
+            if already_stopping:
+                pass
+            elif setup_error is not None:
                 logger.warning(
                     "Failed to setup cashews cache or startup ping failed with %s: %s",
                     redact_url(self.cache_url),
@@ -439,11 +448,19 @@ class ProxyCache:
                 self._last_probe_time = time.monotonic()
                 self._lifecycle_state = LifecycleState.RUNNING
 
+        if already_stopping:
+            return
+
         if setup_error is not None:
             if stop_parts is not None:
                 self._finish_stop(*stop_parts)
             if self.cache_failure_policy == "fail-open":
                 with self._lock:
+                    if self._lifecycle_state in (
+                        LifecycleState.STOPPING,
+                        LifecycleState.STOPPED,
+                    ):
+                        return
                     self._degraded = True
                     self._last_probe_time = time.monotonic()
                     self._stopped = False
@@ -810,10 +827,16 @@ class ProxyCache:
         async def _rate_limit_backend() -> int | None:
             count = await self.cache.incr(rate_key, expire=period_sec)
             if count > self.rate_limit:
-                if count >= self.rate_limit + 1:
-                    await self.cache.expire(rate_key, ttl_sec)
                 expiry = await self.cache.get_expire(rate_key)
                 if expiry is None or expiry <= 0:
+                    # No ban TTL attached yet (first violation, or a
+                    # concurrent burst raced past it without ever seeing
+                    # count == rate_limit + 1) -- attach it now. Checking
+                    # get_expire() first, instead of unconditionally calling
+                    # expire() on every over-limit request, keeps the ban a
+                    # fixed RATE_LIMIT_TTL window instead of one that resets
+                    # on every retry from a client that keeps hammering it.
+                    await self.cache.expire(rate_key, ttl_sec)
                     expiry = ttl_sec
                 return max(1, math.ceil(float(expiry)))
             return None
