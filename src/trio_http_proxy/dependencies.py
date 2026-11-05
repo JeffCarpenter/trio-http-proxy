@@ -1,5 +1,6 @@
 """Small structural contracts for the proxy cache's external effects."""
 
+from asyncio import AbstractEventLoop
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -32,6 +33,21 @@ class HostResolver(Protocol):
     """Blocking DNS lookup, run in the bridge's executor, never on Trio's thread."""
 
     def __call__(self, host: str, /) -> Sequence[str]: ...
+
+
+type StartupResult = tuple[AbstractEventLoop | None, BaseException | None]
+
+
+class StartupChannel(Protocol):
+    """Thread-safe, single-publication handoff for bridge startup.
+
+    Reads raise queue.Empty on deadline or when no result is available.
+    queue.Queue implements this contract without an adapter.
+    """
+
+    def put(self, item: StartupResult) -> None: ...
+    def get(self, *, timeout: float) -> StartupResult: ...
+    def get_nowait(self) -> StartupResult: ...
 
 
 class ThreadHandle(Protocol):

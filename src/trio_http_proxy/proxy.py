@@ -127,7 +127,16 @@ async def http_proxy(
     *,
     settings: Settings | None = None,
     context: ConnectionContext | None = None,
+    client_key_resolver: Callable[[trio.abc.Stream], str | None] | None = None,
 ) -> None:
+    """Serve one connection; resolve its rate-limit identity at the stream boundary.
+
+    Wrapped or non-socket transports may supply a trusted identity resolver.
+    The default extracts the peer IP from the stream's socket.
+    """
+    resolve_client_key = (
+        client_key_resolver if client_key_resolver is not None else get_client_key
+    )
     nextid_fn = _nextid if _nextid is not None else _conn_ids.__next__
     connect_fn = _connect if _connect is not None else trio.open_tcp_stream
     _proxy_cfg = resolve_settings(settings, context)
@@ -156,7 +165,7 @@ async def http_proxy(
             async with client_stream, limiter_ctx:
                 if proxy_cache is not None:
                     try:
-                        client_key = get_client_key(client_stream)
+                        client_key = resolve_client_key(client_stream)
                         if client_key:
                             try:
                                 await proxy_cache.check_rate_limit(client_key)

@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from ..dependencies import CacheBackend, HostResolver, ThreadFactory, ThreadHandle
+from ..dependencies import (
+    CacheBackend,
+    HostResolver,
+    StartupChannel,
+    StartupResult,
+    ThreadFactory,
+    ThreadHandle,
+)
 from ..proxy_cache import (
     BACKEND_EXCEPTIONS,
     LifecycleState,
@@ -21,6 +28,8 @@ __all__ = [
     "ProxyCache",
     "ProxyCacheBuilder",
     "ProxyCacheProtocol",
+    "StartupChannel",
+    "StartupResult",
     "ThreadFactory",
     "ThreadHandle",
     "get_client_key",

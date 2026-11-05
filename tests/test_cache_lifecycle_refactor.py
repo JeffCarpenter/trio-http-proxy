@@ -89,27 +89,33 @@ def test_shutdown_retry_reuses_inflight_cleanup(join_failure):
             workers[0].worker.join(2)
 
 
-def test_startup_timeout_stops_loop_published_at_deadline(monkeypatch):
+def test_startup_timeout_stops_loop_published_at_deadline():
     running = threading.Event()
     published_loop = []
-    real_queue = queue.Queue
 
-    class TimeoutAtPublication(real_queue):
-        def put(self, item, *args, **kwargs):
-            super().put(item, *args, **kwargs)
+    class TimeoutAtPublication:
+        def __init__(self):
+            self.results = queue.Queue(maxsize=1)
+
+        def put(self, item):
+            self.results.put(item)
             loop, error = item
             assert error is None
             published_loop.append(loop)
             loop.call_soon(running.set)
 
-        def get(self, block=True, timeout=None):
-            if not block:
-                return super().get(block=False)
+        def get(self, *, timeout):
             assert running.wait(2)
             raise queue.Empty
 
-    monkeypatch.setattr("trio_http_proxy.proxy_cache.queue.Queue", TimeoutAtPublication)
-    cache = ProxyCache(backend=ControlledBackend(), rate_limit_enabled=True)
+        def get_nowait(self):
+            return self.results.get_nowait()
+
+    cache = ProxyCache(
+        backend=ControlledBackend(),
+        rate_limit_enabled=True,
+        startup_channel_factory=TimeoutAtPublication,
+    )
     with pytest.raises(RuntimeError, match="Timed out waiting"):
         cache.start()
     worker = cache._thread

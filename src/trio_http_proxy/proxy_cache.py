@@ -26,7 +26,13 @@ from .circuit_breaker import (
     CircuitBreakerManager,
     CircuitPermit,
 )
-from .dependencies import CacheBackend, HostResolver, ThreadFactory, ThreadHandle
+from .dependencies import (
+    CacheBackend,
+    HostResolver,
+    StartupChannel,
+    ThreadFactory,
+    ThreadHandle,
+)
 from .errors import CacheBackendUnavailable, RateLimitError
 from .util import redact_url
 
@@ -261,6 +267,7 @@ class ProxyCache:
         resolver: HostResolver | None = None,
         clock: Callable[[], float] | None = None,
         thread_factory: ThreadFactory | None = None,
+        startup_channel_factory: Callable[[], StartupChannel] | None = None,
         **kwargs: Any,
     ) -> None:
         if settings is not None:
@@ -315,6 +322,11 @@ class ProxyCache:
         self._clock = clock if clock is not None else time.monotonic
         self._thread_factory: ThreadFactory = (
             thread_factory if thread_factory is not None else threading.Thread
+        )
+        self._startup_channel_factory: Callable[[], StartupChannel] = (
+            startup_channel_factory
+            if startup_channel_factory is not None
+            else lambda: queue.Queue(maxsize=1)
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: ThreadHandle | None = None
@@ -403,9 +415,7 @@ class ProxyCache:
                 self._lifecycle_state = LifecycleState.RUNNING
                 return
 
-            startup_queue: queue.Queue[
-                tuple[asyncio.AbstractEventLoop | None, BaseException | None]
-            ] = queue.Queue(maxsize=1)
+            startup_queue: StartupChannel
 
             def _run_loop() -> None:
                 if self._startup_aborted.is_set():
@@ -428,6 +438,7 @@ class ProxyCache:
                     loop.close()
 
             try:
+                startup_queue = self._startup_channel_factory()
                 self._thread = self._thread_factory(
                     target=_run_loop, daemon=True, name="cashews-trio-bridge"
                 )

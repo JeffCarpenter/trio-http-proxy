@@ -1,7 +1,7 @@
 """Behavioral contracts for shared response, validation, and permit paths."""
 
+from time import monotonic
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import trio
@@ -9,9 +9,10 @@ import trio.testing as tt
 from pydantic import ValidationError
 
 from trio_http_proxy import http, proxy
-from trio_http_proxy.circuit_breaker import CircuitPermit
+from trio_http_proxy.cache import ProxyCache
+from trio_http_proxy.circuit_breaker import CircuitState, DestinationCircuitBreaker
 from trio_http_proxy.config import Settings
-from trio_http_proxy.errors import RateLimitError
+from trio_http_proxy.errors import CircuitBreakerOpen, RateLimitError
 from trio_http_proxy.proxy_cache import ConnectionRecord, ConnectionResultBuilder
 
 
@@ -48,14 +49,17 @@ def test_positive_duration_validation_identifies_field(field, value):
 @pytest.mark.parametrize("finalization", ["unresolved", "completed", "aborted"])
 @pytest.mark.parametrize("exceptional_exit", [False, True])
 def test_permit_context_exit_is_idempotent(finalization, exceptional_exit):
-    breaker = Mock()
-    permit = CircuitPermit(breaker, epoch=1, permit_id=2, is_probe=True)
+    breaker = DestinationCircuitBreaker(min_calls=1, ttl=1)
+    breaker.record_result(OSError("open circuit"), now=0)
+    permit = breaker.acquire_permit(now=1)
+    assert permit is not None and permit.is_probe
+    assert breaker.acquire_permit(now=1) is None
     error = RuntimeError("cancel probe")
 
     def use_permit():
         with permit:
             if finalization == "completed":
-                assert permit.mark_completed()
+                breaker.record_result(None, now=1, permit=permit)
             elif finalization == "aborted":
                 permit.abort()
             if exceptional_exit:
@@ -68,51 +72,76 @@ def test_permit_context_exit_is_idempotent(finalization, exceptional_exit):
     else:
         use_permit()
 
-    permit.__exit__(None, None, None)
-    permit.abort()
     assert permit.was_completed == (finalization == "completed")
     assert permit.was_aborted == (finalization != "completed")
-    assert breaker._abort_permit.call_count == (0 if finalization == "completed" else 1)
+    assert breaker.state is (
+        CircuitState.CLOSED if finalization == "completed" else CircuitState.HALF_OPEN
+    )
+    successor = breaker.acquire_permit(now=1)
+    assert successor is not None
+
+    # Re-finalizing an old lease must not release its successor.
+    permit.__exit__(None, None, None)
+    permit.abort()
+    if successor.is_probe:
+        assert breaker.acquire_permit(now=1) is None
+    breaker.record_result(None, now=1, permit=successor)
+    assert successor.was_completed
+    assert breaker.state is CircuitState.CLOSED
 
 
 @pytest.mark.parametrize("timeout", [False, True])
+@pytest.mark.parametrize("probe", [False, True])
 @tt.trio_test
-async def test_connect_failure_records_once_then_releases_permit(timeout):
+async def test_connect_failure_records_once_then_releases_permit(timeout, probe):
     error = trio.TooSlowError("timeout") if timeout else OSError("refused")
-    permit = Mock()
-    records = []
     attempts = []
-
-    class Cache:
-        async def check_circuit(self, host, port):
-            return permit
-
-        async def resolve_hosts(self, host):
-            return ["192.0.2.1", "192.0.2.2"]
-
-        def record_connection_result(self, record):
-            records.append(record)
 
     async def connect(host, port):
         attempts.append((host, port))
         raise error
 
-    client, peer = tt.memory_stream_pair()
-    await peer.send_all(
-        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
-    )
-    with pytest.raises(type(error)) as raised:
-        await proxy.tunnel(client, _connect=connect, proxy_cache=Cache())
+    async with ProxyCache(
+        resolver=lambda host: ["192.0.2.1", "192.0.2.2"],
+        dns_cache_ttl="60s",
+        circuit_breaker_min_calls=2,
+    ) as cache:
+        if probe:
+            breaker = cache._circuit_manager.get_breaker("example.com", 443)
+            expired = monotonic() - breaker.ttl - 1
+            breaker.record_result(error, now=expired)
+            breaker.record_result(error, now=expired)
+            assert breaker.state is CircuitState.OPEN
 
-    assert raised.value is error
-    assert attempts == [("192.0.2.1", 443), ("192.0.2.2", 443)]
-    assert len(records) == 1
-    assert records[0].host == "example.com"
-    assert records[0].port == 443
-    assert records[0].error is error
-    permit.abort.assert_called_once_with()
-    expected = http.http_504_gateway_timeout if timeout else http.http_502_bad_gateway
-    assert await peer.receive_some(4096) == expected
+        client, peer = tt.memory_stream_pair()
+        async with client, peer:
+            await peer.send_all(
+                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+            )
+            with pytest.raises(type(error)) as raised:
+                await proxy.tunnel(client, _connect=connect, proxy_cache=cache)
+            assert raised.value is error
+            assert attempts == [("192.0.2.1", 443), ("192.0.2.2", 443)]
+            expected = (
+                http.http_504_gateway_timeout if timeout else http.http_502_bad_gateway
+            )
+            assert await peer.receive_some(4096) == expected
+
+        successor = await cache.check_circuit("example.com", 443)
+        assert successor is not None
+        assert successor.is_probe == probe
+        if probe:
+            # A failed attempt relinquishes its probe lease immediately.
+            with pytest.raises(CircuitBreakerOpen):
+                await cache.check_circuit("example.com", 443)
+        else:
+            # Two failed addresses count as one failed CONNECT, not two or zero.
+            await cache.record_connection_result(
+                ConnectionRecord("example.com", 443, error=error)
+            )
+            with pytest.raises(CircuitBreakerOpen):
+                await cache.check_circuit("example.com", 443)
+        successor.abort()
 
 
 @pytest.mark.parametrize("use_builder", [False, True])
@@ -124,7 +153,7 @@ async def test_result_dispatch_preserves_sync_async_and_legacy_support(
     use_builder, legacy_cache, async_recorder, success
 ):
     error = None if success else OSError("refused")
-    permit = Mock() if success else None
+    permit = DestinationCircuitBreaker().acquire_permit() if success else None
     record = ConnectionRecord("example.com", 443, error, permit)
     calls = []
 

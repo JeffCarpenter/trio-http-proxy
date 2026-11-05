@@ -36,7 +36,14 @@ from .connection import (
     ConnectionLoggerAdapter,
     format_conn_prefix,
 )
-from .dependencies import CacheBackend, HostResolver, ThreadFactory, ThreadHandle
+from .dependencies import (
+    CacheBackend,
+    HostResolver,
+    StartupChannel,
+    StartupResult,
+    ThreadFactory,
+    ThreadHandle,
+)
 from .errors import (
     CacheBackendUnavailable,
     CircuitBreakerOpen,
@@ -99,6 +106,8 @@ __all__ = [
     "RateLimitError",
     "RequestTooLargeError",
     "Settings",
+    "StartupChannel",
+    "StartupResult",
     "ThreadFactory",
     "ThreadHandle",
     "cache",

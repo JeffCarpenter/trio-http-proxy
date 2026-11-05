@@ -1,6 +1,6 @@
 # Testing with injected dependencies
 
-`ProxyCache` and `ProxyCacheBuilder` accept four optional, keyword-only dependencies:
+`ProxyCache` and `ProxyCacheBuilder` accept these optional, keyword-only dependencies:
 
 | Argument | Contract | Default |
 | --- | --- | --- |
@@ -8,6 +8,7 @@
 | `resolver` | `HostResolver`: blocking `host -> Sequence[str]` | System TCP address lookup |
 | `clock` | Callable returning monotonic seconds | `time.monotonic` |
 | `thread_factory` | `ThreadFactory`: creates a `ThreadHandle` with start/join/is_alive | `threading.Thread` |
+| `startup_channel_factory` | Creates a fresh `StartupChannel` for bridge-thread publication and deadline reads | `queue.Queue(maxsize=1)` |
 
 The protocols are exported from `trio_http_proxy` and `trio_http_proxy.cache`.
 They use structural typing: collaborators need not inherit from a particular
@@ -56,6 +57,12 @@ async def check_dns() -> None:
 - The thread factory receives `target`, `daemon`, and `name` as keyword arguments.
   A supplied handle must honor normal thread startup, liveness, and join semantics.
   DNS executor workers are not created through this factory.
+- The startup channel transfers one `(event_loop, error)` result from the bridge
+  thread to the starting thread. It must be thread-safe. `get(timeout=...)` and
+  `get_nowait()` raise `queue.Empty` when no result is available. Each startup
+  owns a fresh channel; the default bounded queue needs no adapter. Supplying a
+  channel lets tests control deadline/publication races without patching queues
+  globally. Channel creation failures stop startup just like thread creation failures.
 
 `tests/cache_fakes.py` provides a controllable, protocol-compatible backend. Its
 instance-local effects model setup, operation, and ping failures and recovery
@@ -66,6 +73,25 @@ For lifecycle transitions, shutdown ownership, retry behavior, and recorder
 compatibility, see [cache lifecycle and bridge ownership](cache-lifecycle.md).
 `tests/test_cache_lifecycle_refactor.py` uses events and controlled join failures
 to exercise startup/shutdown races without timing sleeps.
+
+## Connection identity and behavioral tests
+
+`http_proxy` accepts a keyword-only `client_key_resolver(stream) -> str | None`.
+By default it extracts the peer IP from the stream's socket. A trusted transport
+adapter can supply identity for wrapped or non-socket streams; `None` skips
+per-client rate limiting. Do not derive trusted client identity from unverified
+CONNECT request data.
+
+Tests compose real memory streams, caches, and circuit breakers. Permit tests
+assert state transitions and subsequent admission, rather than calls to private
+methods. Backend recovery starts with failed public operations, not assignments
+to cache state. The controlled backend records attempted operation names so
+probe throttling can be checked without `AsyncMock`. Recorder compatibility tests
+retain small adapters for sync/async and legacy contracts.
+
+Trio's `MockClock` remains a virtual scheduler for timeout tests. It does not
+replace proxy behavior. Backend probe tests use a separate manually advanced
+monotonic clock, which does not control backend key expiry.
 
 ## Property tests
 

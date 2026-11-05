@@ -56,18 +56,22 @@ async def test_repro_c2_broken_resource_does_not_escape_http_proxy():
 
 
 @tt.trio_test
-async def test_repro_c2_rate_limit_broken_resource_does_not_escape():
+async def test_repro_c2_rate_limit_broken_resource_does_not_escape(caplog):
     """If client stream is broken during 429 response, http_proxy must not raise."""
     proxy_client, test_client = tt.memory_stream_pair()
 
-    pc = ProxyCache(rate_limit_enabled=True, rate_limit=1)
-    await pc.check_rate_limit("127.0.0.1")  # exhaust rate limit
+    def identify_client(stream):
+        assert stream is proxy_client
+        return "127.0.0.1"
 
-    # Mock get_client_key to return an IP
-    await test_client.aclose()
-    # http_proxy should catch BrokenResourceError or any exception sending 429
-    await proxy.http_proxy(proxy_client, proxy_cache=pc)
-    pc.stop()
+    async with ProxyCache(rate_limit_enabled=True, rate_limit=1) as pc:
+        await pc.check_rate_limit("127.0.0.1")  # exhaust rate limit
+        await test_client.aclose()
+        await proxy.http_proxy(
+            proxy_client, proxy_cache=pc, client_key_resolver=identify_client
+        )
+    # Prove this exercised the broken 429 response, not the CONNECT parser.
+    assert "Rate limit exceeded" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -186,14 +190,13 @@ async def test_repro_r4_dns_cache_fallback():
             raise OSError("Connection refused on IPv4 #1")
         return dest_server
 
-    class MultiDnsCache(ProxyCache):
-        async def resolve_hosts(self, host: str):
-            return ["192.0.2.1", "192.0.2.2"]
-
     await test_client.send_all(connect_request(target=b"dual.example.com:443"))
 
-    pc = MultiDnsCache(cache_url="mem://", dns_cache_ttl="60s")
-    stream = await proxy.tunnel(proxy_client, _connect=fake_connect, proxy_cache=pc)
+    async with ProxyCache(
+        resolver=lambda host: ["192.0.2.1", "192.0.2.2"],
+        dns_cache_ttl="60s",
+    ) as pc:
+        stream = await proxy.tunnel(proxy_client, _connect=fake_connect, proxy_cache=pc)
     assert stream is dest_server
     assert tried == ["192.0.2.1", "192.0.2.2"]
 

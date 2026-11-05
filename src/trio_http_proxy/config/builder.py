@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, Self
 
-from ..dependencies import CacheBackend, HostResolver, ThreadFactory
+from ..dependencies import CacheBackend, HostResolver, StartupChannel, ThreadFactory
 from .settings import Settings
 
 if TYPE_CHECKING:
@@ -47,12 +47,14 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
         resolver: HostResolver | None = None,
         clock: Callable[[], float] | None = None,
         thread_factory: ThreadFactory | None = None,
+        startup_channel_factory: Callable[[], StartupChannel] | None = None,
         **overrides: Any,
     ) -> None:
         self._backend = backend
         self._resolver = resolver
         self._clock = clock
         self._thread_factory = thread_factory
+        self._startup_channel_factory = startup_channel_factory
         self._base_settings: Settings | None = settings
         self._overrides: dict[str, Any] = dict(overrides)
         # Per-instance LIFO stack (not shared with other builder instances or
@@ -200,6 +202,7 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
             resolver=self._resolver,
             clock=self._clock,
             thread_factory=self._thread_factory,
+            startup_channel_factory=self._startup_channel_factory,
         )
 
     def build_proxy(self, port: int | None = None) -> ProxyBuilder:

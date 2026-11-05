@@ -16,12 +16,15 @@ class ControlledBackend:
             storage if storage is not None else Cache(name="test-backend")
         )
         self.effects: dict[str, Callable[..., Any]] = {}
+        # Appended on the bridge thread; inspect after awaiting the operation.
+        self.operations: list[str] = []
 
     def setup(self, settings_url: str, *, suppress: bool) -> object:
         setup = self.effects.get("setup", self.storage.setup)
         return setup(settings_url, suppress=suppress)
 
     async def _call(self, operation: str, *args: Any, **kwargs: Any) -> Any:
+        self.operations.append(operation)
         effect = self.effects.get(operation)
         if effect is not None:
             return await effect(*args, **kwargs)

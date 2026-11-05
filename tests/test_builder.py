@@ -8,8 +8,9 @@ import pytest
 import trio.testing as tt
 
 from trio_http_proxy.cache import ProxyCache, ProxyCacheBuilder
-from trio_http_proxy.circuit_breaker import CircuitPermit
+from trio_http_proxy.circuit_breaker import CircuitPermit, DestinationCircuitBreaker
 from trio_http_proxy.config import Settings
+from trio_http_proxy.errors import CircuitBreakerOpen
 from trio_http_proxy.proxy import (
     ConnectionRecord,
     ConnectionResultBuilder,
@@ -85,15 +86,19 @@ def test_proxy_builder_configuration():
     assert settings.log_level == "DEBUG"
 
 
-def test_connection_result_builder_permit():
-    dummy_permit = cast(CircuitPermit, object())
+@pytest.fixture
+def permit() -> CircuitPermit:
+    lease = DestinationCircuitBreaker().acquire_permit()
+    assert lease is not None
+    return lease
+
+
+def test_connection_result_builder_permit(permit):
     with pytest.deprecated_call():
-        builder = ConnectionResultBuilder(host="svc.local", port=80).with_permit(
-            dummy_permit
-        )
+        builder = ConnectionResultBuilder(host="svc.local", port=80).with_permit(permit)
     record = builder.build()
     assert record.has_permit is True
-    assert record.permit is dummy_permit
+    assert record.permit is permit
 
 
 def test_connection_result_builder_validation():
@@ -117,44 +122,39 @@ def test_proxy_cache_classmethod_result_builder():
     assert record.is_success is True
 
 
+@pytest.mark.parametrize("use_builder", [False, True])
+@pytest.mark.parametrize("success", [False, True])
 @tt.trio_test
-async def test_connection_result_builder_record_to():
-    recorded = []
+async def test_connection_recording_updates_real_breaker(use_builder, success):
+    async with ProxyCache(circuit_breaker_min_calls=1) as cache:
+        permit = await cache.check_circuit("test.local", 443)
+        assert permit is not None
+        error = None if success else OSError("connection refused")
+        if use_builder:
+            with pytest.deprecated_call():
+                builder = ConnectionResultBuilder("test.local", 443)
+            if success:
+                builder.with_success().with_permit(permit)
+            else:
+                builder.with_error(error)
+            await builder.record_to(cache)
+        else:
+            await cache.record_connection_result(
+                ConnectionRecord("test.local", 443, error, permit if success else None)
+            )
 
-    class MockCache:
-        async def record_connection_result(self, record):
-            recorded.append(record)
-
-    cache = MockCache()
-    with pytest.deprecated_call():
-        builder = ConnectionResultBuilder("test.local", 443).with_success()
-    await builder.record_to(cache)
-
-    assert len(recorded) == 1
-    assert recorded[0].host == "test.local"
-    assert recorded[0].port == 443
-    assert recorded[0].is_success is True
-
-
-@tt.trio_test
-async def test_connection_record_direct_recording():
-    recorded = []
-
-    class MockCache:
-        async def record_connection_result(self, record):
-            recorded.append(record)
-
-    cache = MockCache()
-    record = ConnectionRecord("test.local", 443)
-    await cache.record_connection_result(record)
-
-    assert len(recorded) == 1
-    assert recorded[0].host == "test.local"
-    assert recorded[0].port == 443
-    assert recorded[0].is_success is True
+        if success:
+            assert permit.was_completed
+            successor = await cache.check_circuit("test.local", 443)
+            assert successor is not None
+            successor.abort()
+        else:
+            with pytest.raises(CircuitBreakerOpen):
+                await cache.check_circuit("test.local", 443)
+        permit.abort()
 
 
-def test_connection_record_direct_kwargs():
+def test_connection_record_direct_kwargs(permit):
     record = ConnectionRecord(host="svc.local", port=80)
     assert record.host == "svc.local"
     assert record.port == 80
@@ -163,12 +163,9 @@ def test_connection_record_direct_kwargs():
     assert record.is_success is True
     assert record.has_permit is False
 
-    dummy_permit = cast(CircuitPermit, object())
-    record_with_permit = ConnectionRecord(
-        host="svc.local", port=443, permit=dummy_permit
-    )
+    record_with_permit = ConnectionRecord(host="svc.local", port=443, permit=permit)
     assert record_with_permit.has_permit is True
-    assert record_with_permit.permit is dummy_permit
+    assert record_with_permit.permit is permit
     assert record_with_permit.is_success is True
 
     err = OSError("connect failed")
@@ -178,7 +175,7 @@ def test_connection_record_direct_kwargs():
     assert record_with_error.has_permit is False
 
 
-def test_connection_record_validation_invariants():
+def test_connection_record_validation_invariants(permit):
     # Host must be non-empty string
     with pytest.raises(ValueError, match="host must be specified"):
         ConnectionRecord(host="", port=80)
@@ -201,7 +198,6 @@ def test_connection_record_validation_invariants():
         ConnectionRecord(host="example.com", port=cast(int, True))
 
     # Error and permit are mutually exclusive (Philip Wadler's vision)
-    dummy_permit = cast(CircuitPermit, object())
     with pytest.raises(
         ValueError, match="cannot simultaneously hold both an error and a permit"
     ):
@@ -209,5 +205,5 @@ def test_connection_record_validation_invariants():
             host="example.com",
             port=443,
             error=OSError("fail"),
-            permit=dummy_permit,
+            permit=permit,
         )

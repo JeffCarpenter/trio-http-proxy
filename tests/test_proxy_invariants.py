@@ -338,19 +338,18 @@ async def test_invariant_7_fallback_when_first_address_times_out():
             raise trio.TooSlowError("Host 1 timed out")
         return dest_server
 
-    class MultiDnsCache(ProxyCache):
-        async def resolve_hosts(self, host: str):
-            return ["192.0.2.1", "192.0.2.2"]
-
     await test_client.send_all(connect_request(target=b"dual.example.com:443"))
 
-    pc = MultiDnsCache(cache_url="mem://", dns_cache_ttl="60s")
-    stream = await proxy.tunnel(
-        proxy_client,
-        _connect=fake_connect,
-        proxy_cache=pc,
-        dest_connect_timeout=2.0,
-    )
+    async with ProxyCache(
+        resolver=lambda host: ["192.0.2.1", "192.0.2.2"],
+        dns_cache_ttl="60s",
+    ) as pc:
+        stream = await proxy.tunnel(
+            proxy_client,
+            _connect=fake_connect,
+            proxy_cache=pc,
+            dest_connect_timeout=2.0,
+        )
     assert stream is dest_server
     assert tried == ["192.0.2.1", "192.0.2.2"]
 
@@ -358,41 +357,41 @@ async def test_invariant_7_fallback_when_first_address_times_out():
 @tt.trio_test
 async def test_invariant_7_overall_connect_timeout_bounded(mock_clock):
     """DEST_CONNECT_TIMEOUT is an overall bound across all address attempts."""
+    # Asyncio's worker uses real time: do not autojump its bridge submission.
+    mock_clock.autojump_threshold = float("inf")
     proxy_client, test_client = tt.memory_stream_pair()
 
     tried = []
+    connect_started_at = None
 
     async def fake_connect(host, port):
+        nonlocal connect_started_at
+        if connect_started_at is None:
+            connect_started_at = trio.current_time()
+            mock_clock.autojump_threshold = 0
         tried.append(host)
         # Simulate hang / blackhole
         await trio.sleep_forever()
 
-    class MultiDnsCache:
-        async def resolve_hosts(self, host: str):
-            return ["192.0.2.1", "192.0.2.2", "192.0.2.3"]
-
-        async def check_circuit(self, host: str, port: int):
-            pass
-
-        async def record_connection_result(self, _record: object):
-            pass
-
     await test_client.send_all(connect_request(target=b"multi.example.com:443"))
 
-    pc = MultiDnsCache()
-    start_time = trio.current_time()
-    dest_timeout = 6.0
-
-    with pytest.raises(trio.TooSlowError):
-        await proxy.tunnel(
-            proxy_client,
-            _connect=fake_connect,
-            proxy_cache=pc,
-            dest_connect_timeout=dest_timeout,
-        )
-
-    elapsed = trio.current_time() - start_time
-    assert elapsed <= dest_timeout + 0.01
+    async with ProxyCache(
+        resolver=lambda host: ["192.0.2.1", "192.0.2.2", "192.0.2.3"],
+        dns_cache_ttl="60s",
+        circuit_breaker_enabled=False,
+    ) as pc:
+        dest_timeout = 6.0
+        with pytest.raises(trio.TooSlowError):
+            await proxy.tunnel(
+                proxy_client,
+                _connect=fake_connect,
+                proxy_cache=pc,
+                dest_connect_timeout=dest_timeout,
+            )
+        # DNS/backend bridge scheduling precedes the destination connect budget.
+        assert connect_started_at is not None
+        elapsed = trio.current_time() - connect_started_at
+    assert elapsed == pytest.approx(dest_timeout)
 
 
 @tt.trio_test
