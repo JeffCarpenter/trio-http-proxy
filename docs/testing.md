@@ -93,6 +93,31 @@ Trio's `MockClock` remains a virtual scheduler for timeout tests. It does not
 replace proxy behavior. Backend probe tests use a separate manually advanced
 monotonic clock, which does not control backend key expiry.
 
+## Loopback integration and lifecycle stress
+
+`tests/test_proxy_tcp_integration.py` runs a proxy and echo upstream on ephemeral
+IPv4 loopback ports. It checks CONNECT, binary forwarding, half-close, DNS cache
+reuse, and the default peer-IP rate limit. The third connection must receive 429
+without sending a request. These tests need neither Internet access nor TLS tools.
+
+The same module runs three connection-churn cycles. Each cycle closes 72 clients
+before headers, during headers, or after forwarding, then shuts down the servers
+with six partial handshakes and six live tunnels. It checks handler completion,
+accepted sockets and listeners, returned limiter tokens, and bridge and DNS
+executor thread termination.
+
+`tests/test_cache_lifecycle_stress.py` gates batches of 16 backend reads with
+asyncio futures and Trio events. It checks repeated cancellation, four concurrent
+close callers, pending-work cleanup before backend close, and fail-open/fail-closed
+outage recovery. Task counts return to the cache's startup baseline while it is
+running; Cashews owns an expiration task that should remain until shutdown.
+
+Run these tests independently with:
+
+```bash
+uv run --locked pytest -q tests/test_proxy_tcp_integration.py tests/test_cache_lifecycle_stress.py
+```
+
 ## Property tests
 
 `tests/test_cache_dependencies.py` uses Hypothesis to generate DNS address lists,
@@ -112,6 +137,20 @@ The `justfile` runs `ruff check`, Pyright, and the full test suite, including
 integration and Hypothesis tests, stopping on the first failure. Pyright and pytest
 use `uv run --locked` to prepare the project environment without changing the
 lockfile. Run checks separately with `just lint-ci`, `just typecheck`, or `just test`.
+
+To measure branches as well as statements across the full suite, run:
+
+```bash
+uv run --locked pytest --cov=trio_http_proxy --cov-branch \
+  --cov-report=term-missing \
+  --cov-report=json:/tmp/trio-http-proxy-branch-coverage.json \
+  --cov-report=html:/tmp/trio-http-proxy-branch-coverage
+```
+
+The terminal `Cover` column combines statement and branch coverage. The JSON
+report gives separate `covered_branches` and `num_branches` counts; use those to
+report branch coverage alone. In the missing list, `line->line` marks an untaken
+branch. Reports stay outside the repository.
 
 For local fixes, install `ty` on your PATH and run `just check`. It runs
 `just typecheck-ty` (`ty check --fix`) followed by `just lint` (`ruff check --fix`),
