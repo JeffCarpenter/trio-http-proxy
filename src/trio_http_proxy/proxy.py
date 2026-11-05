@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import signal
 from collections.abc import Awaitable, Callable
 from functools import cache, partial
 from typing import Any
@@ -158,18 +159,138 @@ async def http_proxy(
     logger.debug("[conn%d] Connection closed", conn_id)
 
 
+async def _serve_with_signals(
+    handler: Callable[..., Awaitable[Any]],
+    listeners: list[trio.SocketListener],
+    cfg: ProxyConfig,
+    *,
+    task_status: trio.TaskStatus[list[trio.SocketListener]],
+    signal_aiter: Any,
+) -> None:
+    stop_accepting = trio.Event()
+    drained = trio.Event()
+    listener_scope = trio.CancelScope()
+
+    async def conn_runner(
+        *,
+        task_status: trio.TaskStatus[trio.Nursery] = trio.TASK_STATUS_IGNORED,
+    ) -> None:
+        try:
+            async with trio.open_nursery() as conn_nursery:
+                task_status.started(conn_nursery)
+                await stop_accepting.wait()
+        finally:
+            drained.set()
+
+    async with trio.open_nursery() as supervisor:
+        conn_nursery = await supervisor.start(conn_runner)
+
+        async def serve_listeners_task() -> None:
+            with listener_scope:
+                await trio.serve_listeners(
+                    handler,
+                    listeners,
+                    handler_nursery=conn_nursery,
+                    task_status=task_status,
+                )
+
+        supervisor.start_soon(serve_listeners_task)
+
+        # Wait for first signal
+        async for sig in signal_aiter:
+            logger.info(
+                "Received signal %s, initiating graceful shutdown (timeout=%.1fs)...",
+                sig,
+                cfg.shutdown_timeout,
+            )
+            listener_scope.cancel()
+            stop_accepting.set()
+            break
+
+        if not stop_accepting.is_set():
+            listener_scope.cancel()
+            stop_accepting.set()
+
+        # Wait for conn_nursery to drain up to shutdown_timeout seconds
+        with trio.move_on_after(cfg.shutdown_timeout) as drain_scope:
+            async with trio.open_nursery() as drain_nursery:
+
+                async def wait_second_signal() -> None:
+                    try:
+                        sig2 = await anext(signal_aiter)
+                        logger.warning(
+                            "Received second signal %s, forcing immediate shutdown...",
+                            sig2,
+                        )
+                        conn_nursery.cancel_scope.cancel()
+                        drain_nursery.cancel_scope.cancel()
+                    except StopAsyncIteration, trio.Cancelled:
+                        pass
+
+                drain_nursery.start_soon(wait_second_signal)
+                await drained.wait()
+                drain_nursery.cancel_scope.cancel()
+
+        if drain_scope.cancelled_caught:
+            logger.warning(
+                "Drain timeout (%.1fs) expired before connections drained; forcing shutdown...",
+                cfg.shutdown_timeout,
+            )
+            conn_nursery.cancel_scope.cancel()
+            with trio.CancelScope(shield=True):
+                await drained.wait()
+
+
 async def start_server(
     config: ProxyConfig | None = None,
+    enable_signals: bool = True,
     *,
     task_status: trio.TaskStatus[list[trio.SocketListener]] = trio.TASK_STATUS_IGNORED,
-    _serve: Any = trio.serve_tcp,
+    _serve: Any = None,
 ) -> None:
     """Run the HTTP proxy TCP server."""
     cfg = config or ProxyConfig.from_env()
     limiter = get_conn_limiter(cfg.maxconns)
     handler = partial(http_proxy, config=cfg, limiter=limiter)
     logger.info("Starting proxy on port %d...", cfg.port)
-    await _serve(handler, cfg.port, task_status=task_status)
+
+    if _serve is not None:
+        await _serve(handler, cfg.port, task_status=task_status)
+        return
+
+    listeners = await trio.open_tcp_listeners(cfg.port)
+    try:
+        if enable_signals:
+            try:
+                with trio.open_signal_receiver(
+                    signal.SIGTERM, signal.SIGINT
+                ) as signal_aiter:
+                    await _serve_with_signals(
+                        handler,
+                        listeners,
+                        cfg,
+                        task_status=task_status,
+                        signal_aiter=signal_aiter,
+                    )
+                    return
+            except (NotImplementedError, ValueError, RuntimeError, OSError) as exc:
+                logger.info(
+                    "Signal receiver unavailable (%s), running without signal handling",
+                    exc,
+                )
+
+        async with trio.open_nursery() as conn_nursery:
+            await trio.serve_listeners(
+                handler,
+                listeners,
+                handler_nursery=conn_nursery,
+                task_status=task_status,
+            )
+    except BaseException:
+        for listener in listeners:
+            with trio.CancelScope(shield=True):
+                await listener.aclose()
+        raise
 
 
 def main() -> None:

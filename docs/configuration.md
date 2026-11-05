@@ -23,6 +23,7 @@ When initializing settings, `ProxyConfig.from_env()` evaluates values in this or
 | `pipe_idle_timeout` | `TRIO_HTTP_PROXY_PIPE_IDLE_TIMEOUT` | `PIPE_IDLE_TIMEOUT` | `300.0` | Inactivity timeout in seconds closing idle tunnels. |
 | `pipe_send_timeout` | `TRIO_HTTP_PROXY_PIPE_SEND_TIMEOUT` | `PIPE_SEND_TIMEOUT` | `30.0` | Timeout in seconds closing tunnels blocked on socket writes. |
 | `maxconns` | `TRIO_HTTP_PROXY_MAXCONNS` | `MAXCONNS` | `1000` | Maximum concurrent client connections admitted by `trio.CapacityLimiter`. |
+| `shutdown_timeout` | `TRIO_HTTP_PROXY_SHUTDOWN_TIMEOUT` | `SHUTDOWN_TIMEOUT` | `15.0` | Grace period in seconds allowing active connections to drain on SIGTERM/SIGINT before forced cancellation. |
 | `log_level` | `TRIO_HTTP_PROXY_LOG_LEVEL` | `LOG_LEVEL` | `INFO` | Minimum logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 
 ## Command-Line Usage
