@@ -1,9 +1,4 @@
-# Copyright 2018-2019 Joshua Bronson.    All Rights Reserved.
-# Copyright 2026      Jeffrey Carpenter.
-#
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+"""HTTP CONNECT protocol parsing and RFC 7231 §4.3.6 validation."""
 
 from __future__ import annotations
 
@@ -14,41 +9,73 @@ import h11
 import trio
 
 from . import http
-from .config import Settings, resolve_settings
-from .connection import ConnectionContext, ConnectionFilter, ConnectionLoggerAdapter
+from .config import ProxyConfig
 from .errors import ProxyProtocolError, RequestTooLargeError
 
-LOGGER_NAME = "trio_http_proxy"
-_raw_logger = logging.getLogger(LOGGER_NAME)
-if not any(isinstance(f, ConnectionFilter) for f in _raw_logger.filters):
-    _raw_logger.addFilter(ConnectionFilter())
-logger = ConnectionLoggerAdapter(_raw_logger, {})
+logger = logging.getLogger(__name__)
+
+
+def parse_connect_target(target: bytes) -> tuple[str, int]:
+    """Parse and validate an RFC 7231 §4.3.6 authority-form CONNECT request-target.
+
+    Must be host:port only. Rejects userinfo, path, query, and fragment delimiters.
+    Correctly parses bracketed IPv6 literals (e.g. "[::1]:443").
+    Raises ProxyProtocolError on invalid target.
+    """
+    try:
+        decoded_target = target.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ProxyProtocolError(f"{target!r} contains invalid octets") from exc
+
+    if any(c in decoded_target for c in ("@", "?", "#", "/")):
+        raise ProxyProtocolError(f"{target!r} is not authority-form (RFC 7231 §4.3.6)")
+
+    try:
+        parsed = urlsplit(f"//{decoded_target}")
+    except ValueError as exc:
+        raise ProxyProtocolError(f"{target!r} is not a valid authority") from exc
+
+    if (
+        parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ProxyProtocolError(f"{target!r} is not authority-form (RFC 7231 §4.3.6)")
+
+    try:
+        desthost, destport = parsed.hostname, parsed.port
+    except ValueError as e:
+        raise ProxyProtocolError(f"{target!r} has an invalid port") from e
+
+    if destport is None or not (1 <= destport <= 65535):
+        raise ProxyProtocolError(f"{target!r} has an invalid port range")
+    if not desthost or not desthost.strip():
+        raise ProxyProtocolError(f"{target!r} missing host")
+
+    return desthost, destport
 
 
 async def process_as_connect_request(
     stream: trio.abc.ReceiveStream,
+    *,
+    config: ProxyConfig | None = None,
     bufmaxsz: int | None = None,
     maxreqsz: int | None = None,
     read_timeout: float | None = None,
-    *,
-    settings: Settings | None = None,
-    context: ConnectionContext | None = None,
 ) -> tuple[str, int, bytes]:
-    """Read a stream expected to contain a valid HTTP CONNECT request to desthost:destport.
+    """Read a stream expected to contain a valid HTTP CONNECT request.
 
-    Parses incrementally via h11 without raw byte searching. Returns
-    (destination host, port, trailing_bytes).
-    See https://tools.ietf.org/html/rfc7231#section-4.3.6 for the CONNECT spec.
-    Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout
-    seconds.
+    Parses incrementally via h11 without raw byte searching.
+    Returns (destination_host, destination_port, trailing_bytes).
+    Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout.
     """
-    cfg = resolve_settings(settings, context)
-    req_bufmaxsz: int = int(bufmaxsz) if bufmaxsz is not None else int(cfg.bufmaxsz)
-    req_maxreqsz: int = int(maxreqsz) if maxreqsz is not None else int(cfg.maxreqsz)
-    req_read_timeout: float = (
-        float(read_timeout)
-        if read_timeout is not None
-        else float(cfg.connect_read_timeout)
+    cfg = config or ProxyConfig()
+    req_bufmaxsz = bufmaxsz if bufmaxsz is not None else cfg.bufmaxsz
+    req_maxreqsz = maxreqsz if maxreqsz is not None else cfg.maxreqsz
+    req_read_timeout = (
+        read_timeout if read_timeout is not None else cfg.connect_read_timeout
     )
     logger.debug("Reading CONNECT request...")
 
@@ -65,14 +92,14 @@ async def process_as_connect_request(
             except h11.RemoteProtocolError as exc:
                 if exc.error_status_hint == 431:
                     raise RequestTooLargeError(
-                        f"Request did not fit in {req_maxreqsz} bytes"
+                        f"Request exceeded {req_maxreqsz} bytes"
                     ) from exc
-                raise
+                raise ProxyProtocolError(str(exc)) from exc
 
             if event is h11.NEED_DATA:
                 if total_received >= req_maxreqsz:
                     raise RequestTooLargeError(
-                        f"Request did not fit in {req_maxreqsz} bytes"
+                        f"Request exceeded {req_maxreqsz} bytes"
                     )
                 chunk = await stream.receive_some(req_bufmaxsz)
                 if not chunk:
@@ -84,57 +111,21 @@ async def process_as_connect_request(
             break
 
     if not isinstance(event, h11.Request):
-        raise ProxyProtocolError(f"{event=} is not a h11.Request")
+        raise ProxyProtocolError(f"Expected h11.Request, got {event!r}")
 
     trailing_data, _ = h11_conn.trailing_data
     header_len = total_received - len(trailing_data)
     if header_len > req_maxreqsz:
-        raise RequestTooLargeError(f"Request did not fit in {req_maxreqsz} bytes")
-    if event.method != http.http_method_connect:
-        raise ProxyProtocolError(f"{event.method=} != CONNECT")
+        raise RequestTooLargeError(f"Request exceeded {req_maxreqsz} bytes")
 
-    target = event.target
-    try:
-        decoded_target = target.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ProxyProtocolError(f"{target=} contains invalid octets") from exc
+    if event.method != http.HTTP_METHOD_CONNECT:
+        raise ProxyProtocolError(f"Expected CONNECT method, got {event.method!r}")
 
-    # RFC 7231 4.3.6: request-target MUST be authority-form (host:port only).
-    # Reject targets with userinfo, path, query, or fragment delimiters.
-    if any(c in decoded_target for c in ("@", "?", "#", "/")):
-        raise ProxyProtocolError(f"{target=} is not authority-form (RFC 7231 4.3.6)")
-
-    try:
-        parsed = urlsplit(f"//{decoded_target}")
-    except ValueError as exc:
-        raise ProxyProtocolError(f"{target=} is not a valid authority") from exc
-
-    if (
-        parsed.path
-        or parsed.query
-        or parsed.fragment
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        raise ProxyProtocolError(f"{target=} is not authority-form (RFC 7231 4.3.6)")
-
-    try:
-        desthost, destport = parsed.hostname, parsed.port
-    except ValueError as e:
-        raise ProxyProtocolError(f"{target=} has an invalid port") from e
-
-    if destport is None or not (1 <= destport <= 65535):
-        raise ProxyProtocolError(f"{target=} has an invalid port range")
-    if not desthost or not desthost.strip():
-        raise ProxyProtocolError(f"{target=} missing host")
-
-    if context is not None:
-        context.set_desthost(desthost, destport)
-
-    trailing_data, _ = h11_conn.trailing_data
+    desthost, destport = parse_connect_target(event.target)
     return desthost, destport, trailing_data
 
 
 __all__ = [
+    "parse_connect_target",
     "process_as_connect_request",
 ]
