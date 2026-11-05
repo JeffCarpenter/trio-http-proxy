@@ -159,20 +159,21 @@ async def test_invariant_2_gate_before_accept_bounds_accepted_fds():
 
         # Connect MAXCONNS + 3 clients
         clients = []
-        for _ in range(max_conns + 3):
-            c = await tt.open_stream_to_socket_listener(listener)
-            clients.append(c)
+        try:
+            for _ in range(max_conns + 3):
+                c = await tt.open_stream_to_socket_listener(listener)
+                clients.append(c)
 
-        await tt.wait_all_tasks_blocked()
+            await tt.wait_all_tasks_blocked()
 
-        # Gate before accept means exactly max_conns connections are accepted
-        assert len(accepted_streams) == max_conns
-        assert limiter.borrowed_tokens == max_conns
-
-        # Cleanup
-        nursery.cancel_scope.cancel()
-        for c in clients:
-            await c.aclose()
+            # Gate before accept means exactly max_conns connections are accepted
+            assert len(accepted_streams) == max_conns
+            assert limiter.borrowed_tokens == max_conns
+        finally:
+            nursery.cancel_scope.cancel()
+            with trio.CancelScope(shield=True):
+                for c in clients:
+                    await c.aclose()
 
 
 # ---------------------------------------------------------------------------

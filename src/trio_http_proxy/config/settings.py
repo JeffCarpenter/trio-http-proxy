@@ -188,16 +188,13 @@ class Settings(EnvSettings):
             return normalize_failure_policy(value)
         return value
 
-    @field_validator("circuit_breaker_period", "circuit_breaker_ttl")
+    @field_validator(
+        "circuit_breaker_period", "circuit_breaker_ttl", "rate_limit_period"
+    )
     @classmethod
     def _validate_duration_fields(cls, value: str, info: ValidationInfo) -> str:
         field = info.field_name or "duration"
         return validate_duration_string(value, field=field)
-
-    @field_validator("rate_limit_period")
-    @classmethod
-    def _validate_rate_limit_period(cls, value: str) -> str:
-        return validate_duration_string(value, field="rate_limit_period")
 
     @field_validator("rate_limit_ttl")
     @classmethod

@@ -55,6 +55,7 @@ from .proxy_cache import (
     ConnectionRecord,
     ConnectionResultBuilder,
     ProxyCacheProtocol,
+    _dispatch_connection_record,
     get_default_proxy_cache,
 )
 from .streaming import pipe_with_timeout
@@ -73,23 +74,15 @@ def _http_429_response(
     retry_after: RateLimitError | float | Any = None,
 ) -> bytes:
     """Build a rate-limit response using the rejection's expiry metadata."""
-    if isinstance(retry_after, RateLimitError):
-        try:
-            seconds = max(1, int(retry_after.retry_after_seconds))
-        except (TypeError, ValueError):
-            seconds = 1
-    elif isinstance(retry_after, (int, float)):
-        try:
-            seconds = max(1, int(retry_after))
-        except (TypeError, ValueError):
-            seconds = 1
-    else:
+    try:
+        if isinstance(retry_after, RateLimitError):
+            retry_after = retry_after.retry_after_seconds
+        elif not isinstance(retry_after, (int, float)):
+            retry_after = 1
+        seconds = max(1, int(retry_after))
+    except (TypeError, ValueError):
         seconds = 1
-
-    return (
-        f"HTTP/1.1 429 Too Many Requests\r\nRetry-After: {seconds}\r\n"
-        f"Connection: close\r\nContent-Length: 0\r\n\r\n"
-    ).encode()
+    return http.http_429_too_many_requests % seconds
 
 
 LOGGER_NAME = "trio_http_proxy"
@@ -545,20 +538,8 @@ async def _record_connection_result(
         return
     if isinstance(record, ConnectionResultBuilder):
         await record.record_to(proxy_cache)
-        return
-    if hasattr(proxy_cache, "record_connection_result"):
-        res = proxy_cache.record_connection_result(record)
-        if inspect.isawaitable(res):
-            await res
     else:
-        cache_obj: Any = proxy_cache
-        record_result = getattr(cache_obj, "record_result", None)
-        if callable(record_result):
-            res = record_result(
-                record.host, record.port, record.error, permit=record.permit
-            )
-            if inspect.isawaitable(res):
-                await res
+        await _dispatch_connection_record(proxy_cache, record)
 
 
 async def tunnel(
@@ -689,47 +670,35 @@ async def tunnel(
                 with trio.fail_after(per_host_timeout):
                     dest_stream = await connect_fn(host, destport)
                 break
-            except OSError as exc:
+            except (OSError, trio.TooSlowError) as exc:
                 last_exc = exc
-                continue
-            except trio.TooSlowError as exc:
-                last_exc = exc
-                continue
 
         if dest_stream is None:
+            if proxy_cache is not None:
+                await _record_connection_result(
+                    proxy_cache,
+                    ConnectionRecord(host=desthost, port=destport, error=last_exc),
+                )
             if isinstance(last_exc, trio.TooSlowError):
-                if proxy_cache is not None:
-                    await _record_connection_result(
-                        proxy_cache,
-                        ConnectionRecord(host=desthost, port=destport, error=last_exc),
-                    )
+                response = http.http_504_gateway_timeout
                 logger.warning(
                     "Timed out connecting to %s:%d, sending 504 to client...",
                     desthost,
                     destport,
                 )
-                try:
-                    await client_stream.send_all(http.http_504_gateway_timeout)
-                except (trio.BrokenResourceError, trio.ClosedResourceError):
-                    pass
-                raise last_exc
             else:
-                if proxy_cache is not None:
-                    await _record_connection_result(
-                        proxy_cache,
-                        ConnectionRecord(host=desthost, port=destport, error=last_exc),
-                    )
+                response = http.http_502_bad_gateway
                 logger.warning(
                     "Could not connect to %s:%d (%s), sending 502 to client...",
                     desthost,
                     destport,
                     last_exc,
                 )
-                try:
-                    await client_stream.send_all(http.http_502_bad_gateway)
-                except (trio.BrokenResourceError, trio.ClosedResourceError):
-                    pass
-                raise last_exc
+            try:
+                await client_stream.send_all(response)
+            except (trio.BrokenResourceError, trio.ClosedResourceError):
+                pass
+            raise last_exc
 
         if proxy_cache is not None:
             await _record_connection_result(

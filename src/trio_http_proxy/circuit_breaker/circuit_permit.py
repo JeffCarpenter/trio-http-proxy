@@ -47,9 +47,7 @@ class CircuitPermit:
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> None:
-        if not self.was_completed and not self.was_aborted:
-            self.was_aborted = True
-            self.breaker._abort_permit(self)
+        self.abort()
 
 
 __all__ = ["CircuitPermit"]

@@ -154,9 +154,10 @@ async def test_repro_r3_stop_prevents_auto_restart():
     """Calling stop() must prevent subsequent operations from silently restarting the thread."""
     pc = ProxyCache(cache_url="mem://")
     pc.start()
-    assert pc._started is True
+    assert pc.is_running
     pc.stop()
-    assert pc._started is False
+    assert pc.is_stopped
+    assert not pc.is_running
 
     # Calling run_coroutine after stop must raise RuntimeError, not restart
     async def dummy():
@@ -164,7 +165,8 @@ async def test_repro_r3_stop_prevents_auto_restart():
 
     with pytest.raises(RuntimeError):
         pc.run_coroutine(dummy())
-    assert pc._started is False
+    assert pc.is_stopped
+    assert not pc.is_running
 
 
 # ---------------------------------------------------------------------------

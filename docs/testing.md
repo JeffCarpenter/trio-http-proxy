@@ -62,6 +62,11 @@ instance-local effects model setup, operation, and ping failures and recovery
 without replacing collaborator methods. Environment-variable tests still use
 `monkeypatch.setenv`/`delenv` because environment loading is the behavior under test.
 
+For lifecycle transitions, shutdown ownership, retry behavior, and recorder
+compatibility, see [cache lifecycle and bridge ownership](cache-lifecycle.md).
+`tests/test_cache_lifecycle_refactor.py` uses events and controlled join failures
+to exercise startup/shutdown races without timing sleeps.
+
 ## Property tests
 
 `tests/test_cache_dependencies.py` uses Hypothesis to generate DNS address lists,

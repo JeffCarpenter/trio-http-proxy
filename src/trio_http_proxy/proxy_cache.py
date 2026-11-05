@@ -14,6 +14,7 @@ import threading
 import time
 import warnings
 from collections.abc import Callable, Coroutine
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Protocol, Self, TypeVar, cast, runtime_checkable
 
@@ -96,6 +97,34 @@ class ConnectionRecord:
         return self.permit is not None
 
 
+async def _dispatch_connection_record(
+    proxy_cache: Any,
+    record: ConnectionRecord,
+    *,
+    strict_legacy: bool = False,
+) -> None:
+    """Invoke one recorder, preserving the deprecated builder's strict policy.
+
+    Modern recorders always take precedence. Direct-record callers ignore a
+    missing/non-callable legacy recorder; builders historically raise for a
+    present but non-callable recorder, so that distinction is intentional.
+    """
+    if hasattr(proxy_cache, "record_connection_result"):
+        res = proxy_cache.record_connection_result(record)
+    else:
+        if strict_legacy:
+            if not hasattr(proxy_cache, "record_result"):
+                return
+            recorder = proxy_cache.record_result
+        else:
+            recorder = getattr(proxy_cache, "record_result", None)
+            if not callable(recorder):
+                return
+        res = recorder(record.host, record.port, record.error, permit=record.permit)
+    if inspect.isawaitable(res):
+        await res
+
+
 class ConnectionResultBuilder:
     """[Deprecated] Fluent builder for constructing ConnectionRecord instances."""
 
@@ -155,19 +184,10 @@ class ConnectionResultBuilder:
 
     async def record_to(self, proxy_cache: Any) -> None:
         """Convenience method to build and dispatch this result to proxy_cache."""
-        if proxy_cache is None:
-            return
-        record = self.build()
-        if hasattr(proxy_cache, "record_connection_result"):
-            res = proxy_cache.record_connection_result(record)
-            if inspect.isawaitable(res):
-                await res
-        elif hasattr(proxy_cache, "record_result"):
-            res = proxy_cache.record_result(
-                record.host, record.port, record.error, permit=record.permit
+        if proxy_cache is not None:
+            await _dispatch_connection_record(
+                proxy_cache, self.build(), strict_legacy=True
             )
-            if inspect.isawaitable(res):
-                await res
 
 
 @runtime_checkable
@@ -301,10 +321,8 @@ class ProxyCache:
         self._lock = threading.Lock()
         self._lifecycle_state: LifecycleState = LifecycleState.NEW
         self._startup_aborted: threading.Event = threading.Event()
-        self._started = False
-        self._stopped = False
-        self._stopping = False
-        self._stop_complete = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_future: Future[None] | None = None
         self._degraded = False
         self._last_probe_time: float = 0.0
         self._probe_lock = threading.Lock()
@@ -368,11 +386,11 @@ class ProxyCache:
     def start(self) -> None:
         """Start the background asyncio bridge thread and configure cashews."""
         setup_error: Exception | None = None
-        stop_parts: (
-            tuple[asyncio.AbstractEventLoop | None, ThreadHandle | None] | None
-        ) = None
         with self._lock:
-            if self._lifecycle_state == LifecycleState.STOPPED:
+            if self._lifecycle_state in (
+                LifecycleState.STOPPING,
+                LifecycleState.STOPPED,
+            ):
                 raise RuntimeError("ProxyCache cannot be restarted once stopped")
             if self._lifecycle_state in (
                 LifecycleState.STARTING,
@@ -380,11 +398,8 @@ class ProxyCache:
             ):
                 return
             self._lifecycle_state = LifecycleState.STARTING
-            self._stopped = False
-            self._stopping = False
             self._degraded = False
             if not self._has_backend_features():
-                self._started = True
                 self._lifecycle_state = LifecycleState.RUNNING
                 return
 
@@ -419,8 +434,6 @@ class ProxyCache:
                 self._thread.start()
             except Exception:
                 self._startup_aborted.set()
-                self._stopped = True
-                self._started = False
                 self._lifecycle_state = LifecycleState.STOPPED
                 raise
 
@@ -428,8 +441,18 @@ class ProxyCache:
                 loop, startup_exc = startup_queue.get(timeout=self.startup_timeout)
             except queue.Empty:
                 self._startup_aborted.set()
-                self._stopped = True
-                self._started = False
+                # Publication can race Queue.get's deadline. Once aborted, either
+                # the worker sees the event or we stop the loop it just published.
+                try:
+                    late_loop, _ = startup_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    if late_loop is not None:
+                        try:
+                            late_loop.call_soon_threadsafe(late_loop.stop)
+                        except RuntimeError:
+                            pass  # The worker already closed the aborted loop.
                 self._lifecycle_state = LifecycleState.STOPPED
                 raise RuntimeError(
                     f"Timed out waiting {self.startup_timeout}s for asyncio bridge thread startup"
@@ -437,8 +460,6 @@ class ProxyCache:
 
             if startup_exc is not None or loop is None:
                 self._startup_aborted.set()
-                self._stopped = True
-                self._started = False
                 self._lifecycle_state = LifecycleState.STOPPED
                 raise RuntimeError(
                     f"Asyncio bridge thread startup failed: {startup_exc}"
@@ -454,188 +475,142 @@ class ProxyCache:
             except Exception as exc:  # noqa: BLE001
                 setup_error = exc
 
-        # Lock is released during blocking network ping to prevent freezing event loops (Finding 19)
+        # Never hold the state lock while waiting for backend I/O.
         if setup_error is None:
             try:
-                fut = asyncio.run_coroutine_threadsafe(self.cache.ping(), loop)
-                fut.result(timeout=self.startup_timeout)
+                self.run_coroutine(self.cache.ping(), timeout=self.startup_timeout)
             except Exception as exc:  # noqa: BLE001
                 setup_error = exc
 
         with self._lock:
-            # A concurrent stop() may have already closed the loop/thread while
-            # this lock was released for the ping above. If so, don't clobber
-            # its STOPPING/STOPPED state back to RUNNING -- the loop is gone.
-            already_stopping = self._lifecycle_state in (
-                LifecycleState.STOPPING,
-                LifecycleState.STOPPED,
-            )
-            if already_stopping:
-                pass
-            elif setup_error is not None:
+            # Only the still-active startup may publish readiness.
+            if self._lifecycle_state is not LifecycleState.STARTING:
+                return
+            if setup_error is not None:
                 logger.warning(
                     "Failed to setup cashews cache or startup ping failed with %s: %s",
                     redact_url(self.cache_url),
                     setup_error,
                 )
                 if self.cache_failure_policy == "fail-closed":
-                    self._stopped = True
-                    self._started = False
-                    self._degraded = False
-                    self._lifecycle_state = LifecycleState.STOPPED
-                    stop_parts = self._begin_stop_locked()
+                    self._lifecycle_state = LifecycleState.STOPPING
                 else:
                     self._degraded = True
-                    self._last_probe_time = self._clock()
-                    self._started = True
-                    self._lifecycle_state = LifecycleState.RUNNING
-            else:
-                self._started = True
-                self._degraded = False
-                self._last_probe_time = self._clock()
+            self._last_probe_time = self._clock()
+            if self._lifecycle_state is LifecycleState.STARTING:
                 self._lifecycle_state = LifecycleState.RUNNING
-
-        if already_stopping:
-            return
-
-        if setup_error is not None:
-            if stop_parts is not None:
-                self._finish_stop(*stop_parts)
-            if self.cache_failure_policy == "fail-open":
-                with self._lock:
-                    if self._lifecycle_state in (
-                        LifecycleState.STOPPING,
-                        LifecycleState.STOPPED,
-                    ):
-                        return
-                    self._degraded = True
-                    self._last_probe_time = self._clock()
-                    self._stopped = False
-                    self._started = True
-                    self._lifecycle_state = LifecycleState.RUNNING
                 return
-            raise CacheBackendUnavailable(
-                f"Unable to setup cache backend {redact_url(self.cache_url)!r}: {setup_error}"
-            ) from setup_error
+
+        # Fail-closed startup shares the normal shutdown owner and cleanup task.
+        self.stop()
+        raise CacheBackendUnavailable(
+            f"Unable to setup cache backend {redact_url(self.cache_url)!r}: {setup_error}"
+        ) from setup_error
 
     def stop(self) -> None:
-        """Stop the bridge, draining pending work before closing its loop."""
-        with self._lock:
-            if self._lifecycle_state == LifecycleState.STOPPED:
-                return
-            if self._stopping:
-                done = self._stop_complete
-                parts = None
-            elif self._loop is None and self._thread is None:
-                self._stopped = True
-                self._started = False
-                self._lifecycle_state = LifecycleState.STOPPED
-                return
-            else:
-                self._stopped = True
-                self._started = False
+        """Reject new work, then serialize bounded, retryable bridge cleanup."""
+        if not self._shutdown_lock.acquire(timeout=2.0):
+            raise RuntimeError("Timed out stopping ProxyCache bridge")
+        try:
+            with self._lock:
+                if self._lifecycle_state is LifecycleState.STOPPED:
+                    return
                 self._lifecycle_state = LifecycleState.STOPPING
-                parts = self._begin_stop_locked()
-                done = self._stop_complete
+                loop, thread = self._loop, self._thread
+            self._finish_stop(loop, thread)
+        finally:
+            self._shutdown_lock.release()
 
-        if parts is None:
-            if not done.wait(2.0):
-                raise RuntimeError("Timed out stopping ProxyCache bridge")
-            return
-        self._finish_stop(*parts)
-
-    def _begin_stop_locked(
-        self,
-    ) -> tuple[asyncio.AbstractEventLoop | None, ThreadHandle | None]:
-        self._stopping = True
-        self._stop_complete.clear()
-        return self._loop, self._thread
+    async def _shutdown_bridge(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Run exactly once on the bridge, independently of stop() join retries."""
+        current = asyncio.current_task()
+        pending = [task for task in asyncio.all_tasks(loop) if task is not current]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        try:
+            await loop.shutdown_asyncgens()
+        except Exception:  # noqa: BLE001, S110
+            pass
+        try:
+            await self.cache.close()
+        finally:
+            try:
+                await loop.shutdown_default_executor()
+            except Exception:  # noqa: BLE001, S110
+                pass
+            finally:
+                loop.stop()
 
     def _finish_stop(
         self, loop: asyncio.AbstractEventLoop | None, thread: ThreadHandle | None
     ) -> None:
-        if loop is not None and not loop.is_closed():
-
-            async def shutdown() -> None:
-                current = asyncio.current_task()
-                pending = [
-                    task for task in asyncio.all_tasks(loop) if task is not current
-                ]
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
-                try:
-                    await loop.shutdown_asyncgens()
-                except Exception:  # noqa: BLE001, S110
-                    pass
-                try:
-                    await self.cache.close()
-                finally:
-                    try:
-                        if hasattr(loop, "shutdown_default_executor"):
-                            await loop.shutdown_default_executor()
-                    except Exception:  # noqa: BLE001, S110
-                        pass
-                    finally:
-                        loop.stop()
-
+        if loop is not None and not loop.is_closed() and self._shutdown_future is None:
+            coro = self._shutdown_bridge(loop)
             try:
-                loop.call_soon_threadsafe(lambda: loop.create_task(shutdown()))
+                self._shutdown_future = asyncio.run_coroutine_threadsafe(coro, loop)
             except RuntimeError:
-                pass
+                coro.close()
 
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         alive = thread is not None and thread.is_alive()
         open_loop = loop is not None and not loop.is_closed()
-        with self._lock:
-            self._stopping = False
-            # Only advance to STOPPED once the thread/loop are actually gone;
-            # otherwise leave the lifecycle in STOPPING so a subsequent stop()
-            # call retries cleanup instead of silently no-opping on a leaked
-            # thread/loop (stop() short-circuits on LifecycleState.STOPPED).
-            if not alive and not open_loop:
-                self._lifecycle_state = LifecycleState.STOPPED
-                self._stop_complete.set()
-                if self._thread is thread:
-                    self._thread = None
-                if self._loop is loop:
-                    self._loop = None
-                self._resolve_dns_fn = None
         if alive:
             raise RuntimeError("Timed out stopping ProxyCache bridge")
         if open_loop:
             raise RuntimeError("ProxyCache bridge loop did not close")
+        with self._lock:
+            self._lifecycle_state = LifecycleState.STOPPED
+            self._thread = None
+            self._loop = None
+            self._shutdown_future = None
+            self._resolve_dns_fn = None
 
     def _ensure_started(self) -> None:
         with self._lock:
-            if self._lifecycle_state == LifecycleState.STOPPED or self._stopped:
-                raise RuntimeError("ProxyCache has been stopped")
             if self._lifecycle_state in (
-                LifecycleState.RUNNING,
-                LifecycleState.STARTING,
+                LifecycleState.STOPPING,
+                LifecycleState.STOPPED,
             ):
-                return
-            if not self._started and not self._has_backend_features():
-                self._started = True
-                self._lifecycle_state = LifecycleState.RUNNING
+                raise RuntimeError("ProxyCache has been stopped")
+            if self._lifecycle_state is not LifecycleState.NEW:
                 return
         self.start()
 
+    def _submit(
+        self,
+        coro_fn: Callable[..., Coroutine[Any, Any, T]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[T]:
+        """Atomically admit and submit work; never construct rejected coroutines."""
+        self._ensure_started()
+        with self._lock:
+            loop = self._loop
+            if (
+                self._lifecycle_state
+                not in (LifecycleState.STARTING, LifecycleState.RUNNING)
+                or loop is None
+                or loop.is_closed()
+                or (
+                    self._lifecycle_state is LifecycleState.RUNNING
+                    and not loop.is_running()
+                )
+            ):
+                raise RuntimeError("Asyncio bridge event loop is not running")
+            coro = coro_fn(*args, **kwargs)
+            try:
+                return asyncio.run_coroutine_threadsafe(coro, loop)
+            except Exception:
+                coro.close()
+                raise
+
     def run_coroutine(self, coro: Coroutine[Any, Any, T], timeout: float = 10.0) -> T:
-        """Execute a coroutine in the background asyncio event loop synchronously."""
+        """Execute bridge work synchronously; timeout cancels the submitted task."""
         try:
-            self._ensure_started()
-            with self._lock:
-                if (
-                    self._stopped
-                    or self._stopping
-                    or not self._loop
-                    or not self._loop.is_running()
-                ):
-                    raise RuntimeError("Asyncio bridge event loop is not running")
-                fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            fut = self._submit(lambda: coro)
         except Exception:
             coro.close()
             raise
@@ -662,21 +637,7 @@ class ProxyCache:
         asynchronous and cannot guarantee immediate rollback of remote backend side
         effects.
         """
-        self._ensure_started()
-        with self._lock:
-            if (
-                self._stopped
-                or self._stopping
-                or not self._loop
-                or not self._loop.is_running()
-            ):
-                raise RuntimeError("Asyncio bridge event loop is not running")
-            coro = coro_fn(*args, **kwargs)
-            try:
-                fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-            except Exception:
-                coro.close()
-                raise
+        fut = self._submit(coro_fn, *args, **kwargs)
 
         event = trio.Event()
         token = trio.lowlevel.current_trio_token()
@@ -730,7 +691,7 @@ class ProxyCache:
     def _handle_backend_failure(self, operation: str, exc: Exception) -> None:
         if not isinstance(exc, BACKEND_EXCEPTIONS):
             raise exc
-        if self._stopped:
+        if self.lifecycle_state in (LifecycleState.STOPPING, LifecycleState.STOPPED):
             raise exc
         if self.cache_failure_policy == "fail-open":
             logger.warning(
@@ -749,8 +710,7 @@ class ProxyCache:
         if (
             not self._degraded
             or not self._has_backend_features()
-            or self._stopped
-            or self._stopping
+            or self.lifecycle_state is not LifecycleState.RUNNING
             or self._loop is None
         ):
             return

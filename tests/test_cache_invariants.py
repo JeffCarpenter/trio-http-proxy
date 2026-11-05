@@ -352,7 +352,7 @@ async def test_stop_rejects_racing_submissions():
         assert await trio.to_thread.run_sync(started.wait, 2)
         await trio.to_thread.run_sync(cache.stop)
         nursery.cancel_scope.cancel()
-    assert cache._stopped
+    assert cache.is_stopped
 
 
 def test_destination_circuit_breaker_state_machine():
