@@ -67,9 +67,14 @@ async def test_process_as_connect_request_oversized():
     client_tx, proxy_rx = trio.testing.memory_stream_pair()
     cfg = ProxyConfig(maxreqsz=100)
     huge_header = b"X-Huge: " + b"a" * 120 + b"\r\n"
-    await client_tx.send_all(b"CONNECT example.com:443 HTTP/1.1\r\n" + huge_header + b"\r\n")
+    await client_tx.send_all(
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"
+        + huge_header
+        + b"\r\n"
+    )
     with pytest.raises(RequestTooLargeError):
         await process_as_connect_request(proxy_rx, config=cfg)
+
 
 
 async def test_process_as_connect_request_timeout():
