@@ -1,11 +1,7 @@
-import inspect
-import socket
-import time
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-import trio
 import trio.testing as tt
 
 from trio_http_proxy.cache import ProxyCache
@@ -26,18 +22,12 @@ class MockClock:
 
 
 async def _trigger_backend_probe(pc: ProxyCache) -> None:
-    """Trigger the backend health probe via explicit method or event loop yield."""
-    probe_fn = getattr(pc, "_maybe_probe_backend", None)
-    if probe_fn is not None:
-        res = probe_fn()
-        if inspect.isawaitable(res):
-            await res
-    with trio.move_on_after(0.05):
-        await trio.sleep(0.01)
+    """Await probe completion directly, with no real-time sleeps."""
+    await pc._maybe_probe_backend()
 
 
 @tt.trio_test
-async def test_sticky_degradation_recovers_after_temporary_backend_blip(monkeypatch):
+async def test_sticky_degradation_recovers_after_temporary_backend_blip(backend):
     """Sticky degradation (§3.2 in findings.md) causes rate limiting and caching to stay
 
     permanently bypassed after a temporary backend blip until restart.
@@ -52,9 +42,10 @@ async def test_sticky_degradation_recovers_after_temporary_backend_blip(monkeypa
       - Subsequent backend operations immediately resume enforcing quota limits.
     """
     clock = MockClock(1000.0)
-    monkeypatch.setattr(time, "monotonic", clock)
 
     async with ProxyCache(
+        backend=backend,
+        clock=clock,
         cache_url="mem://",
         rate_limit_enabled=True,
         rate_limit=1,
@@ -83,7 +74,7 @@ async def test_sticky_degradation_recovers_after_temporary_backend_blip(monkeypa
         async def failing_ping() -> Any:
             raise ConnectionError("Backend unavailable")
 
-        monkeypatch.setattr(pc.cache, "ping", failing_ping)
+        backend.effects["ping"] = failing_ping
 
         # Advance clock past probe interval (30s per §3.2)
         clock.advance(35.0)
@@ -98,7 +89,7 @@ async def test_sticky_degradation_recovers_after_temporary_backend_blip(monkeypa
         async def healthy_ping() -> bytes:
             return b"PONG"
 
-        monkeypatch.setattr(pc.cache, "ping", healthy_ping)
+        backend.effects["ping"] = healthy_ping
 
         # Advance clock past next probe interval
         clock.advance(35.0)
@@ -115,7 +106,7 @@ async def test_sticky_degradation_recovers_after_temporary_backend_blip(monkeypa
 
 @tt.trio_test
 async def test_runtime_backend_failure_fail_open_degrades_and_recovers_on_ping(
-    monkeypatch,
+    backend,
 ):
     """Runtime backend failure in fail-open mode must degrade cleanly and recover upon successful ping.
 
@@ -123,9 +114,10 @@ async def test_runtime_backend_failure_fail_open_degrades_and_recovers_on_ping(
     or failing to restore service after backend health is restored.
     """
     clock = MockClock(1000.0)
-    monkeypatch.setattr(time, "monotonic", clock)
 
     async with ProxyCache(
+        backend=backend,
+        clock=clock,
         cache_url="mem://",
         rate_limit_enabled=True,
         rate_limit=1,
@@ -135,12 +127,11 @@ async def test_runtime_backend_failure_fail_open_degrades_and_recovers_on_ping(
         await pc.check_rate_limit("client-b")
 
         # Simulate runtime backend failure during operation
-        original_incr = pc.cache.incr
 
         async def failing_incr(*args: Any, **kwargs: Any) -> Any:
             raise ConnectionError("Redis server connection dropped")
 
-        monkeypatch.setattr(pc.cache, "incr", failing_incr)
+        backend.effects["incr"] = failing_incr
 
         # Runtime failure under fail-open must not raise to the caller
         await pc.check_rate_limit("client-b")
@@ -153,12 +144,12 @@ async def test_runtime_backend_failure_fail_open_degrades_and_recovers_on_ping(
         await pc.check_rate_limit("client-b")
 
         # Restore backend operational method and configure successful ping
-        monkeypatch.setattr(pc.cache, "incr", original_incr)
+        backend.effects.pop("incr")
 
         async def healthy_ping() -> bytes:
             return b"PONG"
 
-        monkeypatch.setattr(pc.cache, "ping", healthy_ping)
+        backend.effects["ping"] = healthy_ping
 
         # Advance past probe interval and run probe
         clock.advance(35.0)
@@ -174,22 +165,23 @@ async def test_runtime_backend_failure_fail_open_degrades_and_recovers_on_ping(
 
 
 @tt.trio_test
-async def test_probe_throttles_pings_to_avoid_stampede_while_degraded(monkeypatch):
+async def test_probe_throttles_pings_to_avoid_stampede_while_degraded(backend):
     """Health check probe must throttle ping frequency to prevent hammering a failing backend.
 
     Catches: Unbounded probe ping execution on every degraded operation request.
     """
     clock = MockClock(1000.0)
-    monkeypatch.setattr(time, "monotonic", clock)
 
     async with ProxyCache(
+        backend=backend,
+        clock=clock,
         cache_url="mem://",
         rate_limit_enabled=True,
         rate_limit=5,
         cache_failure_policy="fail-open",
     ) as pc:
         ping_spy = AsyncMock(side_effect=ConnectionError("Backend unreachable"))
-        monkeypatch.setattr(pc.cache, "ping", ping_spy)
+        backend.effects["ping"] = ping_spy
 
         # Enter degraded mode
         pc._degraded = True
@@ -204,11 +196,7 @@ async def test_probe_throttles_pings_to_avoid_stampede_while_degraded(monkeypatc
         for _ in range(10):
             clock.advance(0.1)
             await pc.check_rate_limit("rapid-client")
-            probe_fn = getattr(pc, "_maybe_probe_backend", None)
-            if probe_fn is not None:
-                res = probe_fn()
-                if inspect.isawaitable(res):
-                    await res
+            await pc._maybe_probe_backend()
 
         # Ping count must not have surged 10 times; probe must be throttled
         assert ping_spy.call_count == initial_ping_count
@@ -222,16 +210,17 @@ async def test_probe_throttles_pings_to_avoid_stampede_while_degraded(monkeypatc
 
 @tt.trio_test
 async def test_failing_probe_keeps_backend_degraded_and_traffic_uninterrupted(
-    monkeypatch,
+    backend,
 ):
     """Failed health probes must not raise exceptions to callers and must maintain degraded status.
 
     Catches: Unhandled exception escaping during probe or premature de-flagging of degraded status.
     """
     clock = MockClock(1000.0)
-    monkeypatch.setattr(time, "monotonic", clock)
 
     async with ProxyCache(
+        backend=backend,
+        clock=clock,
         cache_url="mem://",
         rate_limit_enabled=True,
         rate_limit=1,
@@ -249,7 +238,7 @@ async def test_failing_probe_keeps_backend_degraded_and_traffic_uninterrupted(
         async def timeout_ping() -> Any:
             raise TimeoutError("Ping timeout")
 
-        monkeypatch.setattr(pc.cache, "ping", timeout_ping)
+        backend.effects["ping"] = timeout_ping
 
         clock.advance(35.0)
         # Probe should execute without raising
@@ -264,32 +253,24 @@ async def test_failing_probe_keeps_backend_degraded_and_traffic_uninterrupted(
 
 
 @tt.trio_test
-async def test_probe_recovery_restores_dns_caching_after_backend_outage(monkeypatch):
+async def test_probe_recovery_restores_dns_caching_after_backend_outage(backend):
     """Backend recovery upon successful ping must restore DNS resolution caching.
 
     Catches: Degradation recovery restoring rate limiting but failing to restore backend DNS caching.
     """
     clock = MockClock(1000.0)
-    monkeypatch.setattr(time, "monotonic", clock)
 
     lookup_calls = 0
 
-    def fake_getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+    def resolve(host: str) -> list[str]:
         nonlocal lookup_calls
         lookup_calls += 1
-        return [
-            (
-                socket.AF_INET,
-                socket.SOCK_STREAM,
-                socket.IPPROTO_TCP,
-                "",
-                ("93.184.216.34", 80),
-            )
-        ]
-
-    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+        return ["93.184.216.34"]
 
     async with ProxyCache(
+        backend=backend,
+        clock=clock,
+        resolver=resolve,
         cache_url="mem://",
         dns_cache_ttl="60s",
         cache_failure_policy="fail-open",
@@ -316,7 +297,7 @@ async def test_probe_recovery_restores_dns_caching_after_backend_outage(monkeypa
         async def healthy_ping() -> bytes:
             return b"PONG"
 
-        monkeypatch.setattr(pc.cache, "ping", healthy_ping)
+        backend.effects["ping"] = healthy_ping
 
         clock.advance(35.0)
         await _trigger_backend_probe(pc)

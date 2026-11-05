@@ -11,8 +11,6 @@ Covers Tranche 4 requirements:
 
 import logging
 import threading
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -241,85 +239,60 @@ class TestStartupTimeoutThreadLeakPrevention:
         assert not cache._startup_aborted.is_set()
 
     def test_startup_timeout_aborts_delayed_bridge_thread(self) -> None:
+        unblock_thread = threading.Event()
+        thread_exited = threading.Event()
+
+        def delayed_thread(*, target, daemon, name):
+            def delayed_run() -> None:
+                unblock_thread.wait(timeout=1.0)
+                try:
+                    target()
+                finally:
+                    thread_exited.set()
+
+            return threading.Thread(target=delayed_run, daemon=daemon, name=name)
+
         cache = ProxyCache(
             cache_url="mem://",
             rate_limit_enabled=True,
             startup_timeout=0.05,
+            thread_factory=delayed_thread,
         )
-
-        unblock_thread = threading.Event()
-        thread_started = threading.Event()
-        thread_exited = threading.Event()
-        loop_ran_forever = False
-
-        original_thread_cls = threading.Thread
-
-        def delay_thread_target(*args: Any, **kwargs: Any) -> threading.Thread:
-            target = kwargs.get("target")
-
-            def delayed_run() -> None:
-                nonlocal loop_ran_forever
-                thread_started.set()
-                # Wait until startup timeout expires
-                unblock_thread.wait(timeout=1.0)
-                try:
-                    if target:
-                        target()
-                finally:
-                    thread_exited.set()
-
-            kwargs["target"] = delayed_run
-            return original_thread_cls(*args, **kwargs)
-
-        with (
-            patch("threading.Thread", side_effect=delay_thread_target),
-            pytest.raises(RuntimeError, match="Timed out waiting"),
-        ):
-            cache.start()
-
-        # Invariant: _startup_aborted must be set on timeout
-        assert hasattr(cache, "_startup_aborted")
-        assert cache._startup_aborted.is_set(), (
-            "_startup_aborted must be set when startup times out"
-        )
-        assert cache.lifecycle_state == LifecycleState.STOPPED
-
-        # Unblock thread and verify it cleanly aborts without running loop.run_forever()
-        unblock_thread.set()
-        thread_exited.wait(timeout=1.0)
-        assert thread_exited.is_set(), (
-            "Delayed thread must terminate after observing abort event"
-        )
+        try:
+            with pytest.raises(RuntimeError, match="Timed out waiting"):
+                cache.start()
+            assert cache._startup_aborted.is_set()
+            assert cache.lifecycle_state == LifecycleState.STOPPED
+        finally:
+            unblock_thread.set()
+            assert thread_exited.wait(timeout=1.0)
+            if cache._thread is not None:
+                cache._thread.join(timeout=1.0)
+                assert not cache._thread.is_alive()
 
 
 class TestBridgeShutdownProtocol:
     """Invariant §5.4: Bridge thread shutdown runs shutdown_asyncgens and executor timeout."""
 
     def test_stop_invokes_shutdown_asyncgens(self) -> None:
-        cache = ProxyCache(
-            cache_url="mem://",
-            rate_limit_enabled=True,
-        )
-        cache.start()
-        loop = cache._loop
-        assert loop is not None
+        finalized = threading.Event()
 
-        asyncgens_shutdown_called = False
-        original_shutdown_asyncgens = loop.shutdown_asyncgens
+        async def values():
+            try:
+                yield 1
+                yield 2
+            finally:
+                finalized.set()
 
-        async def tracking_shutdown_asyncgens() -> None:
-            nonlocal asyncgens_shutdown_called
-            asyncgens_shutdown_called = True
-            await original_shutdown_asyncgens()
+        with ProxyCache(cache_url="mem://", rate_limit_enabled=True) as cache:
+            # Retain a reference so only loop shutdown, not GC, closes the generator.
+            generator = values()
 
-        loop.shutdown_asyncgens = tracking_shutdown_asyncgens  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
+            async def first():
+                return await anext(generator)
 
-        try:
-            cache.stop()
-            assert asyncgens_shutdown_called, (
-                "loop.shutdown_asyncgens() was not called during bridge stop"
-            )
-            assert cache.lifecycle_state == LifecycleState.STOPPED
-        finally:
-            if not cache.is_stopped:
-                cache.stop()
+            assert cache.run_coroutine(first()) == 1
+            assert not finalized.is_set()
+
+        assert finalized.is_set(), "bridge shutdown must finalize live async generators"
+        assert cache.lifecycle_state == LifecycleState.STOPPED

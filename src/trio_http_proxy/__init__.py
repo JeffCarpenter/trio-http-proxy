@@ -36,6 +36,7 @@ from .connection import (
     ConnectionLoggerAdapter,
     format_conn_prefix,
 )
+from .dependencies import CacheBackend, HostResolver, ThreadFactory, ThreadHandle
 from .errors import (
     CacheBackendUnavailable,
     CircuitBreakerOpen,
@@ -76,6 +77,7 @@ __all__ = [
     "CV_DEST_STREAM",
     "CV_PIPE_FROM",
     "CV_PROXY_CACHE",
+    "CacheBackend",
     "CacheBackendUnavailable",
     "CircuitBreakerManager",
     "CircuitBreakerOpen",
@@ -87,6 +89,7 @@ __all__ = [
     "ConnectionRecord",
     "ConnectionResultBuilder",
     "DestinationCircuitBreaker",
+    "HostResolver",
     "LifecycleState",
     "ProxyBuilder",
     "ProxyCache",
@@ -96,6 +99,8 @@ __all__ = [
     "RateLimitError",
     "RequestTooLargeError",
     "Settings",
+    "ThreadFactory",
+    "ThreadHandle",
     "cache",
     "circuit_breaker",
     "config",

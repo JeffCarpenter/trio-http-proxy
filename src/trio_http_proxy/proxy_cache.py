@@ -25,6 +25,7 @@ from .circuit_breaker import (
     CircuitBreakerManager,
     CircuitPermit,
 )
+from .dependencies import CacheBackend, HostResolver, ThreadFactory, ThreadHandle
 from .errors import CacheBackendUnavailable, RateLimitError
 from .util import redact_url
 
@@ -46,7 +47,6 @@ T = TypeVar("T")
 from .config import (
     Settings,
     normalize_failure_policy,
-    parse_duration_seconds,
     validate_namespace,
 )
 from .config.builder import ProxyCacheBuilder
@@ -206,11 +206,19 @@ class ProxyCacheProtocol(Protocol):
         ...
 
 
+def resolve_addresses(host: str) -> list[str]:
+    """Resolve TCP addresses in system order; called off the Trio thread."""
+    return [
+        str(info[4][0])
+        for info in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    ]
+
+
 class ProxyCache:
     """Bridges cashews caching, Trio-native circuit breaking, and rate limiting.
 
     Underlying architecture:
-    - DNS caching: Cashews decorator with namespace-isolated keys.
+    - DNS caching: Public backend get/set operations with namespace-isolated keys.
     - Circuit breaking: Explicit Trio-native state machine with gating and
       half-open probe discipline (zero Cashews private key dependencies).
     - Rate limiting: Owned protocol using public increment and expiration methods.
@@ -228,6 +236,11 @@ class ProxyCache:
     def __init__(
         self,
         settings: Settings | None = None,
+        *,
+        backend: CacheBackend | None = None,
+        resolver: HostResolver | None = None,
+        clock: Callable[[], float] | None = None,
+        thread_factory: ThreadFactory | None = None,
         **kwargs: Any,
     ) -> None:
         if settings is not None:
@@ -275,9 +288,16 @@ class ProxyCache:
         self.probe_interval: float = s.probe_interval
         self.startup_timeout: float = s.startup_timeout
 
-        self.cache = Cache(name="trio_http_proxy")
+        self.cache: CacheBackend = (
+            backend if backend is not None else Cache(name="trio_http_proxy")
+        )
+        self._resolver = resolver if resolver is not None else resolve_addresses
+        self._clock = clock if clock is not None else time.monotonic
+        self._thread_factory: ThreadFactory = (
+            thread_factory if thread_factory is not None else threading.Thread
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
+        self._thread: ThreadHandle | None = None
         self._lock = threading.Lock()
         self._lifecycle_state: LifecycleState = LifecycleState.NEW
         self._startup_aborted: threading.Event = threading.Event()
@@ -349,7 +369,7 @@ class ProxyCache:
         """Start the background asyncio bridge thread and configure cashews."""
         setup_error: Exception | None = None
         stop_parts: (
-            tuple[asyncio.AbstractEventLoop | None, threading.Thread | None] | None
+            tuple[asyncio.AbstractEventLoop | None, ThreadHandle | None] | None
         ) = None
         with self._lock:
             if self._lifecycle_state == LifecycleState.STOPPED:
@@ -392,10 +412,17 @@ class ProxyCache:
                 finally:
                     loop.close()
 
-            self._thread = threading.Thread(
-                target=_run_loop, daemon=True, name="cashews-trio-bridge"
-            )
-            self._thread.start()
+            try:
+                self._thread = self._thread_factory(
+                    target=_run_loop, daemon=True, name="cashews-trio-bridge"
+                )
+                self._thread.start()
+            except Exception:
+                self._startup_aborted.set()
+                self._stopped = True
+                self._started = False
+                self._lifecycle_state = LifecycleState.STOPPED
+                raise
 
             try:
                 loop, startup_exc = startup_queue.get(timeout=self.startup_timeout)
@@ -423,7 +450,7 @@ class ProxyCache:
                 # Backend is configured with suppress=False to propagate all failures.
                 # ProxyCache is the sole owner of fail-open vs fail-closed policy.
                 self.cache.setup(self.cache_url, suppress=False)
-                self._register_decorators()
+                self._register_dns_cache()
             except Exception as exc:  # noqa: BLE001
                 setup_error = exc
 
@@ -459,13 +486,13 @@ class ProxyCache:
                     stop_parts = self._begin_stop_locked()
                 else:
                     self._degraded = True
-                    self._last_probe_time = time.monotonic()
+                    self._last_probe_time = self._clock()
                     self._started = True
                     self._lifecycle_state = LifecycleState.RUNNING
             else:
                 self._started = True
                 self._degraded = False
-                self._last_probe_time = time.monotonic()
+                self._last_probe_time = self._clock()
                 self._lifecycle_state = LifecycleState.RUNNING
 
         if already_stopping:
@@ -482,7 +509,7 @@ class ProxyCache:
                     ):
                         return
                     self._degraded = True
-                    self._last_probe_time = time.monotonic()
+                    self._last_probe_time = self._clock()
                     self._stopped = False
                     self._started = True
                     self._lifecycle_state = LifecycleState.RUNNING
@@ -519,13 +546,13 @@ class ProxyCache:
 
     def _begin_stop_locked(
         self,
-    ) -> tuple[asyncio.AbstractEventLoop | None, threading.Thread | None]:
+    ) -> tuple[asyncio.AbstractEventLoop | None, ThreadHandle | None]:
         self._stopping = True
         self._stop_complete.clear()
         return self._loop, self._thread
 
     def _finish_stop(
-        self, loop: asyncio.AbstractEventLoop | None, thread: threading.Thread | None
+        self, loop: asyncio.AbstractEventLoop | None, thread: ThreadHandle | None
     ) -> None:
         if loop is not None and not loop.is_closed():
 
@@ -670,45 +697,30 @@ class ProxyCache:
             fut.cancel()
             raise
 
-    def _register_decorators(self) -> None:
-        c = self.cache
+    def _register_dns_cache(self) -> None:
+        # Preserve the namespace/key/TTL contract without backend-specific decorators.
+        self._resolve_dns_fn = (
+            self._resolve_cached_dns if self.dns_cache_ttl_sec > 0 else None
+        )
 
-        # DNS Resolution Caching with namespace
-        if self.dns_cache_ttl_sec > 0:
-            dns_key = f"{self.namespace}:dns:{{host}}"
-
-            @c(ttl=self.dns_cache_ttl, key=dns_key)
-            async def _resolve_dns(host: str) -> list[str]:
-                if self._loop is None:
-                    raise RuntimeError("Event loop is not initialized")
-                try:
-                    addr_infos = await self._loop.run_in_executor(
-                        None,
-                        socket.getaddrinfo,
-                        host,
-                        None,
-                        socket.AF_UNSPEC,
-                        socket.SOCK_STREAM,
-                    )
-                except OSError as exc:
-                    cast(Any, exc)._trio_http_proxy_dns_error = True
-                    raise
-                if not addr_infos:
-                    exc = OSError(f"Name resolution failed for {host}")
-                    cast(Any, exc)._trio_http_proxy_dns_error = True
-                    raise exc
-                seen: set[str] = set()
-                ips: list[str] = []
-                for info in addr_infos:
-                    ip = str(info[4][0])
-                    if ip not in seen:
-                        seen.add(ip)
-                        ips.append(ip)
-                return ips
-
-            self._resolve_dns_fn = _resolve_dns
-        else:
-            self._resolve_dns_fn = None
+    async def _resolve_cached_dns(self, host: str) -> list[str]:
+        key = f"{self.namespace}:dns:{host}"
+        missing = object()
+        cached = await self.cache.get(key, default=missing)
+        if cached is not missing:
+            return cached
+        if self._loop is None:
+            raise RuntimeError("Event loop is not initialized")
+        try:
+            addresses = await self._loop.run_in_executor(None, self._resolver, host)
+            ips = list(dict.fromkeys(addresses))
+            if not ips:
+                raise OSError(f"Name resolution failed for {host}")
+        except OSError as exc:
+            cast(Any, exc)._trio_http_proxy_dns_error = True
+            raise
+        await self.cache.set(key, ips, expire=self.dns_cache_ttl_sec)
+        return ips
 
     def _backend_error(self, operation: str, exc: Exception) -> CacheBackendUnavailable:
         return CacheBackendUnavailable(
@@ -728,7 +740,7 @@ class ProxyCache:
             )
             with self._lock:
                 self._degraded = True
-                self._last_probe_time = time.monotonic()
+                self._last_probe_time = self._clock()
             return
         raise self._backend_error(operation, exc) from exc
 
@@ -743,7 +755,7 @@ class ProxyCache:
         ):
             return
 
-        now = time.monotonic()
+        now = self._clock()
         with self._probe_lock:
             if now - self._last_probe_time < self.probe_interval:
                 return

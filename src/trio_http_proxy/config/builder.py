@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, Self
 
+from ..dependencies import CacheBackend, HostResolver, ThreadFactory
 from .settings import Settings
 
 if TYPE_CHECKING:
@@ -37,7 +39,20 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
     on top of the consolidated Settings data model.
     """
 
-    def __init__(self, settings: Settings | None = None, **overrides: Any) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        backend: CacheBackend | None = None,
+        resolver: HostResolver | None = None,
+        clock: Callable[[], float] | None = None,
+        thread_factory: ThreadFactory | None = None,
+        **overrides: Any,
+    ) -> None:
+        self._backend = backend
+        self._resolver = resolver
+        self._clock = clock
+        self._thread_factory = thread_factory
         self._base_settings: Settings | None = settings
         self._overrides: dict[str, Any] = dict(overrides)
         # Per-instance LIFO stack (not shared with other builder instances or
@@ -179,7 +194,13 @@ class ProxyCacheBuilder(SettingsBuilderMixin):
         """Construct the configured ProxyCache instance."""
         from ..proxy_cache import ProxyCache
 
-        return ProxyCache(settings=self.build_settings())
+        return ProxyCache(
+            settings=self.build_settings(),
+            backend=self._backend,
+            resolver=self._resolver,
+            clock=self._clock,
+            thread_factory=self._thread_factory,
+        )
 
     def build_proxy(self, port: int | None = None) -> ProxyBuilder:
         """Create a ProxyBuilder seeded with this cache builder's configuration."""

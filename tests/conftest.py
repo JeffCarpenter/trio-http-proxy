@@ -2,6 +2,7 @@ from functools import partial
 
 import pytest
 import trio
+from cache_fakes import ControlledBackend
 
 
 async def _dest_http_server(stream: trio.SocketStream) -> None:
@@ -60,6 +61,17 @@ def _clean_config_env(monkeypatch):
     yield
     reset_settings_cache()
     reset_conn_limiter()
+
+
+@pytest.fixture
+def backend() -> ControlledBackend:
+    """An instance-local backend whose public effects model outages."""
+    return ControlledBackend()
+
+
+@pytest.fixture
+def backend_factory() -> type[ControlledBackend]:
+    return ControlledBackend
 
 
 @pytest.fixture

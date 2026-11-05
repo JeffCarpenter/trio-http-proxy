@@ -28,41 +28,49 @@ def test_failure_policy_default_and_validation(settings):
         ProxyCache(cache_failure_policy="sometimes")
 
 
-def test_setup_failure_fail_open_and_fail_closed(monkeypatch):
+def test_setup_failure_fail_open_and_fail_closed(backend_factory):
     def fail_setup(*args, **kwargs):
         raise RuntimeError("backend unavailable")
 
-    open_cache = ProxyCache(cache_url="mem://", cache_failure_policy="fail-open")
-    monkeypatch.setattr(open_cache.cache, "setup", fail_setup)
+    open_backend = backend_factory()
+    open_backend.effects["setup"] = fail_setup
+    open_cache = ProxyCache(
+        backend=open_backend, cache_url="mem://", cache_failure_policy="fail-open"
+    )
     open_cache.start()
     assert open_cache.enabled is True
     assert open_cache.is_degraded is True
     assert open_cache.is_running is False
     open_cache.stop()
 
-    closed_cache = ProxyCache(cache_url="mem://", cache_failure_policy="fail-closed")
-    monkeypatch.setattr(closed_cache.cache, "setup", fail_setup)
+    closed_backend = backend_factory()
+    closed_backend.effects["setup"] = fail_setup
+    closed_cache = ProxyCache(
+        backend=closed_backend, cache_url="mem://", cache_failure_policy="fail-closed"
+    )
     with pytest.raises(CacheBackendUnavailable):
         closed_cache.start()
     closed_cache.stop()
 
 
 @tt.trio_test
-async def test_dns_oserror_is_not_backend_failure(monkeypatch):
+async def test_dns_oserror_is_not_backend_failure():
     def fail_lookup(*args, **kwargs):
         raise socket.gaierror("destination lookup failed")
 
-    monkeypatch.setattr(socket, "getaddrinfo", fail_lookup)
-    async with ProxyCache(cache_url="mem://", dns_cache_ttl="60s") as cache:
+    async with ProxyCache(
+        resolver=fail_lookup, cache_url="mem://", dns_cache_ttl="60s"
+    ) as cache:
         with pytest.raises(socket.gaierror, match="destination lookup failed"):
             await cache.resolve_hosts("destination.invalid")
 
 
 @tt.trio_test
 async def test_lazy_backend_failure_fail_open_bypasses_dns_circuit_and_rate(
-    monkeypatch,
+    backend,
 ):
     async with ProxyCache(
+        backend=backend,
         cache_url="mem://",
         dns_cache_ttl="60s",
         circuit_breaker_enabled=True,
@@ -74,7 +82,7 @@ async def test_lazy_backend_failure_fail_open_bypasses_dns_circuit_and_rate(
         async def unavailable(*args, **kwargs):
             raise ConnectionError("backend unavailable")
 
-        monkeypatch.setattr(cache.cache, "get", unavailable)
+        backend.effects["get"] = unavailable
         assert await cache.resolve_host("backend.invalid") == "backend.invalid"
         await cache.check_circuit("backend.invalid", 443)
         await cache.check_rate_limit("client")
@@ -84,8 +92,9 @@ async def test_lazy_backend_failure_fail_open_bypasses_dns_circuit_and_rate(
 
 
 @tt.trio_test
-async def test_lazy_backend_failure_fail_closed_raises(monkeypatch):
+async def test_lazy_backend_failure_fail_closed_raises(backend):
     async with ProxyCache(
+        backend=backend,
         cache_url="mem://",
         dns_cache_ttl="60s",
         circuit_breaker_enabled=True,
@@ -97,18 +106,18 @@ async def test_lazy_backend_failure_fail_closed_raises(monkeypatch):
         async def unavailable(*args, **kwargs):
             raise ConnectionError("backend unavailable")
 
-        monkeypatch.setattr(cache.cache, "get", unavailable)
+        backend.effects["get"] = unavailable
         with pytest.raises(CacheBackendUnavailable):
             await cache.resolve_host("backend.invalid")
 
         async def broken_get(*args, **kwargs):
             raise TypeError("programming error")
 
-        monkeypatch.setattr(cache.cache, "get", broken_get)
+        backend.effects["get"] = broken_get
         with pytest.raises(TypeError, match="programming error"):
             await cache.resolve_host("backend.invalid")
 
-        monkeypatch.setattr(cache.cache, "incr", unavailable)
+        backend.effects["incr"] = unavailable
         with pytest.raises(CacheBackendUnavailable):
             await cache.check_rate_limit("client")
 
@@ -271,9 +280,11 @@ async def test_stop_waits_for_blocked_default_executor_job():
         started.set()
         if not release.wait(5):
             raise TimeoutError("test DNS lookup was not released")
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+        return ["127.0.0.1"]
 
-    cache = ProxyCache(cache_url="mem://", dns_cache_ttl="60s")
+    cache = ProxyCache(
+        resolver=blocked_getaddrinfo, cache_url="mem://", dns_cache_ttl="60s"
+    )
     cache.start()
     loop = cache._loop
     bridge_thread = cache._thread
@@ -294,14 +305,12 @@ async def test_stop_waits_for_blocked_default_executor_job():
     stop_thread = threading.Thread(target=stop, daemon=True)
     stop_started = False
     try:
-        with pytest.MonkeyPatch.context() as monkeypatch:
-            monkeypatch.setattr(socket, "getaddrinfo", blocked_getaddrinfo)
-            future = asyncio.run_coroutine_threadsafe(resolve_dns("blocked.test"), loop)
-            assert await trio.to_thread.run_sync(started.wait, 2)
-            stop_started = True
-            stop_thread.start()
-            await trio.sleep(0.1)
-            assert not stop_done.is_set()
+        future = asyncio.run_coroutine_threadsafe(resolve_dns("blocked.test"), loop)
+        assert await trio.to_thread.run_sync(started.wait, 2)
+        stop_started = True
+        stop_thread.start()
+        await trio.sleep(0.1)
+        assert not stop_done.is_set()
     finally:
         release.set()
         if stop_started:
@@ -446,8 +455,9 @@ async def test_async_context_manager_non_blocking():
 
 
 @tt.trio_test
-async def test_rate_limit_cashews_ban_ttl_protocol(monkeypatch):
+async def test_rate_limit_cashews_ban_ttl_protocol(backend):
     async with ProxyCache(
+        backend=backend,
         cache_url="mem://",
         rate_limit_enabled=True,
         rate_limit=2,
@@ -474,8 +484,9 @@ async def test_rate_limit_cashews_ban_ttl_protocol(monkeypatch):
 
 
 @tt.trio_test
-async def test_backend_error_boundary_reraises_programming_errors(monkeypatch):
+async def test_backend_error_boundary_reraises_programming_errors(backend):
     async with ProxyCache(
+        backend=backend,
         cache_url="mem://",
         dns_cache_ttl="60s",
         cache_failure_policy="fail-open",
@@ -484,7 +495,7 @@ async def test_backend_error_boundary_reraises_programming_errors(monkeypatch):
         async def broken_get(*args, **kwargs):
             raise TypeError("internal bug: wrong type passed")
 
-        monkeypatch.setattr(cache.cache, "get", broken_get)
+        backend.effects["get"] = broken_get
 
         # TypeError is an internal bug, not in BACKEND_EXCEPTIONS; must re-raise
         with pytest.raises(TypeError, match="internal bug"):

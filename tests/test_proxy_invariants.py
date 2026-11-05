@@ -67,20 +67,18 @@ async def test_invariant_1_start_server_uses_exact_custom_proxy_cache():
 
 
 @tt.trio_test
-async def test_invariant_1_start_server_resets_cache_context_after_shutdown(
-    monkeypatch,
-):
+async def test_invariant_1_start_server_resets_cache_context_after_shutdown():
     """A stopped custom cache is not reused by later defaulted calls."""
     custom_cache = type(
         "CustomCache", (), {"start": lambda self: None, "stop": lambda self: None}
     )()
-    fallback_cache: Any = type("FallbackCache", (), {})()
     checks = []
 
-    async def check_rate_limit(client_key):
-        checks.append(client_key)
+    class FallbackCache:
+        async def check_rate_limit(self, client_key):
+            checks.append(client_key)
 
-    fallback_cache.check_rate_limit = check_rate_limit
+    fallback_cache = FallbackCache()
     cv_token = proxy.CV_PROXY_CACHE.set(fallback_cache)
 
     async def fake_serve(handler, port):
