@@ -126,3 +126,7 @@ cython_debug/
 
 # Agent worktrees
 .worktrees/
+
+# Planning active plan
+.planning/.active_plan
+
