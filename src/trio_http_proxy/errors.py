@@ -35,7 +35,7 @@ class RateLimitError(cashews.RateLimitError):
         self,
         *args: Any,
         retry_after_seconds: float = 1.0,
-        retry_after: float | int | None = None,
+        retry_after: float | None = None,
         **kwargs: Any,
     ) -> None:
         # cashews.RateLimitError inherits Exception.__init__(self, *args),

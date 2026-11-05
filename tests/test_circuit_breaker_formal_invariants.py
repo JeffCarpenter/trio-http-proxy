@@ -216,12 +216,11 @@ def test_invariant_1_context_manager_probe_release_on_exception() -> None:
     assert p1 is not None
 
     # First attempt inside context manager raises an exception
-    with pytest.raises(RuntimeError, match="client disconnected"):
-        with p1:
-            assert cb._half_open_in_flight is True
-            # Concurrent acquire is rejected
-            assert cb.acquire_permit(now=t_half) is None
-            raise RuntimeError("client disconnected")
+    with pytest.raises(RuntimeError, match="client disconnected"), p1:
+        assert cb._half_open_in_flight is True
+        # Concurrent acquire is rejected
+        assert cb.acquire_permit(now=t_half) is None
+        raise RuntimeError("client disconnected")
 
     # The exception triggered context manager __exit__, aborting p1
     assert p1.was_aborted is True

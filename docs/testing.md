@@ -69,8 +69,19 @@ TTLs, and recovery-clock histories. It checks stable address deduplication, cach
 hits and namespace clearing, and probe throttling/recovery at interval boundaries.
 Each example owns fresh collaborators and cleans up its bridge thread.
 
+## CI and pre-commit checks
+
+Install `just`, `uv`, `ruff`, and `pyright` on your PATH, then run:
+
 ```bash
-uv sync
-uv run pytest
-pyright
+just ci
 ```
+
+The `justfile` runs `ruff check`, Pyright, and the full test suite, including
+integration and Hypothesis tests, stopping on the first failure. Pyright and pytest
+use `uv run --locked` to prepare the project environment without changing the
+lockfile. Run checks separately with `just lint-ci`, `just typecheck`, or `just test`.
+
+For local fixes, install `ty` on your PATH and run `just check`. It runs
+`just typecheck-ty` (`ty check --fix`) followed by `just lint` (`ruff check --fix`),
+stopping if either fails. Unlike `just ci`, these recipes may modify files.

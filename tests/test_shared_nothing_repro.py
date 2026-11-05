@@ -22,7 +22,6 @@ from trio_http_proxy.connection import (
     CV_CLIENT_STREAM,
     CV_CONN_ID,
     CV_DESTHOST,
-    CV_DEST_STREAM,
     ConnectionContext,
     format_conn_prefix,
     resolve_proxy_cache,
@@ -36,9 +35,7 @@ from trio_http_proxy.proxy import (
     ProxyBuilder,
     _http_429_response,
     http_proxy,
-    tunnel,
 )
-from trio_http_proxy.proxy_cache import ProxyCache
 
 
 # ---------------------------------------------------------------------------

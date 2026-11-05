@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from itertools import count
-from typing import Any, Iterator
+from typing import Any
 
 import trio
 
@@ -213,8 +214,8 @@ __all__ = [
     "CV_DEST_STREAM",
     "CV_PIPE_FROM",
     "CV_PROXY_CACHE",
-    "ConnectionContext",
     "_DEFAULT_PROXY_CACHE_SENTINEL",
+    "ConnectionContext",
     "_conn_ids",
     "_connection_context",
     "format_conn_prefix",

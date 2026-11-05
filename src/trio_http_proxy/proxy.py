@@ -30,9 +30,9 @@ from .config import Settings, get_settings, resolve_settings
 from .config.builder import ProxyCacheBuilder, SettingsBuilderMixin
 from .connection import (
     _DEFAULT_PROXY_CACHE_SENTINEL,
-    CV_CLIENT_STREAM,
-    CV_CONN_ID,
-    CV_CURRENT_CONTEXT,
+    CV_CLIENT_STREAM,  # noqa: F401 -- compatibility re-export
+    CV_CONN_ID,  # noqa: F401 -- compatibility re-export
+    CV_CURRENT_CONTEXT,  # noqa: F401 -- compatibility re-export
     CV_DEST_STREAM,
     CV_DESTHOST,
     CV_PROXY_CACHE,
@@ -70,7 +70,7 @@ reset_conn_limiter = get_conn_limiter.cache_clear
 
 
 def _http_429_response(
-    retry_after: RateLimitError | float | int | Any = None,
+    retry_after: RateLimitError | float | Any = None,
 ) -> bytes:
     """Build a rate-limit response using the rejection's expiry metadata."""
     if isinstance(retry_after, RateLimitError):

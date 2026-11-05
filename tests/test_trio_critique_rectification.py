@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import inspect
 import logging
-from collections.abc import Awaitable, Callable
 from typing import Any
 
-import h11
 import pytest
 import trio
 import trio.testing as tt
@@ -17,24 +15,19 @@ from trio_http_proxy.circuit_breaker import (
     DestinationCircuitBreaker,
 )
 from trio_http_proxy.connection import (
-    CV_CLIENT_STREAM,
     CV_CONN_ID,
     CV_CURRENT_CONTEXT,
     CV_DESTHOST,
-    CV_DEST_STREAM,
-    CV_PIPE_FROM,
     ConnectionContext,
     _connection_context,
 )
-from trio_http_proxy.errors import CircuitBreakerOpen, ProxyProtocolError
+from trio_http_proxy.errors import CircuitBreakerOpen
 from trio_http_proxy.proxy import (
     _DEFAULT_LIMITER,
     http_proxy,
-    logger,
     resolve_capacity_limiter,
     tunnel,
 )
-
 
 # ===========================================================================
 # 1. Leslie Lamport: Concurrency Invariants & Circuit Breaker State Machine
