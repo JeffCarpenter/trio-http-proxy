@@ -5,9 +5,7 @@ from __future__ import annotations
 HTTP_METHOD_CONNECT: bytes = b"CONNECT"
 http_method_connect: bytes = HTTP_METHOD_CONNECT
 
-HTTP_200_CONNECTION_ESTABLISHED: bytes = (
-    b"HTTP/1.1 200 Connection established\r\n\r\n"
-)
+HTTP_200_CONNECTION_ESTABLISHED: bytes = b"HTTP/1.1 200 Connection established\r\n\r\n"
 http_200_connection_established: bytes = HTTP_200_CONNECTION_ESTABLISHED
 
 HTTP_400_BAD_REQUEST: bytes = (

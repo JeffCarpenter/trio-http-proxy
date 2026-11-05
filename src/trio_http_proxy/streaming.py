@@ -37,7 +37,7 @@ async def pipe(
     if isinstance(to_stream, trio.abc.HalfCloseableStream):
         try:
             await to_stream.send_eof()
-        except (trio.BrokenResourceError, trio.ClosedResourceError):
+        except trio.BrokenResourceError, trio.ClosedResourceError:
             pass
     logger.debug("Pipe finished")
 

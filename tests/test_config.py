@@ -24,7 +24,7 @@ def test_proxy_config_defaults():
 def test_proxy_config_immutability():
     config = ProxyConfig()
     with pytest.raises(dataclasses.FrozenInstanceError):
-        config.port = 9090  # type: ignore[misc]
+        setattr(config, "port", 9090)  # noqa: B010
 
 
 def test_proxy_config_from_env_mapping():

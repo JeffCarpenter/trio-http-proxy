@@ -71,9 +71,11 @@ Embed the proxy into a Trio application:
 import trio
 from trio_http_proxy import ProxyConfig, start_server
 
+
 async def main() -> None:
     config = ProxyConfig(port=8080, maxconns=500)
     await start_server(config)
+
 
 trio.run(main)
 ```

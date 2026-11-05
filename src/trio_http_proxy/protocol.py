@@ -98,9 +98,7 @@ async def process_as_connect_request(
 
             if event is h11.NEED_DATA:
                 if total_received >= req_maxreqsz:
-                    raise RequestTooLargeError(
-                        f"Request exceeded {req_maxreqsz} bytes"
-                    )
+                    raise RequestTooLargeError(f"Request exceeded {req_maxreqsz} bytes")
                 chunk = await stream.receive_some(req_bufmaxsz)
                 if not chunk:
                     h11_conn.receive_data(b"")

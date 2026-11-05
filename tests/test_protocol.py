@@ -39,7 +39,9 @@ def test_parse_connect_target_invalid(target: bytes):
 
 async def test_process_as_connect_request_success():
     client_tx, proxy_rx = trio.testing.memory_stream_pair()
-    await client_tx.send_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+    await client_tx.send_all(
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+    )
     host, port, trailing = await process_as_connect_request(proxy_rx)
     assert host == "example.com"
     assert port == 443
@@ -48,7 +50,9 @@ async def test_process_as_connect_request_success():
 
 async def test_process_as_connect_request_with_trailing_data():
     client_tx, proxy_rx = trio.testing.memory_stream_pair()
-    payload = b"CONNECT 127.0.0.1:9000 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\nEARLY_DATA"
+    payload = (
+        b"CONNECT 127.0.0.1:9000 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\nEARLY_DATA"
+    )
     await client_tx.send_all(payload)
     host, port, trailing = await process_as_connect_request(proxy_rx)
     assert host == "127.0.0.1"
@@ -74,7 +78,6 @@ async def test_process_as_connect_request_oversized():
     )
     with pytest.raises(RequestTooLargeError):
         await process_as_connect_request(proxy_rx, config=cfg)
-
 
 
 async def test_process_as_connect_request_timeout():

@@ -57,7 +57,7 @@ async def tunnel(
         with trio.move_on_after(5.0):
             await client_stream.send_all(http.HTTP_414_URI_TOO_LONG)
         raise
-    except (ProxyProtocolError, h11.ProtocolError):
+    except ProxyProtocolError, h11.ProtocolError:
         logger.warning("Bad CONNECT request, sending 400 to client")
         with trio.move_on_after(5.0):
             await client_stream.send_all(http.HTTP_400_BAD_REQUEST)
@@ -73,12 +73,16 @@ async def tunnel(
         with trio.fail_after(cfg.dest_connect_timeout):
             dest_stream = await _connect(desthost, destport)
     except OSError:
-        logger.warning("Could not connect to %s:%d, sending 502 to client", desthost, destport)
+        logger.warning(
+            "Could not connect to %s:%d, sending 502 to client", desthost, destport
+        )
         with trio.move_on_after(5.0):
             await client_stream.send_all(http.HTTP_502_BAD_GATEWAY)
         raise
     except trio.TooSlowError:
-        logger.warning("Timed out connecting to %s:%d, sending 504 to client", desthost, destport)
+        logger.warning(
+            "Timed out connecting to %s:%d, sending 504 to client", desthost, destport
+        )
         with trio.move_on_after(5.0):
             await client_stream.send_all(http.HTTP_504_GATEWAY_TIMEOUT)
         raise
@@ -147,7 +151,9 @@ async def http_proxy(
                 trio.TooSlowError,
                 OSError,
             ) as excgroup:
-                logger.debug("[conn%d] Tunnel ended with exception: %s", conn_id, excgroup)
+                logger.debug(
+                    "[conn%d] Tunnel ended with exception: %s", conn_id, excgroup
+                )
 
     logger.debug("[conn%d] Connection closed", conn_id)
 

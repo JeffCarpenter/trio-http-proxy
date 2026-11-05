@@ -4,7 +4,7 @@
 Extract a minimal HTTP CONNECT proxy to git branch `mini`. Build strictly on Trio structured concurrency and RFC 7231. Remove Cashews caching, the background asyncio thread, circuit breakers, rate limiters, and Pydantic settings. See [meta.md](meta.md) for architectural invariants and scope specifications.
 
 ## Current Phase
-Phase 3: Packaging and Dependency Pruning (Dispatched to Worker 1)
+Complete (All Quality Gates Passed)
 
 ## Phase Checklist
 - [x] Phase 0: Setup
@@ -21,30 +21,26 @@ Phase 3: Packaging and Dependency Pruning (Dispatched to Worker 1)
 - [x] Phase 2: Structured Concurrency Core Implementation
   - [x] Write `src/trio_http_proxy/streaming.py`: timeout-oblivious `pipe()` with `send_eof()`, and `pipe_with_timeout()` with `CancelScope` nudging.
   - [x] Write `src/trio_http_proxy/proxy.py`: `tunnel()`, `http_proxy()` with nursery and `CapacityLimiter`, and `start_server()`.
-- [ ] Phase 3: Packaging and Dependency Pruning [IN PROGRESS - Tranche T0]
-  - [ ] Delete legacy modules (`cache/`, `circuit_breaker/`, `connection/`, `proxy_cache.py`, `dependencies.py`, `util.py`).
-  - [ ] Update `src/trio_http_proxy/__init__.py` and `src/trio_http_proxy/__main__.py`.
-  - [ ] Remove `cashews`, `pydantic-settings`, and `trio-asyncio` from `pyproject.toml`.
-  - [ ] Run `uv sync` to refresh lockfile.
-  - [ ] Delete legacy tests in `tests/` and clean `conftest.py`.
-- [ ] Phase 4: Verification Suite [QUEUED - Tranches T1, T2, T3]
-  - [ ] Stream A (T1): Rewrite `tests/test_proxy.py` (200, 400, 408, 414, 502, 504, memory streams).
-  - [ ] Stream B (T2): Write `tests/test_invariants.py` (half-close, idle/send timeouts, sibling cancellation).
-  - [ ] Stream C (T3): Update `tests/test_proxy_tcp_integration.py` (loopback TCP sockets, CapacityLimiter).
-- [ ] Phase 5: Quality Gates & Documentation [QUEUED - Tranche T4 + Final Checks]
-  - [ ] Stream D (T4): Update `README.md` and `CLAUDE.md`.
-  - [ ] Run `mcpls` diagnostics, `ruff`, `pyright`, `pytest`, and live `curl` smoke test.
-
-## Scheduler Status (hierarchical-delegation)
-- `pool_size`: 5
-- `active_workers`: 1
-- `in_flight`:
-  - `T0`: Worker 1 (`63e384ef-ac35-48aa-a9b7-5a538c5114a6`) - Foundation cleanup & packaging
-- `queued`:
-  - `T1` (Stream A: `tests/test_proxy.py`)
-  - `T2` (Stream B: `tests/test_invariants.py`)
-  - `T3` (Stream C: `tests/test_proxy_tcp_integration.py`)
-  - `T4` (Stream D: `README.md`, `CLAUDE.md`)
+- [x] Phase 3: Packaging and Dependency Pruning
+  - [x] Delete legacy modules (`cache/`, `circuit_breaker/`, `connection/`, `proxy_cache.py`, `dependencies.py`, `util.py`).
+  - [x] Update `src/trio_http_proxy/__init__.py` and `src/trio_http_proxy/__main__.py`.
+  - [x] Remove `cashews`, `pydantic-settings`, and `trio-asyncio` from `pyproject.toml`.
+  - [x] Run `uv sync` to refresh lockfile.
+  - [x] Delete legacy tests in `tests/` and clean `conftest.py`.
+- [x] Phase 4: Verification Suite
+  - [x] Stream A (T1): Rewrite `tests/test_proxy.py` (memory streams, status codes 200, 400, 408, 414, 502, 504, chunk boundaries).
+  - [x] Stream B (T2): Write `tests/test_invariants.py` (half-close, idle/send timeouts, sibling cancellation).
+  - [x] Stream C (T3): Update `tests/test_proxy_tcp_integration.py` (live loopback TCP sockets, CapacityLimiter).
+- [x] Phase 5: Quality Gates & Documentation
+  - [x] Stream D (T4): Update `README.md`, `CLAUDE.md`, and `docs/configuration.md`.
+  - [x] Merge all worktrees conflict-free into `mini`.
+  - [x] Pass `mcpls` diagnostics: 0 errors across all files.
+  - [x] Pass `ruff check`: All checks passed.
+  - [x] Pass `ruff format --check`: All files formatted.
+  - [x] Pass `pyright`: 0 errors, 0 warnings, 0 informations.
+  - [x] Pass `ty check`: All checks passed.
+  - [x] Pass `pytest`: 58/58 tests passed in 0.72s.
+  - [x] Live `curl` smoke test: verified HTTPS tunnel through local proxy.
 
 ## Decisions Made
 - Checked out dedicated branch `mini` from `main`.
@@ -53,7 +49,8 @@ Phase 3: Packaging and Dependency Pruning (Dispatched to Worker 1)
 - Support bidirectional TCP half-close via `send_eof()`.
 - Guard against Slowloris reads and stalled send buffers by nudging cancel scope deadlines.
 - Use frozen dataclass for configuration; avoid mutable module state and Pydantic models.
-- Adopted hierarchical-delegation with `pool_size = 5`.
+- Executed parallel streams using isolated `git worktree`s under `hierarchical-delegation`.
+- Supervised and reviewed streams using `pi` via `hcom`.
 - Untracked and ignored `.planning/.active_plan`.
 
 ## Errors Encountered

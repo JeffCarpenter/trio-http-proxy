@@ -17,6 +17,7 @@ Invariants verified:
 from __future__ import annotations
 
 from functools import partial
+from types import TracebackType
 from typing import Self
 
 import pytest
@@ -126,7 +127,6 @@ class TrackedStream(trio.abc.HalfCloseableStream):
             self.cancelled_in_send = True
             raise
 
-
     async def wait_send_all_might_not_block(self) -> None:
         return await self.inner.wait_send_all_might_not_block()
 
@@ -142,7 +142,12 @@ class TrackedStream(trio.abc.HalfCloseableStream):
     async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, *args: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         await self.aclose()
 
 
