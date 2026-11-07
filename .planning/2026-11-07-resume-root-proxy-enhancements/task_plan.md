@@ -4,7 +4,7 @@
 Complete the root plan: accept graceful signal shutdown and incremental Hypothesis fuzzing, integrate target allowlist / SSRF protection, and run combined verification. Preserve existing root planning documents and all worktree changes. Coordinate bounded, disjoint workers where available.
 
 ## Current phase
-Phase 3: Combined validation and handoff.
+Complete: all phases accepted and implementation pushed to origin/mini.
 
 ### Phase 0: Recover task state
 **Status:** complete
@@ -25,13 +25,13 @@ Phase 3: Combined validation and handoff.
 - Document settings and security model; verify denial and opt-out behavior.
 
 ### Phase 3: Combined validation and handoff
-**Status:** in_progress
+**Status:** complete
 - Run pytest, Ruff lint/format, pyright, ty and local TCP smoke test.
 - Review final changes and repository state; record residual risks.
 - Root plan requests commit and push: commit only after checks; inspect configured upstream before push.
 
 ## Next Step
-Run full combined gates and live CLI smoke tests, then commit accepted changes and push mini without including preserved root planning edits.
+No implementation work remains. Hand off verified changes on origin/mini; preserve the pre-existing root planning edits and retained worktrees.
 
 ## Decisions made
 - User clarified that root documents describe the incomplete task; recover them into an explicitly pinned new plan instead of silently selecting an unrelated named plan.

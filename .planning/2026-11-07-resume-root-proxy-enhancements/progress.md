@@ -57,3 +57,9 @@
 - Independent final review accepted connection race and scope/NAT64/cleanup fixes; no remaining concrete findings after per-connection reset containment. Workers frozen and ready to retire.
 - Quality: frozen configuration/tuple policy inputs, pure policy functions, explicit effectful DNS/connection boundary, bounded staggered races with stream ownership cleanup, documented security opt-out. No new dependencies. Residual limits: no client authentication, custom connectors trusted, network-specific NAT/upstream forwarding and DNS-query leakage require network controls.
 - Root planning edits predate task and remain unchanged, excluded from implementation commits. Worktrees retained to preserve original/accepted artifacts.
+
+## Completion
+- Implementation committed as a123704 (shutdown merge plus accepted target policy, cleanup and fuzz artifacts).
+- Fuzz branch history integrated as a4c87d7 using ours strategy because its independently improved file was already accepted in the implementation commit; no code discarded.
+- git push origin mini succeeded: 97ca0d6..a4c87d7. No force push; upstream was checked before publishing.
+- All implementation phases complete. Next step: final handoff and preserve original root planning files/worktrees.
