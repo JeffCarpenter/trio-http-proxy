@@ -26,11 +26,15 @@ dev = [
     "pyreqwest>=0.13.0",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
     "pytest-trio>=0.8.0",
 ]
 
 [tool.pytest]
 trio_mode = true
+# A hung test must fail, not stall CI. The slowest test takes under 0.5 s.
+# pytest-timeout needs this as a string; a TOML integer is an INTERNALERROR.
+timeout = "30"
 
 [tool.pyright]
 venvPath = "."
