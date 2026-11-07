@@ -4,10 +4,10 @@
 Measure how io-agnostic (sans-io) `trio_http_proxy` really is, then pull the genuinely sans-io logic out of the trio code so it has no trio dependency and tests without a runtime.
 
 ## Next Step
-Done. Code committed as 477c491 and 97abdb1 on `nano` (not pushed). Only open follow-up: C10, add a per-test timeout (`pytest-timeout`, a new dependency and a `uv.lock` change); the user has not asked for it.
+Done. `nano` was pushed to origin at 4868171. Phase 7 commits (46fc0f2, d40a09e, 9299c60, plus this plan note) are local and unpushed. No open follow-ups; ask the user whether to push them.
 
 ## Current Phase
-Phase 6 (complete)
+Phase 7 (complete)
 
 ## Phases
 
@@ -78,3 +78,11 @@ T4 waits because it reads `proxy.py`, which T3 writes. Scope-check manifest befo
 | First `ruff format`/`ruff check` did nothing: zsh does not word-split `$F`, so one bogus path was passed | Reran with explicit file paths: 2 files reformatted, check clean |
 | Malformed `Monitor` call (schema not loaded) | Not needed; background Bash notifies on completion |
 | `echo =====` failed in zsh (`=` command-name expansion) while reading plan files | Used a different separator |
+
+### Phase 7: User-chosen follow-ups (smoke test, pytest-timeout, parser contract, rg guard)
+User picked items 2, 3, 4 and said item 5 is trivial with ripgrep. Order (advisor): 3, 4, 5, 2, so the mutation runs for later items fail fast.
+- [x] Item 3: `pytest-timeout` dev dependency, `timeout = "30"` in `[tool.pytest]` (must be a string; a TOML integer is an INTERNALERROR). Commit 46fc0f2.
+- [x] Item 4: `ConnectParser` is terminal after a request or an error; first error repeats; `receive_data()` after finish or after EOF raises `RuntimeError`. Commit d40a09e.
+- [x] Item 5: `just sansio` runs `rg '\btrio\b'` over the four sans-io modules; part of `just ci`. Commit 9299c60.
+- [x] Item 2: built wheel into the scratchpad, installed it into a clean venv, ran the proxy from it against a local web server. Nothing left running.
+- **Status:** complete

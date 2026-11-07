@@ -76,6 +76,7 @@ Tool traps
 - `pyrightconfig.json` shadows `[tool.pyright]` in `pyproject.toml`; `uv run --locked pyright` also checks `tests/`. Never edit `pyrightconfig.json` during a round (an earlier subagent did, then restored it).
 - zsh does not word-split `$F`; use explicit paths or `${=F}`. `echo =====` fails (`=` expansion). The working directory drifts, so start each Bash call with `cd /home/jeff/code/fork/trio_http_proxy`.
 - `requires-python >= 3.14`: `except A, B:` without parentheses (`streaming.py:42`) is valid PEP 758 syntax.
+- Text search: use `rg` (ripgrep, `/usr/sbin/rg`), not `grep`; the user prefers it for performance. Filter saved output files with `rg` too.
 - Library docs: Context7 first, `pydoc` over `inspect`, and the `.venv` source as the final word.
 
 Method

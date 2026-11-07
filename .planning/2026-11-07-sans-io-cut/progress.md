@@ -40,6 +40,14 @@
 - Retrospective recorded: the round-1 acceptance of T1 missed C1 because it was a read-through, not a mutation check. Saved as memory `mutation-check-ported-tests` and under "Coordinator acceptance" in findings.md.
 - C10 (no per-test timeout) left alone: it needs `pytest-timeout`, a new dependency and a `uv.lock` change.
 
+### Phase 7 (user-chosen follow-ups, after the push of nano at 4868171)
+- Order per advisor: 3, 4, 5, 2. Network access worked (`uv add`, `uv build`, wheel venv install).
+- Item 3: `uv add --dev pytest-timeout` added only that package to `uv.lock`. First attempt `timeout = 30` (TOML integer) gave an INTERNALERROR (`config option 'timeout' expects a string, got int: 30`) that my `-o timeout=5` mutation run had hidden by overriding the key; found by reading the plain header. Fixed with `timeout = "30"`, and proved the pyproject value is read (probe 7 showed `timeout: 7.0s`, restored to 30). A mutant without `fail_after(read_timeout)` now fails in 5 s with `Failed: Timeout (>5.0s) from pytest-timeout`. Commit 46fc0f2.
+- Item 4: found by LSP `incomingCalls` that only the driver and tests call the parser. Rules: first error repeats; data after a finished parser or after EOF raises `RuntimeError`. Mutation: no-latch fails 4 tests, finished-check removed fails 2, EOF-check removed fails 1. My first draft also guarded `receive_eof()`; a mutant of that guard survived because h11 never raises on empty data (checked in `.venv` h11 `_connection.py`), so I removed the dead guard and corrected a wrong test comment. I also amended my own unpushed commit message to drop an untested claim about check order. Commit d40a09e.
+- Item 5: no `.github/workflows` exists, so `just ci` is the gate. `just sansio` passes on the clean tree; a function-body `importlib.import_module("trio")` in `protocol.py` passes the test_sansio import tests (4 passed) but fails `just sansio` (rg exit 1); the file was restored and its sha256 checked. Commit 9299c60.
+- Item 2: `uv build --out-dir` into the scratchpad; the wheel lists `timeouts.py` and the entry points. Clean venv install: package import does not load trio; `trio-http-proxy --help` works. Run from that venv against `python -m http.server`: `curl -p` tunnel returned the file; a plain GET through the proxy got 400; CONNECT to a closed port got 502; a 3 MB body arrived whole (3,000,001 bytes); a raw CONNECT with an early GET and an immediate half-close got 200 plus the full response. Both servers stopped with TaskStop; ports confirmed closed.
+- Retrospective: the `-o timeout=5` override hid a config error. An override that works does not prove the file setting works; run once without it.
+
 ### Test Results
 | Test | Expected | Actual | Status |
 |------|----------|--------|--------|
@@ -53,6 +61,7 @@
 | Final after T4 fixes: `pytest -q`, `pyright`, `ruff format --check src tests`, `ruff check src tests` | pass | 154 passed; 0 errors, 0 warnings, 0 informations; 18 files formatted; All checks passed | ok |
 | `just ci` before commit 477c491 | pass | exit 0; ruff clean; pyright 0 errors; 154 passed | ok |
 | `just ci` before commit 97abdb1 | pass | exit 0; 160 passed; `ruff format --check src tests` 19 files formatted | ok |
+| `just ci` before commits 46fc0f2, d40a09e, 9299c60 | pass | exit 0 each; 160, 166, 166 passed; pyright 0 errors; `sansio` passed | ok |
 
 Not run: a real end-to-end run against a live listener beyond the repo's integration tests, and the LSP-diagnosis subagent's own checks (unreported).
 
