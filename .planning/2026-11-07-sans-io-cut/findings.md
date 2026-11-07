@@ -84,5 +84,9 @@ Method
 - `python -I` subprocess tests (in `tests/test_sansio.py`) ignore `PYTHONPATH` and load the repo source through the `.pth` file, so a scratch-copy mutation does not reach them. Mutate the live file only when no worker is running, with a backup and a sha256 restore check.
 - Shared tree: concurrent workers can see each other's half-finished edits. Rerun once, report, do not fix out-of-scope files.
 
+Coordinator acceptance (not for the brief)
+- Accepting a tranche that moves or rewrites tests needs a mutant per behaviour the old tests covered, not a read-through of the new helper plus a green run. In this session T1's sync port dropped the only trio-level test of the driver's EOF branch (`proxy.py`, `parser.receive_eof()`), and 144 tests stayed green until the T4 review found it (C1). T3's production change had been mutation-checked; T1's test-only change had not.
+- List what the old tests covered with `git show <base>:<test file>` before accepting the port. LSP `incomingCalls` on the removed line shows which tests still reach it.
+
 Settled decisions and known pre-existing issues are in the Decisions table of `task_plan.md` and under "Open items noticed, not acted on" above.
 

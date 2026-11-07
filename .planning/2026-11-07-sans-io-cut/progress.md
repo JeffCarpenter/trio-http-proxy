@@ -37,6 +37,7 @@
 - User asked for the commit and agreed to adopt the reviewer's drafted tests. `just ci` ran green before committing (ruff, pyright 0 errors, 154 passed), and again after the extra tests (160 passed).
 - Commit 477c491 `refactor(protocol)!: split sans-io core from the trio driver` (explicit paths; BREAKING CHANGE footer for `protocol.process_as_connect_request`).
 - Adopted the drafted tests in repo style: boundary tests in `tests/test_sansio.py`, `http_proxy` idle/send forwarding in `tests/test_tunnel_forwarding.py`, new `tests/test_pipe_deadlines.py`. Five mutants on scratch copies, each killed by an assertion, none by a hang: `>=` to `>`, either deadline assignment removed (2), idle/send swapped, send dropped. Commit 97abdb1 `test: pin the maxreqsz boundary and the pipe deadlines`.
+- Retrospective recorded: the round-1 acceptance of T1 missed C1 because it was a read-through, not a mutation check. Saved as memory `mutation-check-ported-tests` and under "Coordinator acceptance" in findings.md.
 - C10 (no per-test timeout) left alone: it needs `pytest-timeout`, a new dependency and a `uv.lock` change.
 
 ### Test Results
