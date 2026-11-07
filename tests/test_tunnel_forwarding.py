@@ -178,3 +178,46 @@ async def test_handshake_sends_share_one_send_timeout(
             await tunnel(proxy_client, _connect=connect, **LIMITS)
         assert trio.current_time() - started == SEND_TIMEOUT
         assert upstream.closed
+
+
+async def test_http_proxy_forwards_idle_timeout_to_pipes(
+    autojump_clock: tt.MockClock,
+) -> None:
+    client, proxy_client = tt.memory_stream_pair()
+    upstream = FakeUpstream(stall_send=False)
+
+    async def connect(host: str, port: int) -> trio.abc.Stream:
+        return upstream
+
+    async with client, proxy_client:
+        await client.send_all(CONNECT)
+        started = trio.current_time()
+        await http_proxy(
+            proxy_client, idle_timeout=5.0, send_timeout=SEND_TIMEOUT, _connect=connect
+        )
+        assert trio.current_time() - started == 5.0
+
+
+async def test_http_proxy_forwards_send_timeout_to_pipes(
+    autojump_clock: tt.MockClock,
+) -> None:
+    client, proxy_client = tt.memory_stream_pair()
+    upstream = FakeUpstream(stall_send=False)
+
+    async def connect(host: str, port: int) -> trio.abc.Stream:
+        return upstream
+
+    async def send_late_bytes() -> None:
+        await trio.sleep(1.0)
+        upstream.stall_send = True
+        await client.send_all(b"x")
+
+    async with client, proxy_client, trio.open_nursery() as nursery:
+        await client.send_all(CONNECT)
+        nursery.start_soon(send_late_bytes)
+        started = trio.current_time()
+        await http_proxy(
+            proxy_client, idle_timeout=50.0, send_timeout=SEND_TIMEOUT, _connect=connect
+        )
+        # 1 s until the bytes arrive, then the send deadline.
+        assert trio.current_time() - started == 1.0 + SEND_TIMEOUT

@@ -318,3 +318,23 @@ def test_pipe_timeouts_walks_idle_send_idle() -> None:
 
     assert policy.sent(160.0) == 460.0
     assert (policy.phase, policy.reason, policy.timeout) == ("idle", "idle", 300.0)
+
+
+def _unterminated_request(length: int) -> bytes:
+    """A CONNECT request cut off at length bytes, before its blank line."""
+    prefix = CONNECT[:-2] + b"X: " + b"a" * length
+    assert b"\r\n\r\n" not in prefix[:length]
+    return prefix[:length]
+
+
+def test_incomplete_headers_at_exactly_maxreqsz_are_rejected_at_once() -> None:
+    parser = ConnectParser(maxreqsz=60)
+    parser.receive_data(_unterminated_request(60))
+    with pytest.raises(RequestTooLargeError):
+        parser.next_request()
+
+
+def test_incomplete_headers_one_byte_under_maxreqsz_still_wait_for_data() -> None:
+    parser = ConnectParser(maxreqsz=60)
+    parser.receive_data(_unterminated_request(59))
+    assert parser.next_request() is None
