@@ -4,7 +4,7 @@
 Measure how io-agnostic (sans-io) `trio_http_proxy` really is, then pull the genuinely sans-io logic out of the trio code so it has no trio dependency and tests without a runtime.
 
 ## Next Step
-Done. `nano` was pushed to origin at 4868171. Phase 7 commits (46fc0f2, d40a09e, 9299c60, plus this plan note) are local and unpushed. No open follow-ups; ask the user whether to push them.
+Done. `nano` is pushed to origin through 45cdf3f, which includes all Phase 7 commits (46fc0f2, d40a09e, 9299c60). No open follow-ups.
 
 ## Current Phase
 Phase 7 (complete)
@@ -39,7 +39,7 @@ Phase 7 (complete)
 ### Phase 5: Delivery
 - [x] Report result to user
 - [x] LSP-diagnosis subagent report received (root cause: Claude Code client gitignore filter; no config change)
-- [x] User approved the commit; code is in 477c491 (the cut) and 97abdb1 (review-gap tests) on `nano`, not pushed
+- [x] User approved the commit; code is in 477c491 (the cut) and 97abdb1 (review-gap tests) on `nano`; pushed to origin (first at 4868171, then through 45cdf3f)
 - **Status:** complete
 
 ### Phase 6: Follow-up tranches (hierarchical delegation, pool_size 5)
