@@ -1,89 +1,38 @@
-"""Bidirectional stream piping with half-close support and timeout nudging."""
+"""Bounded stream forwarding with half-close support."""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable
-
 import trio
-
-logger = logging.getLogger(__name__)
 
 
 async def pipe(
     from_stream: trio.abc.ReceiveStream,
     to_stream: trio.abc.SendStream,
     bufmaxsz: int = 8192,
-    on_receive: Callable[[], None] | None = None,
-    on_send: Callable[[], None] | None = None,
-) -> None:
-    """Forward chunks from from_stream to to_stream until EOF.
-
-    When on_receive or on_send is given, call it immediately after each
-    receive_some() or send_all(). On EOF, call to_stream.send_eof() if
-    supported to signal half-close.
-    """
-    while True:
-        chunk = await from_stream.receive_some(bufmaxsz)
-        if on_receive is not None:
-            on_receive()
-        if not chunk:
-            break
-        await to_stream.send_all(chunk)
-        if on_send is not None:
-            on_send()
-        logger.debug("Forwarded %d bytes", len(chunk))
-
-    if isinstance(to_stream, trio.abc.HalfCloseableStream):
-        try:
-            await to_stream.send_eof()
-        except trio.BrokenResourceError, trio.ClosedResourceError:
-            pass
-    logger.debug("Pipe finished")
-
-
-async def pipe_with_timeout(
-    from_stream: trio.abc.ReceiveStream,
-    to_stream: trio.abc.SendStream,
-    bufmaxsz: int = 8192,
+    *,
     idle_timeout: float = 300.0,
     send_timeout: float = 30.0,
 ) -> None:
-    """Run pipe(from_stream, to_stream) with idle and send timeouts.
+    """Forward chunks until EOF, then half-close the destination if supported.
 
-    Nudges a CancelScope deadline on each sign of progress.
-    Raises trio.TooSlowError if idle_timeout passes without data or
-    send_timeout passes while waiting for to_stream to accept data.
+    Each receive gets idle_timeout seconds; each send (including send_eof)
+    gets send_timeout seconds. Expiry raises trio.TooSlowError. The caller
+    owns both streams and remains responsible for closing them.
     """
-    phase = "idle"
+    while True:
+        with trio.fail_after(idle_timeout):
+            chunk = await from_stream.receive_some(bufmaxsz)
+        if not chunk:
+            break
+        with trio.fail_after(send_timeout):
+            await to_stream.send_all(chunk)
 
-    def on_receive() -> None:
-        nonlocal phase
-        phase = "send"
-        cancel_scope.deadline = trio.current_time() + send_timeout
-
-    def on_send() -> None:
-        nonlocal phase
-        phase = "idle"
-        cancel_scope.deadline = trio.current_time() + idle_timeout
-
-    with trio.CancelScope() as cancel_scope:
-        cancel_scope.deadline = trio.current_time() + idle_timeout
-        await pipe(
-            from_stream,
-            to_stream,
-            bufmaxsz=bufmaxsz,
-            on_receive=on_receive,
-            on_send=on_send,
-        )
-    if cancel_scope.cancelled_caught:
-        timeout = send_timeout if phase == "send" else idle_timeout
-        reason = "send stalled" if phase == "send" else "idle"
-        logger.warning("Pipe %s for %ss, closing tunnel", reason, timeout)
-        raise trio.TooSlowError(f"Pipe {reason} for {timeout}s")
+    if isinstance(to_stream, trio.abc.HalfCloseableStream):
+        with trio.fail_after(send_timeout):
+            try:
+                await to_stream.send_eof()
+            except trio.BrokenResourceError, trio.ClosedResourceError:
+                pass
 
 
-__all__ = [
-    "pipe",
-    "pipe_with_timeout",
-]
+__all__ = ["pipe"]

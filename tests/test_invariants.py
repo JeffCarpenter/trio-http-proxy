@@ -6,9 +6,9 @@ Invariants verified:
    HalfCloseableStream, and dest_stream can still send remaining data back to client
    until dest also hits EOF.
 2. Idle receive timeout:
-   pipe_with_timeout raises trio.TooSlowError if no data is received within idle_timeout.
+   pipe raises trio.TooSlowError if no data is received within idle_timeout.
 3. Stalled send timeout:
-   pipe_with_timeout raises trio.TooSlowError if to_stream blocks on send beyond send_timeout.
+   pipe raises trio.TooSlowError if to_stream blocks on send beyond send_timeout.
 4. Sibling cancellation:
    Inside http_proxy, when one direction fails or times out, the shared nursery
    immediately cancels the sibling task and cleanly closes both streams without leaked tasks.
@@ -25,7 +25,7 @@ import trio
 import trio.testing as tt
 
 from trio_http_proxy.proxy import http_proxy
-from trio_http_proxy.streaming import pipe, pipe_with_timeout
+from trio_http_proxy.streaming import pipe
 
 # ---------------------------------------------------------------------------
 # Test Stream Helpers
@@ -205,6 +205,20 @@ async def test_pipe_send_eof_broken_resource_suppressed(
     assert to_stream.send_eof_called is True
 
 
+@pytest.mark.parametrize("exc_type", [OSError, RuntimeError])
+async def test_pipe_unexpected_send_eof_errors_propagate(
+    exc_type: type[Exception],
+) -> None:
+    """Only broken/closed-resource errors are suppressed during half-close."""
+    from_tx, from_rx = tt.memory_stream_pair()
+    to_stream = FaultyEofSendStream(exc_type)
+    await from_tx.send_eof()
+
+    with pytest.raises(exc_type):
+        await pipe(from_rx, to_stream)
+    assert to_stream.send_eof_called
+
+
 async def test_full_duplex_half_close_client_eof_dest_continues() -> None:
     """Client sends EOF; dest receives EOF, then sends remaining data back to client."""
     client_client, client_proxy = tt.memory_stream_pair()
@@ -295,16 +309,16 @@ async def test_full_duplex_half_close_dest_eof_client_continues() -> None:
 
 
 async def test_pipe_idle_receive_timeout_initial() -> None:
-    """pipe_with_timeout raises trio.TooSlowError if no data is received within idle_timeout."""
+    """pipe raises trio.TooSlowError if no data is received within idle_timeout."""
     _from_tx, from_rx = tt.memory_stream_pair()
     to_stream, _to_peer = tt.memory_stream_pair()
 
-    with pytest.raises(trio.TooSlowError, match="Pipe idle for 0.05s"):
-        await pipe_with_timeout(from_rx, to_stream, idle_timeout=0.05, send_timeout=1.0)
+    with pytest.raises(trio.TooSlowError):
+        await pipe(from_rx, to_stream, idle_timeout=0.05, send_timeout=1.0)
 
 
 async def test_pipe_idle_receive_timeout_after_data() -> None:
-    """pipe_with_timeout raises trio.TooSlowError if connection goes idle after initial data."""
+    """pipe raises trio.TooSlowError if connection goes idle after initial data."""
     from_tx, from_rx = tt.memory_stream_pair()
     to_stream, to_peer = tt.memory_stream_pair()
 
@@ -317,10 +331,8 @@ async def test_pipe_idle_receive_timeout_after_data() -> None:
 
         nursery.start_soon(feeder)
 
-        with pytest.raises(trio.TooSlowError, match="Pipe idle for 0.05s"):
-            await pipe_with_timeout(
-                from_rx, to_stream, idle_timeout=0.05, send_timeout=1.0
-            )
+        with pytest.raises(trio.TooSlowError):
+            await pipe(from_rx, to_stream, idle_timeout=0.05, send_timeout=1.0)
 
         nursery.cancel_scope.cancel()
 
@@ -344,7 +356,7 @@ async def test_pipe_idle_timeout_progress_resets_deadline() -> None:
         nursery.start_soon(slow_feeder)
 
         # Should NOT raise TooSlowError because each receive resets the deadline
-        await pipe_with_timeout(from_rx, to_stream, idle_timeout=0.05, send_timeout=1.0)
+        await pipe(from_rx, to_stream, idle_timeout=0.05, send_timeout=1.0)
 
     received = b""
     while chunk := await to_peer.receive_some(1024):
@@ -353,15 +365,15 @@ async def test_pipe_idle_timeout_progress_resets_deadline() -> None:
 
 
 def test_pipe_idle_receive_timeout_mock_clock() -> None:
-    """Virtual clock test verifying pipe_with_timeout idle deadline jumping."""
+    """Virtual clock test verifying pipe idle deadline jumping."""
     clock = tt.MockClock(autojump_threshold=0)
 
     async def scenario() -> None:
         _from_tx, from_rx = tt.memory_stream_pair()
         to_stream, _to_peer = tt.memory_stream_pair()
 
-        with pytest.raises(trio.TooSlowError, match="Pipe idle for 300.0s"):
-            await pipe_with_timeout(
+        with pytest.raises(trio.TooSlowError):
+            await pipe(
                 from_rx,
                 to_stream,
                 idle_timeout=300.0,
@@ -377,14 +389,14 @@ def test_pipe_idle_receive_timeout_mock_clock() -> None:
 
 
 async def test_pipe_stalled_send_timeout() -> None:
-    """pipe_with_timeout raises trio.TooSlowError if to_stream blocks beyond send_timeout."""
+    """pipe raises trio.TooSlowError if to_stream blocks beyond send_timeout."""
     from_tx, from_rx = tt.memory_stream_pair()
     stalled_stream = StalledSendStream()
 
     await from_tx.send_all(b"incoming data")
 
-    with pytest.raises(trio.TooSlowError, match="Pipe send stalled for 0.05s"):
-        await pipe_with_timeout(
+    with pytest.raises(trio.TooSlowError):
+        await pipe(
             from_rx,
             stalled_stream,
             idle_timeout=10.0,
@@ -410,8 +422,8 @@ async def test_pipe_send_progress_resets_deadline_to_idle() -> None:
 
         nursery.start_soon(check_peer)
 
-        with pytest.raises(trio.TooSlowError, match="Pipe idle for 0.05s"):
-            await pipe_with_timeout(
+        with pytest.raises(trio.TooSlowError):
+            await pipe(
                 from_rx,
                 to_stream,
                 idle_timeout=0.05,
@@ -420,7 +432,7 @@ async def test_pipe_send_progress_resets_deadline_to_idle() -> None:
 
 
 def test_pipe_stalled_send_timeout_mock_clock() -> None:
-    """Virtual clock test verifying pipe_with_timeout stalled send jumping."""
+    """Virtual clock test verifying pipe stalled send jumping."""
     clock = tt.MockClock(autojump_threshold=0)
 
     async def scenario() -> None:
@@ -429,8 +441,8 @@ def test_pipe_stalled_send_timeout_mock_clock() -> None:
 
         await from_tx.send_all(b"immediate data")
 
-        with pytest.raises(trio.TooSlowError, match="Pipe send stalled for 30.0s"):
-            await pipe_with_timeout(
+        with pytest.raises(trio.TooSlowError):
+            await pipe(
                 from_rx,
                 stalled_stream,
                 idle_timeout=300.0,
@@ -552,8 +564,9 @@ async def test_sibling_cancelled_on_idle_timeout() -> None:
     ) is True
 
 
-async def test_sibling_cancelled_on_stalled_send_timeout() -> None:
-    """When a send stalls beyond send_timeout, sibling task is cancelled and dest_stream closed."""
+@pytest.mark.parametrize("operation", ["send", "eof"])
+async def test_sibling_cancelled_on_stalled_write_timeout(operation: str) -> None:
+    """A stalled send or half-close cancels the sibling and closes both streams."""
     client_client, client_proxy_raw = tt.memory_stream_pair()
     dest_send = StalledSendStream()
     _dest_tx, dest_rx = tt.memory_stream_pair()
@@ -569,7 +582,8 @@ async def test_sibling_cancelled_on_stalled_send_timeout() -> None:
             await dest_send.wait_send_all_might_not_block()
 
         async def send_eof(self) -> None:
-            pass
+            if operation == "eof":
+                await trio.sleep_forever()
 
         async def receive_some(self, max_bytes: int | None = 4096) -> bytes | bytearray:
             try:
@@ -603,12 +617,15 @@ async def test_sibling_cancelled_on_stalled_send_timeout() -> None:
         resp = await client_client.receive_some(1024)
         assert b"200 Connection established" in resp
 
-        # Client sends data to dest; dest stalls on send_all
-        await client_client.send_all(b"some payload to dest")
+        if operation == "send":
+            await client_client.send_all(b"some payload to dest")
+        else:
+            await client_client.send_eof()
 
     # Sibling task (dest -> client) was cancelled while waiting in dest.receive_some()
     assert stalled_dest.cancelled_in_receive is True
     assert dest_send.closed is True
+    assert client_proxy.closed is True
 
 
 async def test_both_streams_cleanly_closed_under_server_lifecycle() -> None:

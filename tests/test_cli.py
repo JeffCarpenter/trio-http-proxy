@@ -1,4 +1,4 @@
-"""The nano CLI only accepts host and port; environment settings are ignored."""
+"""The micro CLI only accepts host and port; environment settings are ignored."""
 
 from functools import partial
 

@@ -2,7 +2,9 @@
 
 Historical specification for `mini`. The `nano` branch also removes configuration,
 destination policies, connection limiting, custom DNS racing, and signal draining.
-See [README.md](README.md) for its current scope and usage.
+`micro` builds on `nano` and replaces callback-driven forwarding with one bounded
+`pipe()`. The sections below describe `mini`, not the current implementation.
+See [README.md](README.md) for current scope and usage.
 
 ## 1. Scope
 The `mini` branch extracts a minimal HTTP CONNECT proxy from `main`.

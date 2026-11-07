@@ -1,4 +1,4 @@
-"""Live loopback TCP tests for the nano CONNECT server."""
+"""Live loopback TCP tests for the micro CONNECT server."""
 
 from __future__ import annotations
 

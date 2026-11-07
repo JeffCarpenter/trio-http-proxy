@@ -9,7 +9,7 @@ from .proxy import (
     start_server,
     tunnel,
 )
-from .streaming import pipe, pipe_with_timeout
+from .streaming import pipe
 
 __all__ = [
     "ProxyError",
@@ -21,7 +21,6 @@ __all__ = [
     "main",
     "parse_connect_target",
     "pipe",
-    "pipe_with_timeout",
     "process_as_connect_request",
     "protocol",
     "proxy",

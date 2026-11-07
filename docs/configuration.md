@@ -1,6 +1,6 @@
-# Nano runtime options and limits
+# Micro runtime options and limits
 
-The nano branch has no settings object, environment-variable configuration,
+The micro branch has no settings object, environment-variable configuration,
 `.env` support, destination policies, or connection admission limiter.
 
 ## Listen address
@@ -35,13 +35,27 @@ These are library defaults, not CLI or environment settings.
 | DNS and TCP connection deadline | 10 seconds | `tunnel(connect_timeout=...)` |
 | Initial tunnel data and 200 response writes | 30 seconds total | Fixed |
 | Error response write deadline | 5 seconds | Fixed |
-| Per-direction idle timeout | 300 seconds | `http_proxy(idle_timeout=...)`, `pipe_with_timeout(idle_timeout=...)` |
-| Per-direction send timeout | 30 seconds | `http_proxy(send_timeout=...)`, `pipe_with_timeout(send_timeout=...)` |
-| Read chunk size | 8192 bytes | `process_as_connect_request(bufmaxsz=...)`, `pipe(bufmaxsz=...)`, `pipe_with_timeout(bufmaxsz=...)` |
+| Per-direction idle timeout | 300 seconds | `http_proxy(idle_timeout=...)`, `pipe(idle_timeout=...)` |
+| Per-direction send timeout | 30 seconds | `http_proxy(send_timeout=...)`, `pipe(send_timeout=...)` |
+| Read chunk size | 8192 bytes | `process_as_connect_request(bufmaxsz=...)`, `pipe(bufmaxsz=...)` |
+
+Each receive gets a fresh idle deadline. Each write, including `send_eof()`,
+gets a fresh send deadline. Time spent sending does not consume the next
+receive's idle budget. Deadlines apply independently to each direction.
 
 A normal EOF half-closes the opposite stream and lets the other direction
 finish. A forwarding error or timeout cancels the sibling pipe. Stream owners
 close their sockets when they finish or are cancelled.
+
+## Forwarding API migration from nano
+
+`pipe()` now includes idle and send timeouts by default. Replace calls to
+`pipe_with_timeout()` with `pipe()`; the wrapper and the `on_receive`/`on_send`
+callback arguments have been removed. Pass `idle_timeout` and `send_timeout`
+as keyword arguments. Use `float("inf")` for either timeout to disable it
+explicitly. Expiry raises `trio.TooSlowError`; its former phase-specific error
+messages and per-chunk debug logs have been removed. `pipe()` never closes
+either stream; its caller retains ownership.
 
 ## Trust and lifecycle
 

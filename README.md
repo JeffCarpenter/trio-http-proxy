@@ -1,4 +1,4 @@
-# trio-http-proxy — nano
+# trio-http-proxy — micro
 
 A small HTTP CONNECT proxy built on [Trio](https://trio.readthedocs.io/) and
 [h11](https://h11.readthedocs.io/). Requires Python 3.14 or newer.
@@ -43,6 +43,10 @@ access to other machines.
 Trio handles DNS, connection racing, listening sockets, and task lifetimes.
 Ctrl-C cancels the server and its active tunnels; there is no drain period or
 SIGTERM handler.
+
+Micro builds on `nano`, keeping the same protocol checks and safety limits.
+Forwarding uses one `pipe()` with per-operation deadlines instead of callbacks
+and a separate timeout wrapper.
 
 See [runtime options and limits](docs/configuration.md) for details.
 

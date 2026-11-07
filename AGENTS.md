@@ -2,7 +2,7 @@
 
 ## Scope
 
-The `nano` branch is a small HTTP CONNECT proxy built on Trio and h11.
+The `micro` branch is a small HTTP CONNECT proxy built on Trio and h11.
 It requires Python 3.14+ and supports CONNECT tunneling only, not plain HTTP
 proxy requests. Do not restore removed optional layers without an explicit
 request.
@@ -35,8 +35,8 @@ Source lives in `src/trio_http_proxy/`:
 - `proxy.py`: `tunnel()` performs the handshake; `http_proxy()` owns the client
   and upstream streams and runs both pipes in a nursery. `start_server()`
   delegates to `trio.serve_tcp`; `main()` parses only host and port.
-- `streaming.py`: `pipe()` forwards bytes and propagates half-close;
-  `pipe_with_timeout()` updates idle/send deadlines on progress.
+- `streaming.py`: `pipe()` forwards bytes with per-operation idle/send deadlines
+  and propagates half-close. There are no progress callbacks or timeout wrapper.
 - `http.py`: Uppercase wire-format response constants.
 - `errors.py`: Proxy exception hierarchy.
 - `__init__.py`: Public function and exception exports.

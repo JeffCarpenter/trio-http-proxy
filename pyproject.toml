@@ -1,7 +1,7 @@
 [project]
 name = "trio-http-proxy"
 version = "0.1.0"
-description = "Nano HTTP CONNECT proxy built on Trio and h11"
+description = "Micro HTTP CONNECT proxy built on Trio and h11"
 readme = "README.md"
 authors = [
     { name = "Jeff C", email = "pub@jeffc.ca" }

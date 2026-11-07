@@ -13,7 +13,7 @@ import trio
 from . import http
 from .errors import ProxyProtocolError, RequestTooLargeError
 from .protocol import process_as_connect_request
-from .streaming import pipe_with_timeout
+from .streaming import pipe
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ async def http_proxy(
                     ):
                         nursery.start_soon(
                             partial(
-                                pipe_with_timeout,
+                                pipe,
                                 source,
                                 target,
                                 idle_timeout=idle_timeout,
@@ -131,7 +131,7 @@ async def start_server(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Nano HTTP CONNECT proxy")
+    parser = argparse.ArgumentParser(description="Micro HTTP CONNECT proxy")
     parser.add_argument(
         "--host", default="127.0.0.1", help="listen address (127.0.0.1)"
     )

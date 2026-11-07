@@ -1,4 +1,4 @@
-trio-http-proxy — nano
+trio-http-proxy — micro
 ======================
 
 A small HTTP CONNECT proxy built on Trio and h11. Requires Python 3.14+.
