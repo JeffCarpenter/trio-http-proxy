@@ -33,6 +33,9 @@ Source lives in `src/trio_http_proxy/`:
 - `protocol.py`: Sans-io core, no trio import. `ConnectParser` does bounded
   incremental h11 parsing (feed bytes, pull a `ConnectRequest` of host, port
   and early tunnel bytes); also target validation and `error_response()`.
+  The parser is finished once it returns a request or raises: it repeats that
+  result, and `receive_data()` raises `RuntimeError` so later bytes are never
+  dropped (they belong to the tunnel).
 - `timeouts.py`: Sans-io `PipeTimeouts` idle/send deadline policy; the caller
   supplies the clock. Keep `protocol.py`, `timeouts.py`, `errors.py` and
   `http.py` free of trio imports. `tests/test_sansio.py` checks this with a

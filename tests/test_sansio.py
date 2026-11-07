@@ -338,3 +338,66 @@ def test_incomplete_headers_one_byte_under_maxreqsz_still_wait_for_data() -> Non
     parser = ConnectParser(maxreqsz=60)
     parser.receive_data(_unterminated_request(59))
     assert parser.next_request() is None
+
+
+def test_parser_repeats_its_first_error() -> None:
+    parser = ConnectParser()
+    parser.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    with pytest.raises(ProxyProtocolError, match="Expected CONNECT") as first:
+        parser.next_request()
+    with pytest.raises(ProxyProtocolError, match="Expected CONNECT") as second:
+        parser.next_request()
+    assert type(second.value) is type(first.value)
+    assert str(second.value) == str(first.value)
+
+
+def test_parser_repeats_request_too_large() -> None:
+    parser = ConnectParser(maxreqsz=20)
+    parser.receive_data(CONNECT)
+    with pytest.raises(RequestTooLargeError, match="exceeded 20 bytes"):
+        parser.next_request()
+    with pytest.raises(RequestTooLargeError, match="exceeded 20 bytes"):
+        parser.next_request()
+
+
+def test_parser_refuses_data_after_the_request_instead_of_dropping_it() -> None:
+    parser = ConnectParser()
+    parser.receive_data(CONNECT + b"early")
+    request = parser.next_request()
+    assert request is not None
+    with pytest.raises(RuntimeError, match="finished"):
+        parser.receive_data(b"more tunnel bytes")
+    parser.receive_data(b"")  # empty data is still ignored, as always
+    assert parser.next_request() is request
+    assert request.trailing_data == b"early"
+
+
+def test_parser_refuses_data_after_an_error() -> None:
+    parser = ConnectParser()
+    parser.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    with pytest.raises(ProxyProtocolError):
+        parser.next_request()
+    with pytest.raises(RuntimeError, match="finished"):
+        parser.receive_data(b"more")
+
+
+def test_parser_refuses_data_after_eof() -> None:
+    parser = ConnectParser()
+    parser.receive_data(CONNECT[:-2])
+    parser.receive_eof()
+    parser.receive_eof()  # a second EOF is harmless
+    with pytest.raises(RuntimeError, match="after receive_eof"):
+        parser.receive_data(b"x")
+    parser.receive_data(b"")  # empty data stays ignored
+    with pytest.raises(ProxyProtocolError):
+        parser.next_request()
+
+
+def test_parser_eof_after_an_error_keeps_the_first_error() -> None:
+    parser = ConnectParser()
+    parser.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    with pytest.raises(ProxyProtocolError):
+        parser.next_request()
+    parser.receive_eof()
+    with pytest.raises(ProxyProtocolError, match="Expected CONNECT"):
+        parser.next_request()

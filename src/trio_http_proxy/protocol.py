@@ -73,6 +73,12 @@ class ConnectParser:
     It returns None while more bytes are needed, then the ConnectRequest.
     Raises RequestTooLargeError once maxreqsz bytes arrive without a complete
     header block, and ProxyProtocolError for any other malformed input.
+
+    The parser is finished once next_request() returns a request or raises.
+    From then on next_request() repeats that same result. receive_data()
+    raises RuntimeError, because any later bytes belong to the tunnel and must
+    be forwarded, not parsed or dropped. receive_data() after receive_eof()
+    also raises RuntimeError. receive_eof() is always safe to call.
     """
 
     def __init__(self, *, maxreqsz: int = 16384) -> None:
@@ -82,24 +88,43 @@ class ConnectParser:
             max_incomplete_event_size=maxreqsz,
         )
         self._received = 0
-        self._request: ConnectRequest | None = None
+        self._eof = False
+        self._outcome: ConnectRequest | ProxyProtocolError | None = None
 
     def receive_data(self, data: Buffer) -> None:
         """Buffer bytes from the peer. Empty data is ignored; use receive_eof()."""
         chunk = bytes(data)
         if not chunk:
             return
+        if self._outcome is not None:
+            raise RuntimeError(
+                "ConnectParser is finished; forward further bytes to the tunnel"
+            )
+        if self._eof:
+            raise RuntimeError("ConnectParser got data after receive_eof()")
         self._received += len(chunk)
         self._conn.receive_data(chunk)
 
     def receive_eof(self) -> None:
         """Record that the peer closed its sending side."""
+        self._eof = True
         self._conn.receive_data(b"")
 
     def next_request(self) -> ConnectRequest | None:
-        if self._request is not None:
-            return self._request
+        """Return the request, None if more bytes are needed, or raise."""
+        if isinstance(self._outcome, ProxyProtocolError):
+            raise self._outcome
+        if self._outcome is not None:
+            return self._outcome
+        try:
+            request = self._poll()
+        except ProxyProtocolError as exc:
+            self._outcome = exc
+            raise
+        self._outcome = request
+        return request
 
+    def _poll(self) -> ConnectRequest | None:
         try:
             event = self._conn.next_event()
         except h11.RemoteProtocolError as exc:
@@ -125,8 +150,7 @@ class ConnectParser:
             raise ProxyProtocolError(f"Expected CONNECT method, got {event.method!r}")
 
         host, port = parse_connect_target(event.target)
-        self._request = ConnectRequest(host, port, trailing_data)
-        return self._request
+        return ConnectRequest(host, port, trailing_data)
 
 
 def error_response(exc: ProxyProtocolError) -> bytes:
