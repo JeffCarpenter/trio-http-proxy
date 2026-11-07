@@ -1,49 +1,54 @@
 # Project Guide
 
-This file provides guidance for working with code in this repository.
+## Scope
 
-## What this is
+The `nano` branch is a small HTTP CONNECT proxy built on Trio and h11.
+It requires Python 3.14+ and supports CONNECT tunneling only, not plain HTTP
+proxy requests. Do not restore removed optional layers without an explicit
+request.
 
-Simple HTTP CONNECT proxy built on Trio (structured-concurrency async I/O), h11 (HTTP parsing), and cashews (caching, circuit breaking, and rate limiting). It only handles `CONNECT` requests (i.e., tunneling HTTPS); plain HTTP requests are not supported.
+There is no cache, circuit breaker, rate limiter, connection limiter,
+destination policy, settings object, or custom signal handling. It binds
+to `127.0.0.1:8080` by default. It has no authentication or SSRF protection.
 
 ## Commands
 
 ```bash
-uv sync                          # install dependencies into .venv
-uv run trio_http_proxy           # or: uv run python -m trio_http_proxy
-TRIO_HTTP_PROXY_PORT=9090 uv run trio_http_proxy # override the default port (8080)
-
-pytest                           # run test suite
-ruff format                      # format
-ruff check --fix                 # lint
-ty check --fix                   # typecheck
-pyright                          # typecheck
+uv sync
+uv run trio_http_proxy
+uv run trio_http_proxy --port 9090
+ruff format
+ruff check
+uv run --locked pyright
+uv run --locked pytest
 ```
 
-Before committing, run `pyright` and `pytest`.
-
-To manually verify the proxy works end-to-end:
-
-```bash
-uv run trio_http_proxy & sleep 1; curl -x http://127.0.0.1:8080 https://canhazip.com; kill %1
-```
+Run Pyright and pytest before committing. `just ci` runs lint, Pyright and
+pytest. The local interpreter is `.venv/bin/python`.
 
 ## Architecture
 
-Everything lives in `src/trio_http_proxy/`:
-- `config/`: Frozen Pydantic `Settings`, loaded in order from explicit init kwargs, `TRIO_HTTP_PROXY_*` environment variables, `.env`, then defaults. Use the cached `get_settings()` at call time (never read config at import time); `reset_settings_cache()` clears it for tests. No module-level config constants: consumers accept `None`-defaulted parameters and resolve settings when called. Duration parsing and validation helpers live here. The default shared connection limiter is `get_conn_limiter()` (memoized; `reset_conn_limiter()` for tests), and the default cache is the lazy `get_default_proxy_cache()` singleton. `CV_PROXY_CACHE` overrides the default cache for a call tree; set it to `None` to disable caching.
-- `proxy.py`: Core HTTP CONNECT protocol handling, socket tunneling, bidirectional piping, connection-aware logging, and server lifecycle.
-- `proxy_cache.py` + `cache/`: `ProxyCache` bridging `cashews` async operations to Trio via a dedicated background asyncio thread runner, providing destination DNS resolution caching, circuit breaker fail-fast protection for unhealthy upstream hosts, and client rate limiting. `circuit_breaker_manager.py` holds the per-destination breaker registry.
-- `__init__.py`: Re-exports public symbols from `.config`, `.proxy`, `.cache`, and `.errors`.
+Source lives in `src/trio_http_proxy/`:
 
-- `start_server` calls `trio.serve_tcp(http_proxy, port)` and manages the `proxy_cache` lifecycle. Each inbound TCP connection spawns `http_proxy` as its own Trio task.
-- `http_proxy(client_stream, proxy_cache=...)` is the per-connection entry point: it checks client rate limits, calls `tunnel()` to complete the CONNECT handshake, then runs two `pipe_with_timeout()` tasks concurrently in a nursery — one for each direction of the tunnel — so data flows client→dest and dest→client simultaneously until either side closes or stalls.
-- `tunnel(client_stream, proxy_cache=...)` calls `process_as_connect_request()` (parses the CONNECT line via `h11`, in `h11.SERVER` role) to get the destination host/port, probes the destination circuit breaker, optionally resolves/caches destination IP via cashews, opens a TCP stream to it with `trio.open_tcp_stream`, records connection outcomes to the circuit breaker, and replies `200 Connection established` to the client. If circuit breaker is tripped, fast-fails with `502 Bad Gateway`.
-- `pipe(from_stream, to_stream)` forwards chunks until EOF, and sends EOF on destination if supported.
-- `pipe_with_timeout(from_stream, to_stream, ...)` wraps `pipe()` with idle and send timeouts.
-- Logging (`logger`) uses the standard library `logging` module. It is connection-aware via three `ContextVar`s (`CV_CLIENT_STREAM`, `CV_DEST_STREAM`, `CV_PIPE_FROM`) so that concurrent connections' log records are automatically prefixed with `[connN ...]` and enriched with structured attributes (`conn_id`, `desthost`, `direction`, `conn_prefix`). Each `client_stream` gets a sequential `.id` for this purpose (via the `_nextid` counter default arg on `http_proxy`).
-- Requires Python 3.14+ (see `pyproject.toml`).
+- `protocol.py`: Pure authority-form target validation and bounded incremental
+  h11 request parsing. Returns host, port, and any early tunnel bytes.
+- `proxy.py`: `tunnel()` performs the handshake; `http_proxy()` owns the client
+  and upstream streams and runs both pipes in a nursery. `start_server()`
+  delegates to `trio.serve_tcp`; `main()` parses only host and port.
+- `streaming.py`: `pipe()` forwards bytes and propagates half-close;
+  `pipe_with_timeout()` updates idle/send deadlines on progress.
+- `http.py`: Uppercase wire-format response constants.
+- `errors.py`: Proxy exception hierarchy.
+- `__init__.py`: Public function and exception exports.
+- `__main__.py`: Module entry point.
 
-## Configuration reference
+Keep all tasks inside nurseries. Preserve early tunnel bytes, half-close
+semantics, bounded handshakes, sibling cancellation on pipe failure, and
+cleanup on cancellation. A successful `tunnel()` transfers upstream ownership
+to its caller; a failed handshake must close the upstream itself.
 
-The [configuration reference](docs/configuration.md) is the source of truth for supported environment-variable names, defaults, value formats, and runtime behavior. Use `TRIO_HTTP_PROXY_<SETTING>` names, and update the reference when changing settings in `src/trio_http_proxy/config/settings.py`.
+## Runtime reference
+
+[docs/configuration.md](docs/configuration.md) documents CLI options and safety
+limits. Update it when changing defaults or behavior. Environment variables and
+`.env` files are not read.

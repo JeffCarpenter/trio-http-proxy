@@ -11,13 +11,10 @@ import trio
 import trio.testing as tt
 
 from trio_http_proxy import (
-    ProxyConfig,
     ProxyProtocolError,
     RequestTooLargeError,
-    get_conn_limiter,
     http,
     http_proxy,
-    reset_conn_limiter,
     start_server,
     tunnel,
 )
@@ -84,9 +81,8 @@ async def test_tunnel_times_out_reading_connect_sends_408():
         called = True
         raise AssertionError("should not connect on timeout")
 
-    cfg = ProxyConfig(connect_read_timeout=0.01)
     with pytest.raises(trio.TooSlowError):
-        await tunnel(proxy_client, config=cfg, _connect=fake_open_tcp_stream)
+        await tunnel(proxy_client, read_timeout=0.01, _connect=fake_open_tcp_stream)
 
     assert called is False
     reply = await test_client.receive_some(4096)
@@ -102,7 +98,6 @@ async def test_tunnel_oversized_request_sends_414():
         called = True
         raise AssertionError("should not connect on oversized request")
 
-    cfg = ProxyConfig(maxreqsz=100)
     oversized = (
         b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"
         + b"X-Large-Header: "
@@ -112,7 +107,7 @@ async def test_tunnel_oversized_request_sends_414():
     await test_client.send_all(oversized)
 
     with pytest.raises(RequestTooLargeError):
-        await tunnel(proxy_client, config=cfg, _connect=fake_open_tcp_stream)
+        await tunnel(proxy_client, maxreqsz=100, _connect=fake_open_tcp_stream)
 
     assert called is False
     reply = await test_client.receive_some(4096)
@@ -139,11 +134,10 @@ async def test_tunnel_times_out_connecting_sends_504():
     async def hanging_connect(host: str, port: int) -> trio.abc.Stream:
         await trio.sleep_forever()
 
-    cfg = ProxyConfig(dest_connect_timeout=0.01)
     await test_client.send_all(connect_request(target=b"example.com:443"))
 
     with pytest.raises(trio.TooSlowError):
-        await tunnel(proxy_client, config=cfg, _connect=hanging_connect)
+        await tunnel(proxy_client, connect_timeout=0.01, _connect=hanging_connect)
 
     reply = await test_client.receive_some(4096)
     assert reply == http.HTTP_504_GATEWAY_TIMEOUT
@@ -268,14 +262,13 @@ async def test_http_proxy_forwards_large_payload_across_chunk_boundaries():
     proxy_client.receive_stream.receive_some_hook = count_client_to_dest_reads
     dest_proxy_side.receive_stream.receive_some_hook = count_dest_to_client_reads
 
-    cfg = ProxyConfig(bufmaxsz=1024)
-    payload_size = cfg.bufmaxsz * 3 + 777
+    payload_size = 8192 * 3 + 777
     client_payload = random.Random(1).randbytes(payload_size)
     dest_payload = random.Random(2).randbytes(payload_size)
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(
-            partial(http_proxy, proxy_client, config=cfg, _connect=fake_open_tcp_stream)
+            partial(http_proxy, proxy_client, _connect=fake_open_tcp_stream)
         )
 
         await test_client.send_all(connect_request(target=b"example.com:443"))
@@ -355,38 +348,23 @@ async def test_http_proxy_handles_concurrent_connections_without_cross_talk():
             await dest_test_side.aclose()
 
 
-# ---------------------------------------------------------------------------
-# Additional proxy lifecycle and limiter tests
-# ---------------------------------------------------------------------------
-
-
-def test_capacity_limiter_memoization_and_reset():
-    reset_conn_limiter()
-    limiter1 = get_conn_limiter(500)
-    limiter2 = get_conn_limiter(500)
-    assert limiter1 is limiter2
-    assert limiter1.total_tokens == 500
-
-    reset_conn_limiter()
-    limiter3 = get_conn_limiter(200)
-    assert limiter3 is not limiter1
-    assert limiter3.total_tokens == 200
-    reset_conn_limiter()
-
-
-async def test_start_server_delegates_to_serve_tcp():
-    served_calls: list[tuple[Any, int]] = []
+async def test_start_server_delegates_to_serve_tcp(monkeypatch: pytest.MonkeyPatch):
+    served_calls: list[tuple[Any, int, str | None]] = []
 
     async def fake_serve_tcp(
         handler: Any,
         port: int,
         *,
+        host: str | None = None,
         task_status: Any = trio.TASK_STATUS_IGNORED,
     ) -> None:
-        served_calls.append((handler, port))
+        served_calls.append((handler, port, host))
         task_status.started([])
 
-    cfg = ProxyConfig(port=9999)
-    await start_server(config=cfg, _serve=fake_serve_tcp)
-    assert len(served_calls) == 1
-    assert served_calls[0][1] == 9999
+    monkeypatch.setattr(trio, "serve_tcp", fake_serve_tcp)
+    await start_server()
+    await start_server(9999, host="::1")
+    assert served_calls == [
+        (http_proxy, 8080, "127.0.0.1"),
+        (http_proxy, 9999, "::1"),
+    ]

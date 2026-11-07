@@ -1,5 +1,9 @@
 # Architecture and Scope Specification: Minimal Trio HTTP Proxy
 
+Historical specification for `mini`. The `nano` branch also removes configuration,
+destination policies, connection limiting, custom DNS racing, and signal draining.
+See [README.md](README.md) for its current scope and usage.
+
 ## 1. Scope
 The `mini` branch extracts a minimal HTTP CONNECT proxy from `main`.
 

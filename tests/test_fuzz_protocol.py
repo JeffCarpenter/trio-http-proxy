@@ -13,7 +13,6 @@ import trio
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from trio_http_proxy.config import ProxyConfig
 from trio_http_proxy.errors import ProxyProtocolError, RequestTooLargeError
 from trio_http_proxy.protocol import parse_connect_target, process_as_connect_request
 
@@ -413,11 +412,10 @@ def test_process_as_connect_request_oversize_invariant(
     chunks = [payload[i : i + chunk_size] for i in range(0, len(payload), chunk_size)]
 
     async def run_scenario() -> None:
-        cfg = ProxyConfig(maxreqsz=max_request_len)
         rx = ChunkedReceiveStream(chunks)
 
         with trio.fail_after(2.0), pytest.raises(RequestTooLargeError):
-            await process_as_connect_request(rx, config=cfg)
+            await process_as_connect_request(rx, maxreqsz=max_request_len)
 
     trio.run(run_scenario)
 
@@ -444,19 +442,17 @@ def test_process_as_connect_request_boundary_limits(
 
     async def run_boundary_scenario() -> None:
         # At exact boundary: must succeed
-        cfg_exact = ProxyConfig(maxreqsz=exact_len)
         rx_exact = ChunkedReceiveStream(chunks)
         host, parsed_port, trailing = await process_as_connect_request(
-            rx_exact, config=cfg_exact
+            rx_exact, maxreqsz=exact_len
         )
         assert (host, parsed_port) == (expected_host, port)
         assert trailing + await _read_all_stream(rx_exact) == body
 
         # 1 byte under required length: must raise RequestTooLargeError
-        cfg_too_small = ProxyConfig(maxreqsz=exact_len - 1)
         rx_too_small = ChunkedReceiveStream(chunks)
         with pytest.raises(RequestTooLargeError):
-            await process_as_connect_request(rx_too_small, config=cfg_too_small)
+            await process_as_connect_request(rx_too_small, maxreqsz=exact_len - 1)
 
     trio.run(run_boundary_scenario)
 

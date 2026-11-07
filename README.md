@@ -1,126 +1,74 @@
-# trio-http-proxy
+# trio-http-proxy — nano
 
-A minimal HTTP CONNECT proxy built strictly on Trio and h11.
+A small HTTP CONNECT proxy built on [Trio](https://trio.readthedocs.io/) and
+[h11](https://h11.readthedocs.io/). Requires Python 3.14 or newer.
 
-It tunnels HTTPS traffic with structured concurrency. It does not handle plain HTTP requests.
+This branch keeps CONNECT tunneling and its safety checks. It has no cache,
+circuit breaker, rate limiter, connection limiter, destination policy, settings
+object, or custom signal handling. Plain HTTP proxy requests are not supported.
 
-## Features
-
-- **Structured Concurrency:** Every task runs inside a nursery. No background threads, leaked tasks, or dangling sockets.
-- **RFC 7231 Compliance:** Parses authority-form targets (`host:port`), including bracketed IPv6 literals.
-- **Half-Close Support:** Sockets send EOF when one direction finishes writing while continuing to receive data.
-- **Cooperative Cancellation:** Idle and send timeouts nudge cancel scopes during data transfer. When one direction fails or times out, the nursery cancels the other immediately.
-- **Backpressure:** A shared `trio.CapacityLimiter` bounds total concurrent connections.
-- **Graceful Shutdown:** SIGTERM or SIGINT stops accepting connections and allows existing tunnels to drain. A second signal forces cancellation.
-- **Destination Policy:** Exact host/port allowlists and denylists, with public-address checks on IP literals and DNS answers to guard against SSRF and DNS rebinding.
-- **Minimal Dependencies:** Built solely on `trio` and `h11`. No background worker threads, no cache backends, and no complex configuration frameworks.
-
-## Requirements
-
-Python 3.14 or newer.
-
-## Installation
+## Run
 
 ```bash
 uv sync
+uv run trio_http_proxy                  # 127.0.0.1:8080
+uv run trio_http_proxy --port 9090
+uv run python -m trio_http_proxy --host ::1 --port 8080
 ```
 
-Or install with pip:
+Both `trio_http_proxy` and `trio-http-proxy` invoke the same CLI. Only
+`--host` and `--port` are configurable from the command line; environment
+variables and `.env` files are not read.
 
-```bash
-pip install .
-```
-
-## Running the Proxy
-
-Start the proxy on the default port (8080):
-
-```bash
-uv run trio_http_proxy
-```
-
-Override the listen port:
-
-```bash
-TRIO_HTTP_PROXY_PORT=9090 uv run trio_http_proxy
-```
-
-Legacy environment variables also work:
-
-```bash
-PORT=9090 uv run trio_http_proxy
-```
-
-Private and loopback destinations are blocked by default. For trusted local use,
-set `TRIO_HTTP_PROXY_ALLOW_PRIVATE_NETWORKS=true`. See the
-[configuration reference](docs/configuration.md#destination-policy-and-ssrf-protection)
-for allowlist syntax, DNS checks, and security limits. Restrict access to trusted
-clients; this proxy does not provide authentication.
-
-## Testing the Proxy
-
-Make an HTTPS request through the proxy:
+In another terminal:
 
 ```bash
 curl -x http://127.0.0.1:8080 https://canhazip.com
 ```
 
-Run a one-liner smoke test in a single shell session:
+**Keep it local or behind trusted network controls.** There is no authentication
+or destination filtering. Clients can connect to any address the proxy can
+reach, including private networks. Binding to `0.0.0.0` or `::` exposes that
+access to other machines.
 
-```bash
-uv run trio_http_proxy & sleep 1; curl -x http://127.0.0.1:8080 https://canhazip.com; kill %1
-```
+## What remains
 
-## Programmatic Usage
+- Incremental CONNECT parsing with authority-form validation, including IPv6.
+- A 16 KiB header limit and a 10-second request deadline.
+- A 10-second deadline covering DNS resolution and TCP connection.
+- Preservation of tunnel bytes sent alongside the CONNECT headers.
+- Bidirectional forwarding with half-closes, idle and send timeouts.
+- Stream cleanup on success, failure, timeout, and task cancellation.
 
-Embed the proxy into a Trio application:
+Trio handles DNS, connection racing, listening sockets, and task lifetimes.
+Ctrl-C cancels the server and its active tunnels; there is no drain period or
+SIGTERM handler.
+
+See [runtime options and limits](docs/configuration.md) for details.
+
+## Embedding
 
 ```python
+from functools import partial
+
 import trio
-from trio_http_proxy import ProxyConfig, start_server
+from trio_http_proxy import start_server
 
-
-async def main() -> None:
-    config = ProxyConfig(port=8080, maxconns=500)
-    await start_server(config)
-
-
-trio.run(main)
+trio.run(partial(start_server, 8080, host="127.0.0.1"))
 ```
 
-## Configuration
-
-Settings load from `ProxyConfig` fields or environment variables. Canonical prefixed variables take precedence over legacy aliases.
-
-| Setting | Canonical Variable | Legacy Variable | Default | Description |
-|---|---|---|---:|---|
-| `port` | `TRIO_HTTP_PROXY_PORT` | `PORT` | `8080` | Proxy TCP listen port. |
-| `bufmaxsz` | `TRIO_HTTP_PROXY_BUFMAXSZ` | `BUFMAXSZ` | `8192` | Chunk read buffer size in bytes (`io.DEFAULT_BUFFER_SIZE`). |
-| `maxreqsz` | `TRIO_HTTP_PROXY_MAXREQSZ` | `MAXREQSZ` | `16384` | Maximum CONNECT request header size in bytes. |
-| `connect_read_timeout` | `TRIO_HTTP_PROXY_CONNECT_READ_TIMEOUT` | `CONNECT_READ_TIMEOUT` | `10.0` | Timeout in seconds to read the client CONNECT request. |
-| `dest_connect_timeout` | `TRIO_HTTP_PROXY_DEST_CONNECT_TIMEOUT` | `DEST_CONNECT_TIMEOUT` | `10.0` | Total timeout in seconds for DNS and destination connection attempts. |
-| `pipe_idle_timeout` | `TRIO_HTTP_PROXY_PIPE_IDLE_TIMEOUT` | `PIPE_IDLE_TIMEOUT` | `300.0` | Inactivity timeout in seconds closing idle tunnels. |
-| `pipe_send_timeout` | `TRIO_HTTP_PROXY_PIPE_SEND_TIMEOUT` | `PIPE_SEND_TIMEOUT` | `30.0` | Timeout in seconds closing tunnels blocked on socket writes. |
-| `shutdown_timeout` | `TRIO_HTTP_PROXY_SHUTDOWN_TIMEOUT` | `PROXY_SHUTDOWN_TIMEOUT`, `SHUTDOWN_TIMEOUT` | `15.0` | Grace period in seconds for tunnels to drain after SIGTERM/SIGINT. |
-| `allow_private_networks` | `TRIO_HTTP_PROXY_ALLOW_PRIVATE_NETWORKS` | `PROXY_ALLOW_PRIVATE_NETWORKS` | `false` | Permit non-public destinations; allowlists and denylists still apply. |
-| `allowed_targets` | `TRIO_HTTP_PROXY_ALLOWED_TARGETS` | `PROXY_ALLOWED_TARGETS` | empty | Comma-separated exact hosts or `host:port` entries to allow. |
-| `denied_targets` | `TRIO_HTTP_PROXY_DENIED_TARGETS` | `PROXY_DENIED_TARGETS` | empty | Comma-separated exact hosts or `host:port` entries to deny. |
-| `maxconns` | `TRIO_HTTP_PROXY_MAXCONNS` | `MAXCONNS` | `1000` | Maximum concurrent client connections admitted. |
-| `log_level` | `TRIO_HTTP_PROXY_LOG_LEVEL` | `LOG_LEVEL` | `INFO` | Minimum logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
-
-See [docs/configuration.md](docs/configuration.md) for full details.
+Use `await nursery.start(partial(start_server, 0))` to listen on an OS-assigned
+port and receive the listener list. Cancelling the owning nursery closes the
+server and its connections.
 
 ## Development
 
-Run tests and code checks:
-
 ```bash
-pytest                 # run test suite
-ruff check             # lint
-ruff format --check    # check formatting
-pyright                # typecheck
+ruff check
+ruff format --check
+uv run --locked pyright
+uv run --locked pytest
 ```
 
-## License
-
-See [LICENSE](LICENSE) for details.
+Tests cover protocol properties, memory-stream invariants, handshake failures,
+timeouts, cancellation, and live loopback TCP tunnels.

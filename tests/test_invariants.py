@@ -24,7 +24,6 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy.config import ProxyConfig
 from trio_http_proxy.proxy import http_proxy
 from trio_http_proxy.streaming import pipe, pipe_with_timeout
 
@@ -219,7 +218,6 @@ async def test_full_duplex_half_close_client_eof_dest_continues() -> None:
             partial(
                 http_proxy,
                 client_proxy,
-                config=ProxyConfig(),
                 _connect=fake_connect,
             )
         )
@@ -266,7 +264,6 @@ async def test_full_duplex_half_close_dest_eof_client_continues() -> None:
             partial(
                 http_proxy,
                 client_proxy,
-                config=ProxyConfig(),
                 _connect=fake_connect,
             )
         )
@@ -459,14 +456,13 @@ async def test_sibling_cancelled_when_client_fails() -> None:
     async def fake_connect(host: str, port: int) -> trio.abc.Stream:
         return dest_proxy
 
-    cfg = ProxyConfig(pipe_idle_timeout=0.1, pipe_send_timeout=0.1)
-
     async with trio.open_nursery() as nursery:
         nursery.start_soon(
             partial(
                 http_proxy,
                 client_proxy,
-                config=cfg,
+                idle_timeout=0.1,
+                send_timeout=0.1,
                 _connect=fake_connect,
             )
         )
@@ -497,14 +493,13 @@ async def test_sibling_cancelled_when_dest_fails() -> None:
     async def fake_connect(host: str, port: int) -> trio.abc.Stream:
         return dest_proxy
 
-    cfg = ProxyConfig(pipe_idle_timeout=0.1, pipe_send_timeout=0.1)
-
     async with trio.open_nursery() as nursery:
         nursery.start_soon(
             partial(
                 http_proxy,
                 client_proxy,
-                config=cfg,
+                idle_timeout=0.1,
+                send_timeout=0.1,
                 _connect=fake_connect,
             )
         )
@@ -533,14 +528,13 @@ async def test_sibling_cancelled_on_idle_timeout() -> None:
     async def fake_connect(host: str, port: int) -> trio.abc.Stream:
         return dest_proxy
 
-    cfg = ProxyConfig(pipe_idle_timeout=0.05, pipe_send_timeout=1.0)
-
     async with trio.open_nursery() as nursery:
         nursery.start_soon(
             partial(
                 http_proxy,
                 client_proxy,
-                config=cfg,
+                idle_timeout=0.05,
+                send_timeout=1.0,
                 _connect=fake_connect,
             )
         )
@@ -594,14 +588,13 @@ async def test_sibling_cancelled_on_stalled_send_timeout() -> None:
     async def fake_connect(host: str, port: int) -> trio.abc.Stream:
         return stalled_dest
 
-    cfg = ProxyConfig(pipe_idle_timeout=10.0, pipe_send_timeout=0.05)
-
     async with trio.open_nursery() as nursery:
         nursery.start_soon(
             partial(
                 http_proxy,
                 client_proxy,
-                config=cfg,
+                idle_timeout=10.0,
+                send_timeout=0.05,
                 _connect=fake_connect,
             )
         )
@@ -629,12 +622,12 @@ async def test_both_streams_cleanly_closed_under_server_lifecycle() -> None:
     async def fake_connect(host: str, port: int) -> trio.abc.Stream:
         return dest_proxy
 
-    cfg = ProxyConfig(pipe_idle_timeout=0.05, pipe_send_timeout=1.0)
-
     # Mimic serve_tcp pattern: async with client_stream: await handler(client_stream)
     async def simulated_server_accept() -> None:
         async with client_proxy:
-            await http_proxy(client_proxy, config=cfg, _connect=fake_connect)
+            await http_proxy(
+                client_proxy, idle_timeout=0.05, send_timeout=1.0, _connect=fake_connect
+            )
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(simulated_server_accept)
