@@ -45,6 +45,32 @@ def _lookup_env_str(
     return default
 
 
+def _lookup_env_bool(
+    names: tuple[str, ...],
+    default: bool,
+    env: Mapping[str, str],
+) -> bool:
+    for name in names:
+        val = env.get(name)
+        if val is not None and val != "":
+            return val.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def _lookup_env_tuple(
+    names: tuple[str, ...],
+    default: tuple[str, ...],
+    env: Mapping[str, str],
+) -> tuple[str, ...]:
+    for name in names:
+        val = env.get(name)
+        if val is not None and val != "":
+            return tuple(
+                item.strip().lower() for item in val.split(",") if item.strip()
+            )
+    return default
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     """Immutable runtime configuration for the Trio HTTP proxy."""
@@ -58,6 +84,10 @@ class ProxyConfig:
     pipe_send_timeout: float = 30.0
     maxconns: int = 1000
     log_level: str = "INFO"
+    shutdown_timeout: float = 15.0
+    allow_private_networks: bool = False
+    allowed_targets: tuple[str, ...] = ()
+    denied_targets: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Self:
@@ -109,4 +139,31 @@ class ProxyConfig:
                 "INFO",
                 mapping,
             ).upper(),
+            allow_private_networks=_lookup_env_bool(
+                (
+                    "TRIO_HTTP_PROXY_ALLOW_PRIVATE_NETWORKS",
+                    "PROXY_ALLOW_PRIVATE_NETWORKS",
+                ),
+                False,
+                mapping,
+            ),
+            allowed_targets=_lookup_env_tuple(
+                ("TRIO_HTTP_PROXY_ALLOWED_TARGETS", "PROXY_ALLOWED_TARGETS"),
+                (),
+                mapping,
+            ),
+            denied_targets=_lookup_env_tuple(
+                ("TRIO_HTTP_PROXY_DENIED_TARGETS", "PROXY_DENIED_TARGETS"),
+                (),
+                mapping,
+            ),
+            shutdown_timeout=_lookup_env_float(
+                (
+                    "TRIO_HTTP_PROXY_SHUTDOWN_TIMEOUT",
+                    "PROXY_SHUTDOWN_TIMEOUT",
+                    "SHUTDOWN_TIMEOUT",
+                ),
+                15.0,
+                mapping,
+            ),
         )

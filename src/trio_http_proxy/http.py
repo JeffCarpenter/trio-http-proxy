@@ -13,6 +13,12 @@ HTTP_400_BAD_REQUEST: bytes = (
 )
 http_400_bad_request: bytes = HTTP_400_BAD_REQUEST
 
+RESP_403_FORBIDDEN: bytes = (
+    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+)
+HTTP_403_FORBIDDEN: bytes = RESP_403_FORBIDDEN
+http_403_forbidden: bytes = RESP_403_FORBIDDEN
+
 HTTP_408_REQUEST_TIMEOUT: bytes = (
     b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
 )
@@ -36,13 +42,16 @@ http_504_gateway_timeout: bytes = HTTP_504_GATEWAY_TIMEOUT
 __all__ = [
     "HTTP_200_CONNECTION_ESTABLISHED",
     "HTTP_400_BAD_REQUEST",
+    "HTTP_403_FORBIDDEN",
     "HTTP_408_REQUEST_TIMEOUT",
     "HTTP_414_URI_TOO_LONG",
     "HTTP_502_BAD_GATEWAY",
     "HTTP_504_GATEWAY_TIMEOUT",
     "HTTP_METHOD_CONNECT",
+    "RESP_403_FORBIDDEN",
     "http_200_connection_established",
     "http_400_bad_request",
+    "http_403_forbidden",
     "http_408_request_timeout",
     "http_414_uri_too_long",
     "http_502_bad_gateway",

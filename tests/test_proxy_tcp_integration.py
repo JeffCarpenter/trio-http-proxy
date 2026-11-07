@@ -30,7 +30,11 @@ async def test_live_tcp_round_trip(
     dest_server_port: int,
 ) -> None:
     """Verify live TCP CONNECT round-trip through proxy to mock origin."""
-    cfg = ProxyConfig(connect_read_timeout=5.0, dest_connect_timeout=5.0)
+    cfg = ProxyConfig(
+        connect_read_timeout=5.0,
+        dest_connect_timeout=5.0,
+        allow_private_networks=True,
+    )
     listeners = await nursery.start(
         partial(trio.serve_tcp, partial(http_proxy, config=cfg), 0)
     )
@@ -63,7 +67,7 @@ async def test_concurrency_limiting_backpressure(
 ) -> None:
     """With maxconns=1, verify second connection is queued by CapacityLimiter until first completes."""
     reset_conn_limiter()
-    cfg = ProxyConfig(maxconns=1)
+    cfg = ProxyConfig(maxconns=1, allow_private_networks=True)
     limiter = get_conn_limiter(cfg.maxconns)
 
     listeners = await nursery.start(
@@ -133,7 +137,7 @@ async def test_live_tcp_destination_unreachable_returns_502(
 ) -> None:
     """Connecting to an unreachable origin port returns 502 Bad Gateway."""
     unused_port = _get_unused_port()
-    cfg = ProxyConfig(dest_connect_timeout=2.0)
+    cfg = ProxyConfig(dest_connect_timeout=2.0, allow_private_networks=True)
     listeners = await nursery.start(
         partial(trio.serve_tcp, partial(http_proxy, config=cfg), 0)
     )

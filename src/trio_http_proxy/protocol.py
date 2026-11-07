@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from urllib.parse import urlsplit
 
@@ -123,7 +124,72 @@ async def process_as_connect_request(
     return desthost, destport, trailing_data
 
 
+def _translated_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip in ipaddress.IPv6Network("64:ff9b::/96"):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
+def _normalize_host(host: str) -> str:
+    host = host.strip().strip("[]").rstrip(".").lower()
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if isinstance(ip, ipaddress.IPv6Address) and (translated := _translated_ipv4(ip)):
+        return str(translated)
+    # A zone selects an interface, not a different destination address.
+    return str(ip).split("%", 1)[0]
+
+
+def _matches_target(host: str, port: int, target: str) -> bool:
+    target = target.strip()
+    if _normalize_host(host) == _normalize_host(target):
+        return True
+    try:
+        target_host, target_port = parse_connect_target(target.encode("ascii"))
+    except ProxyProtocolError, UnicodeError:
+        return False
+    return port == target_port and _normalize_host(host) == _normalize_host(target_host)
+
+
+def is_address_allowed(address: str, port: int, config: ProxyConfig) -> bool:
+    """Check a resolved address, without reapplying the hostname allowlist."""
+    if any(_matches_target(address, port, target) for target in config.denied_targets):
+        return False
+    ip = ipaddress.ip_address(address)
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _translated_ipv4(ip) or ip.sixtofour
+        if embedded is not None:
+            return is_address_allowed(str(embedded), port, config)
+        if ip.teredo is not None and not all(
+            is_address_allowed(str(part), port, config) for part in ip.teredo
+        ):
+            return False
+    return config.allow_private_networks or (ip.is_global and not ip.is_multicast)
+
+
+def is_target_allowed(host: str, port: int, config: ProxyConfig) -> bool:
+    """Evaluate the requested target; the connector also checks DNS answers."""
+    if any(_matches_target(host, port, target) for target in config.denied_targets):
+        return False
+    if config.allowed_targets and not any(
+        _matches_target(host, port, target) for target in config.allowed_targets
+    ):
+        return False
+    normalized = _normalize_host(host)
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        is_localhost = normalized == "localhost" or normalized.endswith(".localhost")
+        return config.allow_private_networks or not is_localhost
+    return is_address_allowed(normalized, port, config)
+
+
 __all__ = [
+    "is_target_allowed",
     "parse_connect_target",
     "process_as_connect_request",
 ]

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import itertools
 import logging
+import signal
 from collections.abc import Awaitable, Callable
+from contextlib import ExitStack
 from functools import cache, partial
 from typing import Any
 
@@ -14,7 +16,7 @@ import trio
 from . import http
 from .config import ProxyConfig
 from .errors import ProxyProtocolError, RequestTooLargeError
-from .protocol import process_as_connect_request
+from .protocol import is_address_allowed, is_target_allowed, process_as_connect_request
 from .streaming import pipe_with_timeout
 
 logger = logging.getLogger(__name__)
@@ -33,17 +35,77 @@ def reset_conn_limiter() -> None:
     get_conn_limiter.cache_clear()
 
 
+async def _open_target_stream(
+    host: str, port: int, *, config: ProxyConfig
+) -> trio.SocketStream:
+    results = await trio.socket.getaddrinfo(host, port, type=trio.socket.SOCK_STREAM)
+    addresses = tuple(
+        dict.fromkeys(
+            str(sockaddr[0])
+            + (f"%{sockaddr[3]}" if len(sockaddr) == 4 and sockaddr[3] else "")
+            for family, _, _, _, sockaddr in results
+            if family in (trio.socket.AF_INET, trio.socket.AF_INET6)
+        )
+    )
+    if not addresses:
+        raise OSError("No addresses found for target")
+    # Reject mixed public/private DNS answers and never reconnect by hostname.
+    if not all(is_address_allowed(address, port, config) for address in addresses):
+        raise ProxyProtocolError("Resolved target address denied by policy")
+    return await _connect_to_addresses(addresses, port)
+
+
+async def _connect_to_addresses(
+    addresses: tuple[str, ...], port: int
+) -> trio.SocketStream:
+    """Race vetted addresses with Trio's default 250 ms connection stagger."""
+    winner: trio.SocketStream | None = None
+    errors: list[OSError] = []
+
+    async def attempt(address: str, failed: trio.Event) -> None:
+        nonlocal winner
+        try:
+            stream = await trio.open_tcp_stream(address, port)
+        except OSError as exc:
+            errors.append(exc)
+            failed.set()
+            return
+        if winner is None:
+            winner = stream
+            nursery.cancel_scope.cancel()
+        else:
+            await trio.aclose_forcefully(stream)
+
+    try:
+        async with trio.open_nursery() as nursery:
+            for address in addresses:
+                failed = trio.Event()
+                nursery.start_soon(attempt, address, failed)
+                with trio.move_on_after(0.25):
+                    await failed.wait()
+    except BaseException:
+        if winner is not None:
+            await trio.aclose_forcefully(winner)
+        raise
+    if winner is not None:
+        return winner
+    raise OSError("All target connection attempts failed") from ExceptionGroup(
+        "Target connection failures", errors
+    )
+
+
 async def tunnel(
     client_stream: trio.abc.Stream,
     *,
     config: ProxyConfig | None = None,
-    _connect: Callable[[str, int], Awaitable[trio.abc.Stream]] = trio.open_tcp_stream,
+    _connect: Callable[[str, int], Awaitable[trio.abc.Stream]] | None = None,
 ) -> trio.abc.Stream:
     """Perform the HTTP CONNECT handshake and establish the upstream tunnel.
 
     Reads the CONNECT request, opens a TCP connection to the destination,
     and returns the upstream stream. Replies to the client with appropriate
-    HTTP status codes on success or failure.
+    HTTP status codes on success or failure. An explicitly injected connector
+    is trusted to enforce DNS/address safety itself.
     """
     cfg = config or ProxyConfig()
 
@@ -68,10 +130,29 @@ async def tunnel(
             await client_stream.send_all(http.HTTP_408_REQUEST_TIMEOUT)
         raise
 
+    if not is_target_allowed(desthost, destport, cfg):
+        logger.warning(
+            "Target '%s:%d' forbidden by policy, sending 403 to client",
+            desthost,
+            destport,
+        )
+        with trio.move_on_after(5.0):
+            await client_stream.send_all(http.RESP_403_FORBIDDEN)
+        raise ProxyProtocolError(f"Target '{desthost}:{destport}' forbidden by policy")
+
     logger.info("Connecting to %s:%d...", desthost, destport)
     try:
         with trio.fail_after(cfg.dest_connect_timeout):
-            dest_stream = await _connect(desthost, destport)
+            dest_stream = (
+                await _connect(desthost, destport)
+                if _connect is not None
+                else await _open_target_stream(desthost, destport, config=cfg)
+            )
+    except ProxyProtocolError:
+        logger.warning("Resolved target denied by policy, sending 403 to client")
+        with trio.move_on_after(5.0):
+            await client_stream.send_all(http.RESP_403_FORBIDDEN)
+        raise
     except OSError:
         logger.warning(
             "Could not connect to %s:%d, sending 502 to client", desthost, destport
@@ -87,11 +168,15 @@ async def tunnel(
             await client_stream.send_all(http.HTTP_504_GATEWAY_TIMEOUT)
         raise
 
-    if trailing_data:
-        await dest_stream.send_all(trailing_data)
-
-    logger.info("Connected to %s:%d, sending 200 to client...", desthost, destport)
-    await client_stream.send_all(http.HTTP_200_CONNECTION_ESTABLISHED)
+    try:
+        if trailing_data:
+            await dest_stream.send_all(trailing_data)
+        logger.info("Connected to %s:%d, sending 200 to client...", desthost, destport)
+        await client_stream.send_all(http.HTTP_200_CONNECTION_ESTABLISHED)
+    except BaseException:
+        # Ownership passes to the caller only after the handshake succeeds.
+        await trio.aclose_forcefully(dest_stream)
+        raise
     return dest_stream
 
 
@@ -100,7 +185,7 @@ async def http_proxy(
     *,
     config: ProxyConfig | None = None,
     limiter: trio.CapacityLimiter | None = None,
-    _connect: Callable[[str, int], Awaitable[trio.abc.Stream]] = trio.open_tcp_stream,
+    _connect: Callable[[str, int], Awaitable[trio.abc.Stream]] | None = None,
     _nextid: Callable[[], int] = _conn_ids.__next__,
 ) -> None:
     """Handle a single inbound client connection."""
@@ -122,6 +207,8 @@ async def http_proxy(
             ProxyProtocolError,
             h11.ProtocolError,
             trio.TooSlowError,
+            trio.BrokenResourceError,
+            trio.ClosedResourceError,
             OSError,
         ):
             return
@@ -158,18 +245,138 @@ async def http_proxy(
     logger.debug("[conn%d] Connection closed", conn_id)
 
 
+async def _serve_with_signals(
+    handler: Callable[..., Awaitable[Any]],
+    listeners: list[trio.SocketListener],
+    cfg: ProxyConfig,
+    *,
+    task_status: trio.TaskStatus[list[trio.SocketListener]],
+    signal_aiter: Any,
+) -> None:
+    stop_accepting = trio.Event()
+    drained = trio.Event()
+    listener_scope = trio.CancelScope()
+
+    async def conn_runner(
+        *,
+        task_status: trio.TaskStatus[trio.Nursery] = trio.TASK_STATUS_IGNORED,
+    ) -> None:
+        try:
+            async with trio.open_nursery() as conn_nursery:
+                task_status.started(conn_nursery)
+                await stop_accepting.wait()
+        finally:
+            drained.set()
+
+    async with trio.open_nursery() as supervisor:
+        conn_nursery = await supervisor.start(conn_runner)
+
+        async def serve_listeners_task() -> None:
+            with listener_scope:
+                await trio.serve_listeners(
+                    handler,
+                    listeners,
+                    handler_nursery=conn_nursery,
+                    task_status=task_status,
+                )
+
+        supervisor.start_soon(serve_listeners_task)
+
+        # Wait for first signal
+        async for sig in signal_aiter:
+            logger.info(
+                "Received signal %s, initiating graceful shutdown (timeout=%.1fs)...",
+                sig,
+                cfg.shutdown_timeout,
+            )
+            listener_scope.cancel()
+            stop_accepting.set()
+            break
+
+        if not stop_accepting.is_set():
+            listener_scope.cancel()
+            stop_accepting.set()
+
+        # Wait for conn_nursery to drain up to shutdown_timeout seconds
+        with trio.move_on_after(cfg.shutdown_timeout) as drain_scope:
+            async with trio.open_nursery() as drain_nursery:
+
+                async def wait_second_signal() -> None:
+                    try:
+                        sig2 = await anext(signal_aiter)
+                        logger.warning(
+                            "Received second signal %s, forcing immediate shutdown...",
+                            sig2,
+                        )
+                        conn_nursery.cancel_scope.cancel()
+                        drain_nursery.cancel_scope.cancel()
+                    except StopAsyncIteration, trio.Cancelled:
+                        pass
+
+                drain_nursery.start_soon(wait_second_signal)
+                await drained.wait()
+                drain_nursery.cancel_scope.cancel()
+
+        if drain_scope.cancelled_caught:
+            logger.warning(
+                "Drain timeout (%.1fs) expired before connections drained; forcing shutdown...",
+                cfg.shutdown_timeout,
+            )
+            conn_nursery.cancel_scope.cancel()
+            # The supervisor nursery joins handlers without shielding parent cancellation.
+
+
 async def start_server(
     config: ProxyConfig | None = None,
+    enable_signals: bool = True,
     *,
     task_status: trio.TaskStatus[list[trio.SocketListener]] = trio.TASK_STATUS_IGNORED,
-    _serve: Any = trio.serve_tcp,
+    _serve: Any = None,
 ) -> None:
     """Run the HTTP proxy TCP server."""
     cfg = config or ProxyConfig.from_env()
     limiter = get_conn_limiter(cfg.maxconns)
     handler = partial(http_proxy, config=cfg, limiter=limiter)
     logger.info("Starting proxy on port %d...", cfg.port)
-    await _serve(handler, cfg.port, task_status=task_status)
+
+    if _serve is not None:
+        await _serve(handler, cfg.port, task_status=task_status)
+        return
+
+    listeners = await trio.open_tcp_listeners(cfg.port)
+    try:
+        if enable_signals:
+            with ExitStack() as signal_stack:
+                try:
+                    signal_aiter = signal_stack.enter_context(
+                        trio.open_signal_receiver(signal.SIGTERM, signal.SIGINT)
+                    )
+                except (NotImplementedError, ValueError, RuntimeError, OSError) as exc:
+                    logger.info(
+                        "Signal receiver unavailable (%s), running without signal handling",
+                        exc,
+                    )
+                else:
+                    await _serve_with_signals(
+                        handler,
+                        listeners,
+                        cfg,
+                        task_status=task_status,
+                        signal_aiter=signal_aiter,
+                    )
+                    return
+
+        async with trio.open_nursery() as conn_nursery:
+            await trio.serve_listeners(
+                handler,
+                listeners,
+                handler_nursery=conn_nursery,
+                task_status=task_status,
+            )
+    finally:
+        for listener in listeners:
+            with trio.CancelScope(shield=True):
+                await listener.aclose()
 
 
 def main() -> None:
