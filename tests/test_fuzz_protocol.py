@@ -1,7 +1,11 @@
 """Bounded CONNECT fuzz tests for authority parsing, chunking, and size limits.
 
-Chunking must preserve the destination and all tunnel bytes, including bytes
-left unread in the stream; the returned initial bytes alone may vary by split.
+The sans-io ConnectParser is driven synchronously through drive(), with no event
+loop. Chunking must preserve the destination and all tunnel bytes, including
+chunks the parser never saw; the returned trailing bytes alone may vary by
+split. A single Trio test runs process_as_connect_request over a
+ChunkedReceiveStream to cover the driver layer and bytes left unread in the
+stream.
 """
 
 from __future__ import annotations
@@ -10,40 +14,51 @@ from typing import Final
 
 import pytest
 import trio
+import trio.testing as tt
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from trio_http_proxy.errors import ProxyProtocolError, RequestTooLargeError
-from trio_http_proxy.protocol import parse_connect_target, process_as_connect_request
+from trio_http_proxy.protocol import (
+    ConnectParser,
+    ConnectRequest,
+    parse_connect_target,
+)
+from trio_http_proxy.proxy import process_as_connect_request
 
 # ---------------------------------------------------------------------------
-# Test Stream Helpers
+# Sans-io Drive Helpers
 # ---------------------------------------------------------------------------
 
 
-class ChunkedReceiveStream(trio.abc.ReceiveStream):
-    """An in-memory Trio ReceiveStream that yields predetermined byte chunks."""
+def drive(
+    parser: ConnectParser, chunks: list[bytes]
+) -> tuple[ConnectRequest | None, list[bytes]]:
+    """Feed chunks to the parser one at a time, as the Trio driver does.
 
-    def __init__(self, chunks: list[bytes]) -> None:
-        self._chunks: list[bytes] = list(chunks)
-        self._closed: bool = False
+    Polls next_request() first and after every chunk, and stops at the first
+    request. Signals EOF and polls once more only when the chunks run out
+    first. Returns the request and the chunks never fed, which is what a real
+    stream would still hold unread. Parser errors propagate.
+    """
+    unread = list(chunks)
+    request = parser.next_request()
+    while request is None and unread:
+        parser.receive_data(unread.pop(0))
+        request = parser.next_request()
+    if request is None:
+        parser.receive_eof()
+        request = parser.next_request()
+    return request, unread
 
-    async def receive_some(self, max_bytes: int | None = None) -> bytes:
-        await trio.lowlevel.checkpoint()
-        if self._closed:
-            raise trio.ClosedResourceError("Stream is closed")
-        if not self._chunks:
-            return b""
-        chunk = self._chunks.pop(0)
-        limit = max_bytes if max_bytes is not None else len(chunk)
-        if len(chunk) <= limit:
-            return chunk
-        # If the chunk is larger than requested, return limit and retain remainder
-        self._chunks.insert(0, chunk[limit:])
-        return chunk[:limit]
 
-    async def aclose(self) -> None:
-        self._closed = True
+def drive_to_request(
+    parser: ConnectParser, chunks: list[bytes]
+) -> tuple[ConnectRequest, bytes]:
+    """Drive to a request; return it with all tunnel bytes that followed its headers."""
+    request, unread = drive(parser, chunks)
+    assert request is not None, "parser never produced a request"
+    return request, request.trailing_data + b"".join(unread)
 
 
 def partition_bytes(data: bytes, chunk_sizes: list[int]) -> list[bytes]:
@@ -62,17 +77,6 @@ def partition_bytes(data: bytes, chunk_sizes: list[int]) -> list[bytes]:
     if idx < len(data):
         chunks.append(data[idx:])
     return [c for c in chunks if c]
-
-
-async def _read_all_stream(stream: trio.abc.ReceiveStream) -> bytes:
-    """Drain all remaining bytes from a ReceiveStream until EOF."""
-    collected: list[bytes] = []
-    while True:
-        data = await stream.receive_some()
-        if not data:
-            break
-        collected.append(bytes(data))
-    return b"".join(collected)
 
 
 # ---------------------------------------------------------------------------
@@ -286,19 +290,21 @@ def _expected_parsed_host(target_host: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Invariant 2: process_as_connect_request chunk-splitting invariance
+# Invariant 2: ConnectParser chunk-splitting invariance
 # ---------------------------------------------------------------------------
 
-
-@settings(max_examples=100, derandomize=True, deadline=None)
-@given(
+_chunk_splitting_cases = given(
     target_host=_valid_target_host_strategy,
     port=_valid_port_strategy,
     headers=_headers_strategy,
     body=_body_strategy,
     chunk_sizes=_chunk_sizes_strategy,
 )
-def test_process_as_connect_request_chunk_splitting(
+
+
+@settings(max_examples=100, derandomize=True, deadline=None)
+@_chunk_splitting_cases
+def test_connect_parser_chunk_splitting(
     target_host: str,
     port: int,
     headers: list[tuple[str, str]],
@@ -311,37 +317,24 @@ def test_process_as_connect_request_chunk_splitting(
 
     expected_host = _expected_parsed_host(target_host)
 
-    async def run_scenario() -> None:
-        # Baseline: raw request sent in a single chunk via ChunkedReceiveStream
-        rx_base = ChunkedReceiveStream([raw_request])
-        base_host, base_port, base_initial_body = await process_as_connect_request(
-            rx_base
-        )
-        base_trailing_remainder = await _read_all_stream(rx_base)
-        base_total_body = base_initial_body + base_trailing_remainder
+    # Baseline: raw request delivered in a single chunk
+    base, base_tunnel = drive_to_request(ConnectParser(), [raw_request])
 
-        # Chunked: raw request partitioned into arbitrary chunk sizes
-        rx_chunked = ChunkedReceiveStream(chunks)
-        chunk_host, chunk_port, chunk_initial_body = await process_as_connect_request(
-            rx_chunked
-        )
-        chunk_trailing_remainder = await _read_all_stream(rx_chunked)
-        chunk_total_body = chunk_initial_body + chunk_trailing_remainder
+    # Chunked: raw request partitioned into arbitrary chunk sizes
+    chunked, chunked_tunnel = drive_to_request(ConnectParser(), chunks)
 
-        # Invariant assertions:
-        # 1. Output must match baseline exactly
-        assert (chunk_host, chunk_port) == (base_host, base_port)
-        assert chunk_total_body == base_total_body
+    # Invariant assertions:
+    # 1. Output must match baseline exactly
+    assert (chunked.host, chunked.port) == (base.host, base.port)
+    assert chunked_tunnel == base_tunnel
 
-        # 2. Target must parse host and port accurately
-        assert (chunk_host, chunk_port) == (expected_host, port)
-        assert chunk_total_body == body
-
-    trio.run(run_scenario)
+    # 2. Target must parse host and port accurately
+    assert (chunked.host, chunked.port) == (expected_host, port)
+    assert chunked_tunnel == body
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 7])
-def test_process_as_connect_request_incremental_stream(chunk_size: int) -> None:
+def test_connect_parser_incremental_feed(chunk_size: int) -> None:
     """Exercise bytewise delivery, split final CRLF, and binary tunnel data."""
     body = b"\x00\xff\r\nCONNECT not-a-request"
     raw_request = _build_connect_request_bytes("[::1]", 443, [], body)
@@ -349,17 +342,16 @@ def test_process_as_connect_request_incremental_stream(chunk_size: int) -> None:
         raw_request[i : i + chunk_size] for i in range(0, len(raw_request), chunk_size)
     ]
 
-    async def run_scenario() -> None:
-        stream = ChunkedReceiveStream(chunks)
-        host, port, trailing = await process_as_connect_request(stream)
-        assert (host, port) == ("::1", 443)
-        assert trailing + await _read_all_stream(stream) == body
+    request, tunnel = drive_to_request(ConnectParser(), chunks)
 
-    trio.run(run_scenario)
+    assert (request.host, request.port) == ("::1", 443)
+    assert tunnel == body
+    # The request is ready in the chunk holding the final CRLF, not a later one.
+    assert len(request.trailing_data) < chunk_size
 
 
 # ---------------------------------------------------------------------------
-# Invariant 3: process_as_connect_request oversize invariant
+# Invariant 3: ConnectParser oversize invariant
 # ---------------------------------------------------------------------------
 
 _max_req_len_strategy = st.integers(min_value=40, max_value=250)
@@ -375,15 +367,16 @@ _overflow_kind_strategy = st.sampled_from(["target", "header_value", "many_heade
     chunk_size=_oversize_chunk_size_strategy,
     kind=_overflow_kind_strategy,
 )
-def test_process_as_connect_request_oversize_invariant(
+def test_connect_parser_oversize_invariant(
     max_request_len: int,
     excess: int,
     chunk_size: int,
     kind: str,
 ) -> None:
-    """process_as_connect_request must consistently raise RequestTooLargeError when limits are exceeded.
+    """ConnectParser must consistently raise RequestTooLargeError when limits are exceeded.
 
-    Must never crash, hang, or raise unhandled exceptions.
+    Must never crash or raise unhandled exceptions. It cannot hang: drive() only
+    loops over the finite chunk list.
     """
     if kind == "target":
         overflow_host = "a" * (max_request_len + excess)
@@ -411,13 +404,8 @@ def test_process_as_connect_request_oversize_invariant(
 
     chunks = [payload[i : i + chunk_size] for i in range(0, len(payload), chunk_size)]
 
-    async def run_scenario() -> None:
-        rx = ChunkedReceiveStream(chunks)
-
-        with trio.fail_after(2.0), pytest.raises(RequestTooLargeError):
-            await process_as_connect_request(rx, maxreqsz=max_request_len)
-
-    trio.run(run_scenario)
+    with pytest.raises(RequestTooLargeError):
+        drive(ConnectParser(maxreqsz=max_request_len), chunks)
 
 
 @settings(max_examples=100, derandomize=True, deadline=None)
@@ -427,7 +415,7 @@ def test_process_as_connect_request_oversize_invariant(
     chunk_size=st.sampled_from([1, 2, 7, 8192]),
     body=_body_strategy,
 )
-def test_process_as_connect_request_boundary_limits(
+def test_connect_parser_boundary_limits(
     target_host: str,
     port: int,
     chunk_size: int,
@@ -440,33 +428,116 @@ def test_process_as_connect_request_boundary_limits(
     chunks = [payload[i : i + chunk_size] for i in range(0, len(payload), chunk_size)]
     expected_host = _expected_parsed_host(target_host)
 
-    async def run_boundary_scenario() -> None:
-        # At exact boundary: must succeed
-        rx_exact = ChunkedReceiveStream(chunks)
-        host, parsed_port, trailing = await process_as_connect_request(
-            rx_exact, maxreqsz=exact_len
-        )
-        assert (host, parsed_port) == (expected_host, port)
-        assert trailing + await _read_all_stream(rx_exact) == body
+    # At exact boundary: must succeed
+    request, tunnel = drive_to_request(ConnectParser(maxreqsz=exact_len), chunks)
+    assert (request.host, request.port) == (expected_host, port)
+    assert tunnel == body
 
-        # 1 byte under required length: must raise RequestTooLargeError
-        rx_too_small = ChunkedReceiveStream(chunks)
-        with pytest.raises(RequestTooLargeError):
-            await process_as_connect_request(rx_too_small, maxreqsz=exact_len - 1)
-
-    trio.run(run_boundary_scenario)
+    # 1 byte under required length: must raise RequestTooLargeError
+    with pytest.raises(RequestTooLargeError):
+        drive(ConnectParser(maxreqsz=exact_len - 1), chunks)
 
 
 @pytest.mark.parametrize("missing_bytes", [1, 2, 3, 4])
-def test_process_as_connect_request_truncated_headers(missing_bytes: int) -> None:
+def test_connect_parser_truncated_headers(missing_bytes: int) -> None:
     """EOF during the terminating CRLF must not accept an incomplete request."""
     request = _build_connect_request_bytes("example.com", 443, [], b"")
+    chunks = [bytes([byte]) for byte in request[:-missing_bytes]]
+
+    with pytest.raises(ProxyProtocolError):
+        drive(ConnectParser(), chunks)
+
+
+# ---------------------------------------------------------------------------
+# Trio driver layer: the only tests that run an event loop
+# ---------------------------------------------------------------------------
+
+
+class ChunkedReceiveStream(trio.abc.ReceiveStream):
+    """An in-memory Trio ReceiveStream that yields predetermined byte chunks."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks: list[bytes] = list(chunks)
+        self._closed: bool = False
+
+    async def receive_some(self, max_bytes: int | None = None) -> bytes:
+        await trio.lowlevel.checkpoint()
+        if self._closed:
+            raise trio.ClosedResourceError("Stream is closed")
+        if not self._chunks:
+            return b""
+        chunk = self._chunks.pop(0)
+        limit = max_bytes if max_bytes is not None else len(chunk)
+        if len(chunk) <= limit:
+            return chunk
+        # If the chunk is larger than requested, return limit and retain remainder
+        self._chunks.insert(0, chunk[limit:])
+        return chunk[:limit]
+
+    async def aclose(self) -> None:
+        self._closed = True
+
+
+async def _read_all_stream(stream: trio.abc.ReceiveStream) -> bytes:
+    """Drain all remaining bytes from a ReceiveStream until EOF."""
+    collected: list[bytes] = []
+    while True:
+        data = await stream.receive_some()
+        if not data:
+            break
+        collected.append(bytes(data))
+    return b"".join(collected)
+
+
+@settings(max_examples=100, derandomize=True, deadline=None)
+@_chunk_splitting_cases
+def test_process_as_connect_request_chunk_splitting(
+    target_host: str,
+    port: int,
+    headers: list[tuple[str, str]],
+    body: bytes,
+    chunk_sizes: list[int],
+) -> None:
+    """The Trio driver matches the sync drive() and leaves later chunks unread.
+
+    Every chunk is smaller than the default receive size, so the driver feeds the
+    parser exactly the chunks drive() does and must stop reading at the same one.
+    """
+    raw_request = _build_connect_request_bytes(target_host, port, headers, body)
+    chunks = partition_bytes(raw_request, chunk_sizes)
+    expected_host = _expected_parsed_host(target_host)
+
+    expected, unread = drive(ConnectParser(), chunks)
+    assert expected is not None
 
     async def run_scenario() -> None:
-        stream = ChunkedReceiveStream(
-            [bytes([byte]) for byte in request[:-missing_bytes]]
-        )
-        with trio.fail_after(2.0), pytest.raises(ProxyProtocolError):
-            await process_as_connect_request(stream)
+        stream = ChunkedReceiveStream(chunks)
+        request = await process_as_connect_request(stream)
+        stream_remainder = await _read_all_stream(stream)
+
+        assert request == expected
+        assert (request.host, request.port) == (expected_host, port)
+        # Bytes the driver never read stay in the stream, in order.
+        assert stream_remainder == b"".join(unread)
+        assert request.trailing_data + stream_remainder == body
 
     trio.run(run_scenario)
+
+
+@pytest.mark.parametrize("missing_bytes", [None, 2, 40])
+async def test_process_as_connect_request_eof_is_protocol_error_without_waiting(
+    missing_bytes: int | None, autojump_clock: tt.MockClock
+) -> None:
+    """EOF before a complete request must fail at once, not run out read_timeout.
+
+    The driver turns an empty read into receive_eof(); without that call it
+    would wait for read_timeout and report TooSlowError (a 408) instead.
+    """
+    request = _build_connect_request_bytes("example.com", 443, [], b"")
+    sent = b"" if missing_bytes is None else request[:-missing_bytes]
+    stream = ChunkedReceiveStream([sent] if sent else [])
+
+    started = trio.current_time()
+    with pytest.raises(ProxyProtocolError):
+        await process_as_connect_request(stream, read_timeout=10.0)
+    assert trio.current_time() - started == 0

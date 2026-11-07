@@ -5,7 +5,8 @@ import trio
 import trio.testing
 
 from trio_http_proxy.errors import ProxyProtocolError, RequestTooLargeError
-from trio_http_proxy.protocol import parse_connect_target, process_as_connect_request
+from trio_http_proxy.protocol import parse_connect_target
+from trio_http_proxy.proxy import process_as_connect_request
 
 
 def test_parse_connect_target_valid():

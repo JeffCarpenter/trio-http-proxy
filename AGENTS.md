@@ -30,16 +30,25 @@ pytest. The local interpreter is `.venv/bin/python`.
 
 Source lives in `src/trio_http_proxy/`:
 
-- `protocol.py`: Pure authority-form target validation and bounded incremental
-  h11 request parsing. Returns host, port, and any early tunnel bytes.
-- `proxy.py`: `tunnel()` performs the handshake; `http_proxy()` owns the client
+- `protocol.py`: Sans-io core, no trio import. `ConnectParser` does bounded
+  incremental h11 parsing (feed bytes, pull a `ConnectRequest` of host, port
+  and early tunnel bytes); also target validation and `error_response()`.
+- `timeouts.py`: Sans-io `PipeTimeouts` idle/send deadline policy; the caller
+  supplies the clock. Keep `protocol.py`, `timeouts.py`, `errors.py` and
+  `http.py` free of trio imports. `tests/test_sansio.py` checks this with a
+  static import scan and a subprocess import with trio blocked; it does not
+  catch an import hidden inside a function body.
+- `proxy.py`: `process_as_connect_request()` drives `ConnectParser` over a trio
+  stream; `tunnel()` performs the handshake; `http_proxy()` owns the client
   and upstream streams and runs both pipes in a nursery. `start_server()`
   delegates to `trio.serve_tcp`; `main()` parses only host and port.
 - `streaming.py`: `pipe()` forwards bytes and propagates half-close;
-  `pipe_with_timeout()` updates idle/send deadlines on progress.
+  `pipe_with_timeout()` applies `PipeTimeouts` deadlines to a cancel scope.
 - `http.py`: Uppercase wire-format response constants.
 - `errors.py`: Proxy exception hierarchy.
-- `__init__.py`: Public function and exception exports.
+- `__init__.py`: Lazy (PEP 562) public exports; importing the package must not
+  load trio. A new public name needs the `TYPE_CHECKING` import, `__all__`
+  and `_EXPORTS` (or `_SUBMODULES`) entries.
 - `__main__.py`: Module entry point.
 
 Keep all tasks inside nurseries. Preserve early tunnel bytes, half-close

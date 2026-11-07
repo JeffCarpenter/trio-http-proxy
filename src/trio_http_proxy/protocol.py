@@ -1,17 +1,27 @@
-"""HTTP CONNECT protocol parsing and RFC 7231 §4.3.6 validation."""
+"""Sans-io HTTP CONNECT protocol: no sockets, clocks or event loop.
+
+Feed bytes in with ConnectParser.receive_data(), pull the parsed request out
+with next_request(). Callers own all I/O and timeouts.
+"""
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Buffer
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 import h11
-import trio
 
 from . import http
 from .errors import ProxyProtocolError, RequestTooLargeError
 
-logger = logging.getLogger(__name__)
+
+class ConnectRequest(NamedTuple):
+    """A validated CONNECT request plus any bytes that followed its headers."""
+
+    host: str
+    port: int
+    trailing_data: bytes
 
 
 def parse_connect_target(target: bytes) -> tuple[str, int]:
@@ -56,63 +66,79 @@ def parse_connect_target(target: bytes) -> tuple[str, int]:
     return desthost, destport
 
 
-async def process_as_connect_request(
-    stream: trio.abc.ReceiveStream,
-    *,
-    bufmaxsz: int = 8192,
-    maxreqsz: int = 16384,
-    read_timeout: float = 10.0,
-) -> tuple[str, int, bytes]:
-    """Read a stream expected to contain a valid HTTP CONNECT request.
+class ConnectParser:
+    """Incremental, size-bounded parser for one CONNECT request.
 
-    Parses incrementally via h11 without raw byte searching.
-    Returns (destination_host, destination_port, trailing_bytes).
-    Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout.
+    Call next_request() first and after every receive_data()/receive_eof().
+    It returns None while more bytes are needed, then the ConnectRequest.
+    Raises RequestTooLargeError once maxreqsz bytes arrive without a complete
+    header block, and ProxyProtocolError for any other malformed input.
     """
-    logger.debug("Reading CONNECT request...")
 
-    h11_conn = h11.Connection(
-        our_role=h11.SERVER,
-        max_incomplete_event_size=maxreqsz,
-    )
-    total_received = 0
+    def __init__(self, *, maxreqsz: int = 16384) -> None:
+        self._maxreqsz = maxreqsz
+        self._conn = h11.Connection(
+            our_role=h11.SERVER,
+            max_incomplete_event_size=maxreqsz,
+        )
+        self._received = 0
+        self._request: ConnectRequest | None = None
 
-    with trio.fail_after(read_timeout):
-        while True:
-            try:
-                event = h11_conn.next_event()
-            except h11.RemoteProtocolError as exc:
-                if exc.error_status_hint == 431:
-                    raise RequestTooLargeError(
-                        f"Request exceeded {maxreqsz} bytes"
-                    ) from exc
-                raise ProxyProtocolError(str(exc)) from exc
+    def receive_data(self, data: Buffer) -> None:
+        """Buffer bytes from the peer. Empty data is ignored; use receive_eof()."""
+        chunk = bytes(data)
+        if not chunk:
+            return
+        self._received += len(chunk)
+        self._conn.receive_data(chunk)
 
-            if event is h11.NEED_DATA:
-                if total_received >= maxreqsz:
-                    raise RequestTooLargeError(f"Request exceeded {maxreqsz} bytes")
-                chunk = await stream.receive_some(bufmaxsz)
-                if not chunk:
-                    h11_conn.receive_data(b"")
-                else:
-                    total_received += len(chunk)
-                    h11_conn.receive_data(bytes(chunk))
-                continue
-            break
+    def receive_eof(self) -> None:
+        """Record that the peer closed its sending side."""
+        self._conn.receive_data(b"")
 
-    if not isinstance(event, h11.Request):
-        raise ProxyProtocolError(f"Expected h11.Request, got {event!r}")
+    def next_request(self) -> ConnectRequest | None:
+        if self._request is not None:
+            return self._request
 
-    trailing_data, _ = h11_conn.trailing_data
-    header_len = total_received - len(trailing_data)
-    if header_len > maxreqsz:
-        raise RequestTooLargeError(f"Request exceeded {maxreqsz} bytes")
+        try:
+            event = self._conn.next_event()
+        except h11.RemoteProtocolError as exc:
+            if exc.error_status_hint == 431:
+                raise RequestTooLargeError(
+                    f"Request exceeded {self._maxreqsz} bytes"
+                ) from exc
+            raise ProxyProtocolError(str(exc)) from exc
 
-    if event.method != http.HTTP_METHOD_CONNECT:
-        raise ProxyProtocolError(f"Expected CONNECT method, got {event.method!r}")
+        if event is h11.NEED_DATA:
+            if self._received >= self._maxreqsz:
+                raise RequestTooLargeError(f"Request exceeded {self._maxreqsz} bytes")
+            return None
 
-    desthost, destport = parse_connect_target(event.target)
-    return desthost, destport, trailing_data
+        if not isinstance(event, h11.Request):
+            raise ProxyProtocolError(f"Expected h11.Request, got {event!r}")
+
+        trailing_data, _ = self._conn.trailing_data
+        if self._received - len(trailing_data) > self._maxreqsz:
+            raise RequestTooLargeError(f"Request exceeded {self._maxreqsz} bytes")
+
+        if event.method != http.HTTP_METHOD_CONNECT:
+            raise ProxyProtocolError(f"Expected CONNECT method, got {event.method!r}")
+
+        host, port = parse_connect_target(event.target)
+        self._request = ConnectRequest(host, port, trailing_data)
+        return self._request
 
 
-__all__ = ["parse_connect_target", "process_as_connect_request"]
+def error_response(exc: ProxyProtocolError) -> bytes:
+    """Return the HTTP error response for a failed CONNECT parse."""
+    if isinstance(exc, RequestTooLargeError):
+        return http.HTTP_414_URI_TOO_LONG
+    return http.HTTP_400_BAD_REQUEST
+
+
+__all__ = [
+    "ConnectParser",
+    "ConnectRequest",
+    "error_response",
+    "parse_connect_target",
+]

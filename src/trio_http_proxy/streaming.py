@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import trio
 
+from .timeouts import PipeTimeouts
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,20 +57,17 @@ async def pipe_with_timeout(
     Raises trio.TooSlowError if idle_timeout passes without data or
     send_timeout passes while waiting for to_stream to accept data.
     """
-    phase = "idle"
+    policy = PipeTimeouts(
+        idle_timeout=idle_timeout, send_timeout=send_timeout, now=trio.current_time()
+    )
 
     def on_receive() -> None:
-        nonlocal phase
-        phase = "send"
-        cancel_scope.deadline = trio.current_time() + send_timeout
+        cancel_scope.deadline = policy.received(trio.current_time())
 
     def on_send() -> None:
-        nonlocal phase
-        phase = "idle"
-        cancel_scope.deadline = trio.current_time() + idle_timeout
+        cancel_scope.deadline = policy.sent(trio.current_time())
 
-    with trio.CancelScope() as cancel_scope:
-        cancel_scope.deadline = trio.current_time() + idle_timeout
+    with trio.CancelScope(deadline=policy.deadline) as cancel_scope:
         await pipe(
             from_stream,
             to_stream,
@@ -77,10 +76,8 @@ async def pipe_with_timeout(
             on_send=on_send,
         )
     if cancel_scope.cancelled_caught:
-        timeout = send_timeout if phase == "send" else idle_timeout
-        reason = "send stalled" if phase == "send" else "idle"
-        logger.warning("Pipe %s for %ss, closing tunnel", reason, timeout)
-        raise trio.TooSlowError(f"Pipe {reason} for {timeout}s")
+        logger.warning("Pipe %s for %ss, closing tunnel", policy.reason, policy.timeout)
+        raise trio.TooSlowError(f"Pipe {policy.reason} for {policy.timeout}s")
 
 
 __all__ = [

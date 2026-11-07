@@ -7,12 +7,11 @@ import logging
 from collections.abc import Awaitable, Callable
 from functools import partial
 
-import h11
 import trio
 
 from . import http
-from .errors import ProxyProtocolError, RequestTooLargeError
-from .protocol import process_as_connect_request
+from .errors import ProxyProtocolError
+from .protocol import ConnectParser, ConnectRequest, error_response
 from .streaming import pipe_with_timeout
 
 logger = logging.getLogger(__name__)
@@ -23,28 +22,52 @@ async def _reply_error(stream: trio.abc.SendStream, response: bytes) -> None:
         await stream.send_all(response)
 
 
+async def process_as_connect_request(
+    stream: trio.abc.ReceiveStream,
+    *,
+    bufmaxsz: int = 8192,
+    maxreqsz: int = 16384,
+    read_timeout: float = 10.0,
+) -> ConnectRequest:
+    """Read a stream expected to contain a valid HTTP CONNECT request.
+
+    Drives the sans-io ConnectParser: receive, feed, repeat.
+    Returns a ConnectRequest, which unpacks as (host, port, trailing_bytes).
+    Raises trio.TooSlowError if the complete request doesn't arrive within read_timeout.
+    """
+    logger.debug("Reading CONNECT request...")
+    parser = ConnectParser(maxreqsz=maxreqsz)
+    with trio.fail_after(read_timeout):
+        while (request := parser.next_request()) is None:
+            chunk = await stream.receive_some(bufmaxsz)
+            if chunk:
+                parser.receive_data(chunk)
+            else:
+                parser.receive_eof()
+    return request
+
+
 async def tunnel(
     client_stream: trio.abc.Stream,
     *,
     read_timeout: float = 10.0,
     connect_timeout: float = 10.0,
     maxreqsz: int = 16384,
+    send_timeout: float = 30.0,
     _connect: Callable[[str, int], Awaitable[trio.abc.Stream]] | None = None,
 ) -> trio.abc.Stream:
     """Validate CONNECT, open the destination and transfer ownership to the caller.
 
     On failure, send an HTTP error when possible and close any opened upstream.
-    The caller owns the client stream throughout.
+    The caller owns the client stream throughout. send_timeout bounds the
+    handshake writes: early tunnel bytes upstream and the 200 reply to the client.
     """
     try:
         host, port, trailing_data = await process_as_connect_request(
             client_stream, read_timeout=read_timeout, maxreqsz=maxreqsz
         )
-    except RequestTooLargeError:
-        await _reply_error(client_stream, http.HTTP_414_URI_TOO_LONG)
-        raise
-    except ProxyProtocolError, h11.ProtocolError:
-        await _reply_error(client_stream, http.HTTP_400_BAD_REQUEST)
+    except ProxyProtocolError as exc:
+        await _reply_error(client_stream, error_response(exc))
         raise
     except trio.TooSlowError:
         await _reply_error(client_stream, http.HTTP_408_REQUEST_TIMEOUT)
@@ -62,7 +85,7 @@ async def tunnel(
         raise
 
     try:
-        with trio.fail_after(30):
+        with trio.fail_after(send_timeout):
             if trailing_data:
                 await dest_stream.send_all(trailing_data)
             await client_stream.send_all(http.HTTP_200_CONNECTION_ESTABLISHED)
@@ -78,15 +101,24 @@ async def http_proxy(
     *,
     idle_timeout: float = 300.0,
     send_timeout: float = 30.0,
+    read_timeout: float = 10.0,
+    connect_timeout: float = 10.0,
+    maxreqsz: int = 16384,
     _connect: Callable[[str, int], Awaitable[trio.abc.Stream]] | None = None,
 ) -> None:
     """Handle one client, closing both streams on EOF, failure or cancellation."""
     async with client_stream:
         try:
-            dest_stream = await tunnel(client_stream, _connect=_connect)
+            dest_stream = await tunnel(
+                client_stream,
+                read_timeout=read_timeout,
+                connect_timeout=connect_timeout,
+                maxreqsz=maxreqsz,
+                send_timeout=send_timeout,
+                _connect=_connect,
+            )
         except (
             ProxyProtocolError,
-            h11.ProtocolError,
             trio.TooSlowError,
             trio.BrokenResourceError,
             trio.ClosedResourceError,
@@ -144,4 +176,10 @@ def main() -> None:
         pass
 
 
-__all__ = ["http_proxy", "main", "start_server", "tunnel"]
+__all__ = [
+    "http_proxy",
+    "main",
+    "process_as_connect_request",
+    "start_server",
+    "tunnel",
+]

@@ -30,14 +30,19 @@ These are library defaults, not CLI or environment settings.
 
 | Limit | Default | Python function parameter |
 |---|---:|---|
-| CONNECT header size | 16384 bytes | `process_as_connect_request(maxreqsz=...)`, `tunnel(maxreqsz=...)` |
-| CONNECT read deadline | 10 seconds | `process_as_connect_request(read_timeout=...)`, `tunnel(read_timeout=...)` |
-| DNS and TCP connection deadline | 10 seconds | `tunnel(connect_timeout=...)` |
-| Initial tunnel data and 200 response writes | 30 seconds total | Fixed |
+| CONNECT header size | 16384 bytes | `process_as_connect_request(maxreqsz=...)`, `tunnel(maxreqsz=...)`, `http_proxy(maxreqsz=...)` |
+| CONNECT read deadline | 10 seconds | `process_as_connect_request(read_timeout=...)`, `tunnel(read_timeout=...)`, `http_proxy(read_timeout=...)` |
+| DNS and TCP connection deadline | 10 seconds | `tunnel(connect_timeout=...)`, `http_proxy(connect_timeout=...)` |
+| Initial tunnel data and 200 response writes | 30 seconds total | `tunnel(send_timeout=...)`, `http_proxy(send_timeout=...)` |
 | Error response write deadline | 5 seconds | Fixed |
 | Per-direction idle timeout | 300 seconds | `http_proxy(idle_timeout=...)`, `pipe_with_timeout(idle_timeout=...)` |
 | Per-direction send timeout | 30 seconds | `http_proxy(send_timeout=...)`, `pipe_with_timeout(send_timeout=...)` |
 | Read chunk size | 8192 bytes | `process_as_connect_request(bufmaxsz=...)`, `pipe(bufmaxsz=...)`, `pipe_with_timeout(bufmaxsz=...)` |
+
+`http_proxy` passes `read_timeout`, `connect_timeout`, `maxreqsz` and
+`send_timeout` to `tunnel`. One `send_timeout` value bounds both the
+handshake writes (the early tunnel data upstream plus the 200 reply, sharing one
+deadline) and each pipe send.
 
 A normal EOF half-closes the opposite stream and lets the other direction
 finish. A forwarding error or timeout cancels the sibling pipe. Stream owners
