@@ -40,7 +40,8 @@ Source lives in `src/trio_http_proxy/`:
   supplies the clock. Keep `protocol.py`, `timeouts.py`, `errors.py` and
   `http.py` free of trio imports. `tests/test_sansio.py` checks this with a
   static import scan and a subprocess import with trio blocked; it does not
-  catch an import hidden inside a function body.
+  catch an import hidden inside a function body, so `just sansio` also runs
+  ripgrep for the word `trio` in those four files (part of `just ci`).
 - `proxy.py`: `process_as_connect_request()` drives `ConnectParser` over a trio
   stream; `tunnel()` performs the handshake; `http_proxy()` owns the client
   and upstream streams and runs both pipes in a nursery. `start_server()`

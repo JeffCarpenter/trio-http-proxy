@@ -1,5 +1,5 @@
 # Run the required CI/pre-commit checks, stopping on the first failure.
-ci: lint-ci typecheck test
+ci: lint-ci sansio typecheck test
 
 # Apply type-checking and lint fixes, stopping on the first failure.
 check: typecheck-ty lint
@@ -7,6 +7,10 @@ check: typecheck-ty lint
 # Check lint without modifying files.
 lint-ci:
     ruff check
+
+# The sans-io modules must not mention trio at all. This also catches an import hidden in a function body, which the AST test in tests/test_sansio.py misses.
+sansio:
+    ! rg -n '\btrio\b' src/trio_http_proxy/protocol.py src/trio_http_proxy/timeouts.py src/trio_http_proxy/errors.py src/trio_http_proxy/http.py
 
 # Fix lint violations where possible.
 lint:
