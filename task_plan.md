@@ -1,57 +1,47 @@
-# Task Plan: Minimal Trio HTTP Proxy
+# Task Plan: Enhancements (Items 5, 2, 3, 4) via Hierarchical Delegation
 
 ## Goal
-Extract a minimal HTTP CONNECT proxy to git branch `mini`. Build strictly on Trio structured concurrency and RFC 7231. Remove Cashews caching, the background asyncio thread, circuit breakers, rate limiters, and Pydantic settings. See [meta.md](meta.md) for architectural invariants and scope specifications.
+Implement graceful signal shutdown (Item 2), Hypothesis property-based fuzzing (Item 3), target allowlist / SSRF guard (Item 4), and prune stale worktrees (Item 5) using strict hierarchical delegation, bounded worker pool, disjoint scopes, and structured concurrency.
 
 ## Current Phase
-Complete (All Quality Gates Passed)
+Complete. Implementation and acceptance are recorded in
+`.planning/2026-11-07-resume-root-proxy-enhancements/`.
 
-## Phase Checklist
-- [x] Phase 0: Setup
-  - [x] Check out branch `mini`.
-  - [x] Create planning files (`task_plan.md`, `findings.md`, `progress.md`, and `meta.md`).
-  - [x] Untrack and ignore `.planning/.active_plan`.
-  - [x] Record architectural invariants and scope in `meta.md`.
-- [x] Phase 1: Design and Pure Core Extraction
-  - [x] Write `src/trio_http_proxy/config.py`: frozen `ProxyConfig` with environment loader.
-  - [x] Write `src/trio_http_proxy/errors.py`: `ProxyError`, `ProxyProtocolError`, and `RequestTooLargeError`.
-  - [x] Write `src/trio_http_proxy/http.py`: wire-format byte responses (200, 400, 408, 414, 502, 504).
-  - [x] Write `src/trio_http_proxy/protocol.py`: pure RFC 7231 §4.3.6 target parser and incremental `h11` stream consumer.
-  - [x] Write `tests/test_config.py` and `tests/test_protocol.py`.
-- [x] Phase 2: Structured Concurrency Core Implementation
-  - [x] Write `src/trio_http_proxy/streaming.py`: timeout-oblivious `pipe()` with `send_eof()`, and `pipe_with_timeout()` with `CancelScope` nudging.
-  - [x] Write `src/trio_http_proxy/proxy.py`: `tunnel()`, `http_proxy()` with nursery and `CapacityLimiter`, and `start_server()`.
-- [x] Phase 3: Packaging and Dependency Pruning
-  - [x] Delete legacy modules (`cache/`, `circuit_breaker/`, `connection/`, `proxy_cache.py`, `dependencies.py`, `util.py`).
-  - [x] Update `src/trio_http_proxy/__init__.py` and `src/trio_http_proxy/__main__.py`.
-  - [x] Remove `cashews`, `pydantic-settings`, and `trio-asyncio` from `pyproject.toml`.
-  - [x] Run `uv sync` to refresh lockfile.
-  - [x] Delete legacy tests in `tests/` and clean `conftest.py`.
-- [x] Phase 4: Verification Suite
-  - [x] Stream A (T1): Rewrite `tests/test_proxy.py` (memory streams, status codes 200, 400, 408, 414, 502, 504, chunk boundaries).
-  - [x] Stream B (T2): Write `tests/test_invariants.py` (half-close, idle/send timeouts, sibling cancellation).
-  - [x] Stream C (T3): Update `tests/test_proxy_tcp_integration.py` (live loopback TCP sockets, CapacityLimiter).
-- [x] Phase 5: Quality Gates & Documentation
-  - [x] Stream D (T4): Update `README.md`, `CLAUDE.md`, and `docs/configuration.md`.
-  - [x] Merge all worktrees conflict-free into `mini`.
-  - [x] Pass `mcpls` diagnostics: 0 errors across all files.
-  - [x] Pass `ruff check`: All checks passed.
-  - [x] Pass `ruff format --check`: All files formatted.
-  - [x] Pass `pyright`: 0 errors, 0 warnings, 0 informations.
-  - [x] Pass `ty check`: All checks passed.
-  - [x] Pass `pytest`: 58/58 tests passed in 0.72s.
-  - [x] Live `curl` smoke test: verified HTTPS tunnel through local proxy.
+## Roles
+- Coordinator: owns decomposition, scheduling, scope-conflict detection, acceptance, and final whole-repo checks.
+- Workers: bounded pool (`active_workers <= 5`), disjoint write scopes, no sub-delegation.
 
-## Decisions Made
-- Checked out dedicated branch `mini` from `main`.
-- Moved architecture and scope specification to `meta.md`.
-- Enforce strict nursery scoping (`trio.open_nursery`): no task outlives its caller.
-- Support bidirectional TCP half-close via `send_eof()`.
-- Guard against Slowloris reads and stalled send buffers by nudging cancel scope deadlines.
-- Use frozen dataclass for configuration; avoid mutable module state and Pydantic models.
-- Executed parallel streams using isolated `git worktree`s under `hierarchical-delegation`.
-- Supervised and reviewed streams using `pi` via `hcom`.
-- Untracked and ignored `.planning/.active_plan`.
+## Tranches
+- [x] Tranche T0 (Item 5: Prune Stale Worktrees)
+  - Scope: Worktree paths `.worktrees/*`
+  - Deps: []
+  - Status: DONE (pruned and verified)
+- [x] Tranche T1 (Item 2: Graceful Signal Shutdown)
+  - Scope: `src/trio_http_proxy/config.py`, `src/trio_http_proxy/proxy.py`, `tests/test_shutdown.py`
+  - Deps: [T0]
+  - Status: ACCEPTED; cancellation deadlock fixed, signal setup fallback narrowed, and parent-cancellation/cleanup regressions passed.
+- [x] Tranche T2 (Item 3: Hypothesis Property-Based Fuzzing)
+  - Scope: `tests/test_fuzz_protocol.py`
+  - Deps: [T0]
+  - Status: ACCEPTED; real incremental streams, exact size boundaries, tunnel-byte preservation, and bounded deterministic Hypothesis coverage verified.
+- [x] Tranche T3 (Item 4: Target Allowlist & SSRF Guard)
+  - Scope: `src/trio_http_proxy/config.py`, `src/trio_http_proxy/http.py`, `src/trio_http_proxy/protocol.py`, `src/trio_http_proxy/proxy.py`, `tests/test_target_filter.py`
+  - Deps: [T1] (serialized due to overlapping scope on `config.py` and `proxy.py`)
+  - Status: ACCEPTED; host/port policy, DNS-answer vetting, numeric connection racing, scope/NAT64 identity checks, and failed-handshake cleanup verified.
+- [x] Final Combined Checks & Acceptance
+  - `uv run pytest`: 217 passed; coverage run: 98%.
+  - `ruff check` and `ruff format --check`: passed.
+  - `pyright` and `ty check`: passed.
+  - Live CLI smoke: default denial, private opt-out, early data, echo, and SIGTERM draining passed.
+  - Implementation and accepted plan committed and pushed through `3eaaba4` on `origin/mini`.
 
-## Errors Encountered
-- None.
+## Execution Log
+- [x] Coordinator: Decomposed tranches and analyzed scope conflicts.
+- [x] Batch 0: Executed T0 (Prune Stale Worktrees). `git worktree list` verified clean.
+- [x] Batch 1: Dispatched T1 (`.worktrees/shutdown`) and T2 (`.worktrees/fuzz`) concurrently (`active_workers = 2 <= 5`).
+- [x] Review: Dispatched `pi` Reviewers (`lilo` for T1, `nemo` for T2) via `hcom`. High-quality findings recorded in `findings.md`.
+- [x] Resolved T1/T2 review findings, integrated their accepted artifacts, and completed T3 with independent security review.
+- [x] Retired workers; retained task worktrees to preserve accepted artifacts.
+
+## Next Step
+No work remains. Root planning documents reflect the accepted implementation and verification results.

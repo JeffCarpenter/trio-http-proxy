@@ -1,47 +1,38 @@
-# Research and Architectural Decisions: Minimal Trio HTTP Proxy
+# Findings: Minimal Trio HTTP Proxy Enhancements
 
-## 1. Scope
-The `mini` branch extracts a minimal HTTP CONNECT proxy from `main`.
+## Acceptance Summary
 
-The `main` branch accumulated non-core mechanisms:
-- Cashews cache bridge running an asyncio event loop inside an OS thread.
-- Circuit breaker state machine tracking sliding windows, lease epochs, and permits.
-- Rate limiters and client IP tracking.
-- Pydantic settings hierarchy with 30 forwarding properties.
-- ContextVars for mutable stream context.
+All findings below were resolved and verified before implementation was pushed
+to `origin/mini`. Line references in the historical review notes describe the
+reviewed versions, not the current source.
 
-The `mini` branch removes these mechanisms. It retains only the HTTP CONNECT tunnel.
+- Shutdown cleanup always notifies the supervisor; shielded drain waits no longer deadlock on parent cancellation. Signal fallback is limited to receiver setup.
+- Fuzz tests use incremental receive streams and check exact size boundaries plus preservation of returned and unread tunnel bytes.
+- Target policy checks requested hosts and all resolved addresses, rejects mixed public/private DNS answers, and connects only to vetted numeric addresses.
+- Security review findings for scoped IPv6, NAT64 private-address aliases, upstream ownership during failed handshakes, and client-reset isolation were fixed with regressions.
+- Final acceptance: 217 tests passed, 98% coverage, Ruff/Pyright/ty clean, and real CLI smoke tests passed.
+- Private destinations require explicit `TRIO_HTTP_PROXY_ALLOW_PRIVATE_NETWORKS=true`; the guard does not replace client authentication or network egress controls.
 
-## 2. Structured Concurrency Invariants
-Trio requires strict concurrency boundaries:
-1. **Bounded Lifetimes:** Every task runs inside a nursery (`async with trio.open_nursery() as nursery:`). When a function returns, all child tasks have completed. No tasks or threads run in the background.
-2. **Half-Close Support:** TCP tunnels are full-duplex. When one side finishes writing (`from_stream.receive_some() == b""`), the forwarder calls `await to_stream.send_eof()`. The other direction continues transferring data until it reaches EOF.
-3. **Cooperative Cancellation and Timeouts:** Cancel scopes wrap all I/O. Idle and send timeouts nudge cancel scope deadlines on progress (`on_receive`, `on_send`). When one direction fails or times out, the nursery cancels the other direction immediately.
-4. **Guaranteed Resource Cleanup:** Streams close via `async with` blocks or `try...finally: await stream.aclose()`. No file descriptor or socket leaks on normal exit, cancellation, or error.
-5. **Backpressure:** A shared `trio.CapacityLimiter` bounds total concurrent connections.
+Detailed decisions and verification are retained in
+`.planning/2026-11-07-resume-root-proxy-enhancements/`.
 
-## 3. Wire Protocol and Responses
-- Pure protocol parsing using `h11` for the CONNECT request line.
-- Validation of RFC 7231 §4.3.6 authority-form (`host:port`), including bracketed IPv6 literals.
-- Responses:
-  - `200 Connection established`: tunnel opened.
-  - `400 Bad Request`: malformed request or target not in authority-form.
-  - `408 Request Timeout`: slow request headers.
-  - `414 URI Too Long`: request exceeds configured byte ceiling.
-  - `502 Bad Gateway`: destination host unreachable or connection refused.
-  - `504 Gateway Timeout`: destination connection timed out.
+## Historical Hierarchical Delegation Review Findings (Tranches T1 & T2)
 
-## 4. File Layout
-- `src/trio_http_proxy/config.py`: Frozen dataclass `ProxyConfig` with environment loader.
-- `src/trio_http_proxy/errors.py`: Exception hierarchy (`ProxyError`, `ProxyProtocolError`, `RequestTooLargeError`).
-- `src/trio_http_proxy/http.py`: Wire-format HTTP response byte constants.
-- `src/trio_http_proxy/protocol.py`: Pure target parser and incremental `h11` stream consumer.
-- `src/trio_http_proxy/streaming.py`: Timeout-oblivious `pipe()` with `send_eof()` support, and `pipe_with_timeout()`.
-- `src/trio_http_proxy/proxy.py`: `tunnel()`, `http_proxy()`, and `start_server()`.
-- `src/trio_http_proxy/__init__.py`: Clean public exports.
-- `src/trio_http_proxy/__main__.py`: CLI entry point.
-- `src/trio_http_proxy/py.typed`: Type marker.
+### Tranche T1 (Signal Shutdown) — Review by `pi` Reviewer (`lilo`)
+- **[P1] Potential cancellation deadlock in `src/trio_http_proxy/proxy.py:238–239`**:
+  - Once the drain timeout expires, the supervisor shielded its wait for `drained`.
+  - If the enclosing nursery is cancelled while a connection handler finishes shielded cleanup, `conn_runner` exits via cancellation before reaching `drained.set()`.
+  - The supervisor waits indefinitely, even though the handler finished.
+  - **Remediation**: Wrap `conn_runner` in `try...finally: drained.set()` or join child tasks directly within the supervisor nursery. Add a regression test for external cancellation during timeout cleanup.
+- **Documentation**:
+  - `docs/configuration.md` is missing `shutdown_timeout` details.
 
-Removals:
-- Delete `cache/`, `circuit_breaker/`, `connection/`, `dependencies.py`, and `proxy_cache.py`.
-- Remove `cashews`, `pydantic-settings`, and `trio-asyncio` from `pyproject.toml`.
+### Tranche T2 (Hypothesis Fuzzing) — Review by `pi` Reviewer (`nemo`)
+- **[P1] Chunk-splitting test in `tests/test_fuzz_protocol.py:336–352`**:
+  - Sending all chunks into Trio's in-memory stream before parsing coalesces the chunks into a single read.
+  - Use `ChunkedReceiveStream` with generated non-empty bodies.
+  - Assert that `returned trailing bytes + unread stream bytes == original body`.
+- **[P2] Oversize chunk variation in `tests/test_fuzz_protocol.py:433–444`**:
+  - Pre-buffering bypasses incremental delivery.
+  - Use `ChunkedReceiveStream` for incremental oversize testing.
+  - Add exact-limit acceptance and one-byte-over rejection cases to catch off-by-one errors.

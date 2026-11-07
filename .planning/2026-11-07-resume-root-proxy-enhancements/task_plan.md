@@ -4,7 +4,7 @@
 Complete the root plan: accept graceful signal shutdown and incremental Hypothesis fuzzing, integrate target allowlist / SSRF protection, and run combined verification. Preserve existing root planning documents and all worktree changes. Coordinate bounded, disjoint workers where available.
 
 ## Current phase
-Complete: all phases accepted and implementation pushed to origin/mini.
+Complete: implementation published and root planning documents synchronized.
 
 ### Phase 0: Recover task state
 **Status:** complete
@@ -30,8 +30,14 @@ Complete: all phases accepted and implementation pushed to origin/mini.
 - Review final changes and repository state; record residual risks.
 - Root plan requests commit and push: commit only after checks; inspect configured upstream before push.
 
+### Phase 4: Synchronize and commit root planning documents
+**Status:** complete
+- User requested committing remaining changes after implementation handoff.
+- Preserve the root task and review history while updating stale completion states.
+- Run required pre-commit checks and commit planning documents only.
+
 ## Next Step
-No implementation work remains. Hand off verified changes on origin/mini; preserve the pre-existing root planning edits and retained worktrees.
+No work remains. Root planning summaries match the accepted implementation; the follow-up documentation commit is local only.
 
 ## Decisions made
 - User clarified that root documents describe the incomplete task; recover them into an explicitly pinned new plan instead of silently selecting an unrelated named plan.

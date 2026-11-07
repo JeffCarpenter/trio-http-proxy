@@ -63,3 +63,10 @@
 - Fuzz branch history integrated as a4c87d7 using ours strategy because its independently improved file was already accepted in the implementation commit; no code discarded.
 - git push origin mini succeeded: 97ca0d6..a4c87d7. No force push; upstream was checked before publishing.
 - All implementation phases complete. Next step: final handoff and preserve original root planning files/worktrees.
+
+## Follow-up: commit root planning documents
+- User requested commit after implementation handoff. Remaining changes were the original root planning edits.
+- Updated root task completion checkboxes, preserved historical review findings, and added acceptance/verification summaries. No source/test changes.
+- Follow-up scope: local documentation commit only; no new push requested.
+
+- Follow-up checks: pyright 0 errors; uv run pytest 217 passed in 2.12s; git diff --check clean. Root planning summaries synchronized; follow-up documentation commit prepared after successful checks.
