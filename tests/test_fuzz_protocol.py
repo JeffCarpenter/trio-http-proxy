@@ -3,19 +3,19 @@
 The sans-io ConnectParser is driven synchronously through drive(), with no event
 loop. Chunking must preserve the destination and all tunnel bytes, including
 chunks the parser never saw; the returned trailing bytes alone may vary by
-split. A single Trio test runs process_as_connect_request over a
-ChunkedReceiveStream to cover the driver layer and bytes left unread in the
-stream.
+split. Trio driver tests cover bytes left unread in a ChunkedReceiveStream
+and connection-local failures inside an http_proxy nursery.
 """
 
 from __future__ import annotations
 
+from ipaddress import IPv6Address
 from typing import Final
 
 import pytest
 import trio
 import trio.testing as tt
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from trio_http_proxy.errors import ProxyProtocolError, RequestTooLargeError
@@ -24,7 +24,7 @@ from trio_http_proxy.protocol import (
     ConnectRequest,
     parse_connect_target,
 )
-from trio_http_proxy.proxy import process_as_connect_request
+from trio_http_proxy.proxy import http_proxy, process_as_connect_request
 
 # ---------------------------------------------------------------------------
 # Sans-io Drive Helpers
@@ -196,6 +196,11 @@ _target_bytes_strategy = st.one_of(
 
 @settings(max_examples=100, derandomize=True, deadline=None)
 @given(target=_target_bytes_strategy)
+@example(target=b"example.com:443")
+@example(target=b"[2001:db8::1]:443")
+@example(target=b".example.com:443")
+@example(target=b"a..b.com:443")
+@example(target=b"a" * 64 + b".com:443")
 def test_parse_connect_target_invariants(target: bytes) -> None:
     """parse_connect_target must return a valid (host, port) pair or raise ProxyProtocolError.
 
@@ -214,6 +219,11 @@ def test_parse_connect_target_invariants(target: bytes) -> None:
     assert 1 <= port <= 65535, (
         f"Port {port} outside valid range [1, 65535] for {target!r}"
     )
+    # Resolver-encodable does not mean DNS-resolvable; no network is needed.
+    try:
+        IPv6Address(host)
+    except ValueError:
+        assert host.encode("idna"), f"Host is not IDNA-encodable: {host!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -541,3 +551,101 @@ async def test_process_as_connect_request_eof_is_protocol_error_without_waiting(
     with pytest.raises(ProxyProtocolError):
         await process_as_connect_request(stream, read_timeout=10.0)
     assert trio.current_time() - started == 0
+
+
+_NURSERY_CONNECT = _build_connect_request_bytes("example.com", 443, [], b"early")
+_nursery_payloads = st.one_of(
+    st.binary(max_size=2048),
+    st.builds(
+        lambda target, extra: (
+            b"CONNECT " + target + b" HTTP/1.1\r\nHost: proxy\r\n\r\n" + extra
+        ),
+        _target_bytes_strategy,
+        st.binary(max_size=128),
+    ),
+    st.just(_NURSERY_CONNECT),
+)
+
+
+@settings(max_examples=100, derandomize=True, deadline=None)
+@given(
+    payload=_nursery_payloads,
+    chunk_sizes=st.lists(st.integers(min_value=1, max_value=256), max_size=20),
+    failure=st.sampled_from(
+        ["none", "oserror", "unicode", "broken", "closed", "timeout"]
+    ),
+)
+@example(payload=_NURSERY_CONNECT, chunk_sizes=[1, 2, 7], failure="none")
+@example(payload=_NURSERY_CONNECT, chunk_sizes=[], failure="oserror")
+@example(payload=_NURSERY_CONNECT, chunk_sizes=[], failure="unicode")
+@example(payload=_NURSERY_CONNECT, chunk_sizes=[], failure="broken")
+@example(payload=_NURSERY_CONNECT, chunk_sizes=[], failure="closed")
+@example(payload=_NURSERY_CONNECT, chunk_sizes=[], failure="timeout")
+@example(
+    payload=b"CONNECT .example.com:443 HTTP/1.1\r\nHost: proxy\r\n\r\n",
+    chunk_sizes=[1],
+    failure="none",
+)
+def test_http_proxy_keeps_arbitrary_requests_connection_local(
+    payload: bytes, chunk_sizes: list[int], failure: str
+) -> None:
+    """Neither malformed requests nor dial failures may tear down a nursery.
+
+    Real memory streams and an injected connector exercise both the handshake
+    and, for accepted requests, the two-pipe nursery. No sockets or patches.
+    """
+
+    async def run_scenario() -> None:
+        client, proxy_client = tt.memory_stream_pair()
+        upstream, peer = tt.memory_stream_pair()
+        finished = trio.Event()
+        sibling_survived = trio.Event()
+
+        async def connect(host: str, port: int) -> trio.abc.Stream:
+            await trio.lowlevel.checkpoint()
+            if failure == "oserror":
+                raise OSError("connection refused")
+            if failure == "unicode":
+                raise UnicodeError("resolver encoding failed")
+            if failure == "broken":
+                raise trio.BrokenResourceError("connection reset")
+            if failure == "closed":
+                raise trio.ClosedResourceError("connection closed")
+            if failure == "timeout":
+                await trio.sleep_forever()
+            return upstream
+
+        async def handle() -> None:
+            await http_proxy(
+                proxy_client,
+                bufmaxsz=64,
+                maxreqsz=512,
+                read_timeout=1,
+                connect_timeout=1,
+                idle_timeout=1,
+                send_timeout=1,
+                _connect=connect,
+            )
+            finished.set()
+
+        async def sibling() -> None:
+            await finished.wait()
+            await trio.lowlevel.checkpoint()
+            sibling_survived.set()
+
+        with trio.fail_after(5):
+            async with client, proxy_client, upstream, peer:
+                for chunk in partition_bytes(payload, chunk_sizes):
+                    await client.send_all(chunk)
+                await client.send_eof()
+                await peer.send_all(b"upstream reply")
+                await peer.send_eof()
+                # Any exception escaping handle() fails the property and cancels
+                # sibling(); do not catch it or shield the shared nursery.
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(handle)
+                    nursery.start_soon(sibling)
+        assert finished.is_set()
+        assert sibling_survived.is_set()
+
+    trio.run(run_scenario, clock=tt.MockClock(autojump_threshold=0))

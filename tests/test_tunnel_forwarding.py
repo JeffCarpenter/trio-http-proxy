@@ -12,6 +12,8 @@ import trio.testing as tt
 
 from trio_http_proxy import http, http_proxy, tunnel
 
+from .streams import RecordingStream
+
 READ_TIMEOUT = 2.0
 CONNECT_TIMEOUT = 3.0
 SEND_TIMEOUT = 4.0
@@ -127,10 +129,9 @@ async def test_http_proxy_forwards_connect_timeout(
 async def test_handshake_send_timeout_closes_upstream(
     stage: str,
     entrypoint,
-    monkeypatch: pytest.MonkeyPatch,
     autojump_clock: tt.MockClock,
 ) -> None:
-    client, proxy_client = tt.memory_stream_pair()
+    client, raw_client = tt.memory_stream_pair()
     upstream = FakeUpstream(stall_send=stage == "initial_data")
 
     async def connect(host: str, port: int) -> trio.abc.Stream:
@@ -139,9 +140,10 @@ async def test_handshake_send_timeout_closes_upstream(
     async def stall(data: bytes | bytearray | memoryview) -> None:
         await trio.sleep_forever()
 
-    if stage == "response":
-        monkeypatch.setattr(proxy_client, "send_all", stall)
-    async with client, proxy_client:
+    proxy_client = RecordingStream(
+        raw_client, before_send=stall if stage == "response" else None
+    )
+    async with client, raw_client:
         await client.send_all(CONNECT + b"early bytes")
         started = trio.current_time()
         if entrypoint is tunnel:
@@ -154,14 +156,14 @@ async def test_handshake_send_timeout_closes_upstream(
 
 
 async def test_handshake_sends_share_one_send_timeout(
-    monkeypatch: pytest.MonkeyPatch, autojump_clock: tt.MockClock
+    autojump_clock: tt.MockClock,
 ) -> None:
     """Early bytes upstream and the 200 reply spend one send_timeout together.
 
     docs/configuration.md promises one shared deadline: 3 s on the early bytes
     leave 1 s of the 4 s budget for the reply. Separate deadlines would allow 7 s.
     """
-    client, proxy_client = tt.memory_stream_pair()
+    client, raw_client = tt.memory_stream_pair()
     upstream = SlowUpstream(send_delay=3.0)
 
     async def connect(host: str, port: int) -> trio.abc.Stream:
@@ -170,8 +172,8 @@ async def test_handshake_sends_share_one_send_timeout(
     async def stall(data: bytes | bytearray | memoryview) -> None:
         await trio.sleep_forever()
 
-    monkeypatch.setattr(proxy_client, "send_all", stall)
-    async with client, proxy_client:
+    proxy_client = RecordingStream(raw_client, before_send=stall)
+    async with client, raw_client:
         await client.send_all(CONNECT + b"early bytes")
         started = trio.current_time()
         with pytest.raises(trio.TooSlowError):
@@ -223,42 +225,29 @@ async def test_http_proxy_forwards_send_timeout_to_pipes(
         assert trio.current_time() - started == 1.0 + SEND_TIMEOUT
 
 
-async def test_http_proxy_forwards_bufmaxsz(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client, proxy_client = tt.memory_stream_pair()
-    dest_proxy, dest_peer = tt.memory_stream_pair()
-    client_max_bytes: list[int | None] = []
-    dest_max_bytes: list[int | None] = []
-    original_client_receive = proxy_client.receive_some
-    original_dest_receive = dest_proxy.receive_some
-
-    async def recording_client_receive(
-        max_bytes: int | None = None,
-    ) -> bytes | bytearray:
-        client_max_bytes.append(max_bytes)
-        return await original_client_receive(max_bytes)
-
-    async def recording_dest_receive(
-        max_bytes: int | None = None,
-    ) -> bytes | bytearray:
-        dest_max_bytes.append(max_bytes)
-        return await original_dest_receive(max_bytes)
+async def test_http_proxy_forwards_bufmaxsz() -> None:
+    client, raw_client = tt.memory_stream_pair()
+    raw_dest, dest_peer = tt.memory_stream_pair()
+    proxy_client = RecordingStream(raw_client)
+    dest_proxy = RecordingStream(raw_dest)
 
     async def connect(host: str, port: int) -> trio.abc.Stream:
         return dest_proxy
 
-    monkeypatch.setattr(proxy_client, "receive_some", recording_client_receive)
-    monkeypatch.setattr(dest_proxy, "receive_some", recording_dest_receive)
-    async with client, proxy_client, dest_proxy, dest_peer:
+    async with client, raw_client, raw_dest, dest_peer:
         await client.send_all(CONNECT)
         await dest_peer.send_all(b"reply")
         await client.send_eof()
         await dest_peer.send_eof()
         await http_proxy(proxy_client, bufmaxsz=256, _connect=connect)
+        assert (
+            await read_until_eof(client)
+            == http.HTTP_200_CONNECTION_ESTABLISHED + b"reply"
+        )
+        assert await dest_peer.receive_some(4096) == b""
 
     # First read is in process_as_connect_request (via tunnel); subsequent reads are in pipe_with_timeout.
-    assert len(client_max_bytes) >= 2
-    assert all(size == 256 for size in client_max_bytes)
-    assert len(dest_max_bytes) >= 2
-    assert all(size == 256 for size in dest_max_bytes)
+    assert len(proxy_client.read_sizes) >= 2
+    assert all(size == 256 for size in proxy_client.read_sizes)
+    assert len(dest_proxy.read_sizes) >= 2
+    assert all(size == 256 for size in dest_proxy.read_sizes)

@@ -6,6 +6,8 @@ base_commit: 5c959fe
 items:
   - rank: 1
     id: branch-coverage-audit
+    status: complete
+    verification: "209 tests pass; 100% source line and branch coverage (279 statements, 68 branches). Runtime-only TYPE_CHECKING arc documented."
     title: "Verify 100% line and branch coverage on src/trio_http_proxy/"
     roi: very_high
     effort: minimal
@@ -23,6 +25,8 @@ items:
 
   - rank: 2
     id: ci-and-pyright-config-hygiene
+    status: complete
+    verification: "Sole Pyright config in pyproject.toml covers src/tests; just ci passes formatting, lint, sansio, Pyright and pytest."
     title: "Consolidate Pyright config and enforce ruff format --check in just ci"
     roi: high
     effort: low
@@ -42,6 +46,8 @@ items:
 
   - rank: 3
     id: mutation-verify-b13f8bd-guards
+    status: complete
+    verification: "10/10 isolated mutants killed by assertions in 0.40-0.48 s each; see mutation_report.md and verify_mutations.py."
     title: "Mutation-check all guards introduced in commit b13f8bd"
     roi: high
     effort: medium
@@ -71,6 +77,8 @@ items:
 
   - rank: 4
     id: fuzz-nursery-and-idna-boundary
+    status: complete
+    verification: "IDNA/IPv6 invariant and bounded shared-nursery property pass, with explicit valid/invalid targets and six connector outcomes."
     title: "Extend Hypothesis fuzzing to assert IDNA/IPv6 resolvability and http_proxy nursery isolation"
     roi: medium_high
     effort: medium
@@ -84,3 +92,32 @@ items:
     acceptance_criteria:
       - "test_parse_connect_target_invariants asserts every accepted host passes ipaddress.IPv6Address(host) or host.encode('idna')."
       - "Property test feeds arbitrary byte streams to http_proxy inside a Trio nursery and asserts no exception ever escapes http_proxy."
+
+  - rank: 5
+    id: monkeypatch-free-testability
+    title: "Replace patch-based tests with explicit arguments and stream seams"
+    status: complete
+    roi: high
+    effort: medium
+    impact: high
+    plan: testability_plan.md
+    rationale: >-
+      User approved targeted DI rather than merely avoiding new patching.
+      CLI argv/runner inputs and shared interface-level streams remove all test
+      patches; real port-0 server tests prove the boundary without new runtime layers.
+    result: >-
+      212 tests pass; source coverage is 100%; ten mutants die by assertions.
+      Source/AST audit finds no patching or dependency-method replacement in 13
+      test/support modules. CLI Pyright is clean; live mcpls still cannot resolve
+      the new helper imports in three tests, documented in progress.md.
+    sequence:
+      - "main(): explicit argv and injectable runner, preserving main() defaults."
+      - "Recording/fault-injecting stream wrappers replace method patching."
+      - "Observe upstream aclose instead of patching trio.aclose_forcefully."
+      - "Reuse the existing _connect callable for connection outcomes."
+      - "Replace patched serve_tcp delegation with real loopback port-0 coverage."
+    acceptance_criteria:
+      - "No monkeypatch, mock.patch, or manual replacement of dependency methods in tests."
+      - "Preserve CLI defaults, stream ownership, early bytes, half-close and cancellation."
+      - "just ci, 100% source coverage, and all ten assertion-based mutation kills remain green."
+      - "No dependency container, settings object, or generic clock/cleanup factories."

@@ -4,8 +4,9 @@ ci: lint-ci sansio typecheck test
 # Apply type-checking and lint fixes, stopping on the first failure.
 check: typecheck-ty lint
 
-# Check lint without modifying files.
+# Check formatting and lint without modifying files.
 lint-ci:
+    ruff format --check
     ruff check
 
 # The sans-io modules must not mention trio at all. This also catches an import hidden in a function body, which the AST test in tests/test_sansio.py misses.

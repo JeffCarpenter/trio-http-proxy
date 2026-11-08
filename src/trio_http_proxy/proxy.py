@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from functools import partial
 
 import trio
@@ -176,18 +176,23 @@ async def start_server(
     await trio.serve_tcp(http_proxy, port, host=host, task_status=task_status)
 
 
-def main() -> None:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    runner: Callable[[Callable[[], Awaitable[None]]], None] = trio.run,
+) -> None:
+    """Parse explicit or process arguments, then run the server with Trio by default."""
     parser = argparse.ArgumentParser(description="Nano HTTP CONNECT proxy")
     parser.add_argument(
         "--host", default="127.0.0.1", help="listen address (127.0.0.1)"
     )
     parser.add_argument("--port", type=int, default=8080, help="listen port (8080)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not (0 <= args.port <= 65535):
         parser.error(f"argument --port: must be between 0 and 65535, got {args.port}")
     logging.basicConfig(level=logging.INFO)
     try:
-        trio.run(partial(start_server, args.port, host=args.host))
+        runner(partial(start_server, args.port, host=args.host))
     except KeyboardInterrupt:
         pass
 

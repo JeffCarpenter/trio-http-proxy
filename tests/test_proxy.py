@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import random
 from functools import partial
-from typing import Any
 
 import pytest
 import trio
@@ -15,9 +14,10 @@ from trio_http_proxy import (
     RequestTooLargeError,
     http,
     http_proxy,
-    start_server,
     tunnel,
 )
+
+from .streams import RecordingStream
 
 
 @pytest.fixture
@@ -242,25 +242,13 @@ async def test_http_proxy_dest_connect_failure_sends_502_and_closes():
 
 
 async def test_http_proxy_forwards_large_payload_across_chunk_boundaries():
-    proxy_client, test_client = tt.memory_stream_pair()
-    dest_proxy_side, dest_test_side = tt.memory_stream_pair()
+    raw_client, test_client = tt.memory_stream_pair()
+    raw_upstream, dest_test_side = tt.memory_stream_pair()
+    proxy_client = RecordingStream(raw_client)
+    dest_proxy_side = RecordingStream(raw_upstream)
 
     async def fake_open_tcp_stream(host: str, port: int) -> trio.abc.Stream:
         return dest_proxy_side
-
-    client_to_dest_reads = 0
-    dest_to_client_reads = 0
-
-    async def count_client_to_dest_reads():
-        nonlocal client_to_dest_reads
-        client_to_dest_reads += 1
-
-    async def count_dest_to_client_reads():
-        nonlocal dest_to_client_reads
-        dest_to_client_reads += 1
-
-    proxy_client.receive_stream.receive_some_hook = count_client_to_dest_reads
-    dest_proxy_side.receive_stream.receive_some_hook = count_dest_to_client_reads
 
     payload_size = 8192 * 3 + 777
     client_payload = random.Random(1).randbytes(payload_size)
@@ -275,7 +263,7 @@ async def test_http_proxy_forwards_large_payload_across_chunk_boundaries():
         reply = await test_client.receive_some(4096)
         assert reply == http.HTTP_200_CONNECTION_ESTABLISHED
 
-        client_to_dest_reads = 0
+        client_reads_before_payload = len(proxy_client.read_sizes)
 
         await test_client.send_all(client_payload)
         await dest_test_side.send_all(dest_payload)
@@ -297,8 +285,8 @@ async def test_http_proxy_forwards_large_payload_across_chunk_boundaries():
         assert received_by_dest == client_payload
         assert received_by_client == dest_payload
 
-        assert client_to_dest_reads >= 4
-        assert dest_to_client_reads >= 4
+        assert len(proxy_client.read_sizes) - client_reads_before_payload >= 4
+        assert len(dest_proxy_side.read_sizes) >= 4
 
         await test_client.aclose()
         await dest_test_side.aclose()
@@ -346,25 +334,3 @@ async def test_http_proxy_handles_concurrent_connections_without_cross_talk():
         for _i, _proxy_client, test_client, _dest_proxy_side, dest_test_side in conns:
             await test_client.aclose()
             await dest_test_side.aclose()
-
-
-async def test_start_server_delegates_to_serve_tcp(monkeypatch: pytest.MonkeyPatch):
-    served_calls: list[tuple[Any, int, str | None]] = []
-
-    async def fake_serve_tcp(
-        handler: Any,
-        port: int,
-        *,
-        host: str | None = None,
-        task_status: Any = trio.TASK_STATUS_IGNORED,
-    ) -> None:
-        served_calls.append((handler, port, host))
-        task_status.started([])
-
-    monkeypatch.setattr(trio, "serve_tcp", fake_serve_tcp)
-    await start_server()
-    await start_server(9999, host="::1")
-    assert served_calls == [
-        (http_proxy, 8080, "127.0.0.1"),
-        (http_proxy, 9999, "::1"),
-    ]

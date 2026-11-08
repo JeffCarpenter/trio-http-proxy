@@ -78,7 +78,7 @@ _EXPORTS = {
 }
 
 
-if not TYPE_CHECKING:
+if not TYPE_CHECKING:  # pragma: no branch -- always true at runtime
     # Hidden from type checkers so a misspelled attribute is still an error there;
     # the TYPE_CHECKING imports above give them the real names.
     def __getattr__(name: str) -> object:

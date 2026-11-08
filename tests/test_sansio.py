@@ -197,6 +197,11 @@ def test_all_matches_documented_public_names() -> None:
     assert sorted(trio_http_proxy.__all__) == sorted(PUBLIC_NAMES)
 
 
+def test_package_dir_lists_public_names_and_existing_globals() -> None:
+    names = dir(trio_http_proxy)
+    assert names == sorted({*vars(trio_http_proxy), *PUBLIC_NAMES})
+
+
 def test_unknown_attribute_raises_attribute_error() -> None:
     missing = "nope"
     with pytest.raises(AttributeError, match="has no attribute 'nope'"):

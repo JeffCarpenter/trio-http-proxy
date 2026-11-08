@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+from contextlib import AsyncExitStack
 from functools import partial
 
 import trio
@@ -82,26 +83,45 @@ async def test_live_tcp_invalid_request_returns_400(nursery: trio.Nursery) -> No
         assert await client.receive_some(4096) == b""
 
 
-async def test_server_cancellation_closes_active_tunnel(nursery: trio.Nursery) -> None:
+async def test_server_custom_host_and_cancellation_close_active_tunnel(
+    nursery: trio.Nursery,
+) -> None:
     upstream_closed = trio.Event()
 
     async def origin(stream: trio.SocketStream) -> None:
         async with stream:
             assert await stream.receive_some(4096) == b""
-            upstream_closed.set()
+        upstream_closed.set()
 
-    origins = await nursery.start(partial(trio.serve_tcp, origin, 0, host="127.0.0.1"))
-    origin_port = origins[0].socket.getsockname()[1]
-    async with trio.open_nursery() as server_nursery:
-        listeners = await server_nursery.start(partial(start_server, 0))
-        proxy_port = listeners[0].socket.getsockname()[1]
-        client = await trio.open_tcp_stream("127.0.0.1", proxy_port)
-        await client.send_all(connect_request(origin_port))
-        assert await client.receive_some(4096) == http.HTTP_200_CONNECTION_ESTABLISHED
-        server_nursery.cancel_scope.cancel()
-    async with client:
-        assert await client.receive_some(4096) == b""
-    await upstream_closed.wait()
+    with trio.fail_after(5):
+        origins = await nursery.start(
+            partial(trio.serve_tcp, origin, 0, host="127.0.0.1")
+        )
+        origin_port = origins[0].socket.getsockname()[1]
+        async with AsyncExitStack() as resources:
+            async with trio.open_nursery() as server_nursery:
+                # A distinct loopback address detects an ignored host argument.
+                listeners = await server_nursery.start(
+                    partial(start_server, 0, host="127.0.0.2")
+                )
+                host, proxy_port = listeners[0].socket.getsockname()
+                assert host == "127.0.0.2"
+                assert proxy_port != 0
+                client = await resources.enter_async_context(
+                    await trio.open_tcp_stream(host, proxy_port)
+                )
+                await client.send_all(connect_request(origin_port))
+                response = bytearray()
+                while not response.endswith(b"\r\n\r\n"):
+                    chunk = await client.receive_some(4096)
+                    assert chunk, "proxy closed before completing the handshake"
+                    response.extend(chunk)
+                assert response == http.HTTP_200_CONNECTION_ESTABLISHED
+                server_nursery.cancel_scope.cancel()
+            # Observe server cleanup before the client/fixture contexts exit.
+            assert all(listener.socket.fileno() == -1 for listener in listeners)
+            assert await client.receive_some(4096) == b""
+            await upstream_closed.wait()
 
 
 async def test_live_tcp_invalid_dns_label_returns_400_and_keeps_server_alive(

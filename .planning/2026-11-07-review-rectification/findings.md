@@ -1,5 +1,29 @@
 # Findings & Decisions
 
+## Approved DI implementation — complete
+- CLI now accepts an explicit Sequence[str] argv and typed runner, defaulting to normal process args and trio.run. No dependency container or settings object. Tests pass recording/interrupting runners and use subprocess env mappings rather than touching globals.
+- Entry-point tests measure real child execution explicitly and merge CoverageData into the active collector through public APIs; no subprocess patch configuration. runpy import-only namespace must be package-qualified or coverage's source-package filter skips it. Initial 99% result resolved without branch exclusions.
+- Shared RecordingStream accepts only a HalfCloseableStream, records read limits/successful writes/close calls/cancellation, and injects send behavior through one constructor callback. Normal I/O and EOF delegate unchanged. Cleanup assertions precede raw-resource teardown; success leaves upstream ownership with the caller. No production stream, cleanup or clock seams were needed.
+- Replaced patched serve_tcp delegation with stronger existing live tests: default-host forwarding plus custom-host port-0 startup, readiness, CONNECT and cancellation. Both tunnel peers and listener closure are observed before fixture/client teardown; all six live TCP tests passed ten consecutive runs without sleeps.
+- Source/AST audit across 13 test/support modules found no patching or dependency-method replacement. Remaining non-self attribute assignments only set fake failure/stall state. Sans-I/O import blocking remains a supported custom import finder installed only in a fresh child process, not replacement of a dependency function.
+- Final gate: just ci passes 212 tests; CLI Pyright/Ruff clean; 100% source line/branch coverage (279 statements, 68 branches); all ten mutants die by assertions in 0.38–0.44 s.
+- Live mcpls discrepancy: diagnostics refreshed for 12 affected Python files; nine clean, three unresolved .streams imports in consumers of the new helper. Fresh CLI Pyright includes src and tests and reports zero errors; runtime imports succeed. No suppressions or path workarounds added; live-server import resolution remains a tooling limitation.
+
+## Follow-up backlog (2026-11-07, before DI migration)
+- Pre-migration gate: 209 tests pass; 100% coverage across all eight source modules (279 statements, 68 branches). just ci, diff whitespace check, and published mcpls diagnostics on all six modified/new Python files are clean. No runtime defaults/ownership behavior changed.
+- New properties explicitly exercise IDNA-invalid dot/label targets and valid IPv6/domain hosts. The shared-nursery property combines arbitrary bytes, structured requests, varied chunking and six injected dial outcomes (success, OSError, UnicodeError, BrokenResourceError, ClosedResourceError, timeout); a sibling must remain alive. MockClock bounds runtime without network or patches.
+- The initial DI proposal was documented in testability_plan.md and next_steps.yaml rank 5. The user subsequently approved it; implementation above clears the identified patch-based CLI/cleanup debt.
+- Mutation verification: all ten grouped backlog mutants killed by explicit assertions, not collection/runtime errors or timeouts. Added a reusable isolated verifier and mutation_report.md; clean-copy control passes. Error-reply test uses an injected faulty SendStream; the later approved argv/runner seam also removes CLI patching.
+- User's testability direction: propose small DI seams to remove monkeypatching over time; no dependency container or restored settings layer. Prioritize CLI argv/runner injection, recording/fault-injecting stream wrappers, observing upstream aclose through wrappers, and reuse existing _connect. Prefer a real loopback test to injecting serve_tcp solely for delegation.
+- Configuration hygiene: pyproject.toml now owns Pyright settings, includes src/ and tests/, and retains explicit Python 3.14 and project venv resolution without hard-coded site-packages. Deleted shadowing JSON. just lint-ci checks formatting before lint; just ci passes (205 tests, zero type errors).
+- mcpls call hierarchy confirms http_proxy -> tunnel -> process_as_connect_request, with _reply_error handling failures. Existing forwarding/cleanup tests exercise these boundaries.
+- Baseline: 202 tests passed; 97% reported branch+line coverage.
+- Real gaps: in-process package `__dir__` and both module-entry modes. Added three focused cases; subprocess entry/lazy-loading tests remain intact.
+- Coverage.py 7.16.1 falsely reports two nursery/loop arcs on Python 3.14. Official changelog documents the fix in 7.16.2 (issue 2168). An isolated `uv run --locked --with 'coverage>=7.16.2' pytest ...` cleared the proxy misses before source edits. Require coverage>=7.16.2; lock resolves 7.17.2.
+- The runtime-only `if not TYPE_CHECKING` guard cannot take its false branch. Marked only that branch `pragma: no branch`, retaining line and lazy-export body coverage; no runtime paths excluded.
+- Coverage audit result: 205 tests pass, all eight source modules at 100% (279 statements, 68 branches; no missed statements/partial branches).
+
+
 ## Requirements
 - Rigorously refactor `src/trio_http_proxy/` to rectify code review concerns.
 - Honour the structured-concurrency gospel (every task in a nursery, clean cancellation propagation, deterministic stream ownership and teardown, no unhandled connection-local exceptions escaping into `trio.serve_tcp`'s nursery).

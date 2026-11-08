@@ -19,6 +19,11 @@ The Python entry point is
 It delegates to `trio.serve_tcp`. A port of `0` requests an OS-assigned port;
 `nursery.start()` returns the bound listeners.
 
+The CLI function also accepts `main(argv=None, *, runner=trio.run)` for embedding
+and tests. Pass an argument sequence and a callable that runs the zero-argument
+async server function. Omitting them keeps the normal CLI behavior; argument
+validation runs before the runner is called.
+
 Old variables such as `TRIO_HTTP_PROXY_PORT`, `PORT`, and
 `TRIO_HTTP_PROXY_ALLOW_PRIVATE_NETWORKS` have no effect. `ProxyConfig` and
 the limiter helpers have been removed. HTTP constants are available as
