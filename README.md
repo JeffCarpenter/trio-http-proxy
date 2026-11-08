@@ -64,11 +64,17 @@ server and its connections.
 ## Development
 
 ```bash
-ruff check
-ruff format --check
-uv run --locked pyright
-uv run --locked pytest
+uv sync --locked
+just ci                 # lint, Sans-io boundary, AST test policy, types, coverage
+just mutation           # separate scratch-copy mutation verification
 ```
 
+Ruff and Pyright are locked development dependencies; the recipes run them through
+`uv run --locked`. `just ci` runs pytest once and requires 100% source line and
+branch coverage, including the real CLI subprocesses. Only static `TYPE_CHECKING`
+imports and an impossible `TYPE_CHECKING` branch are exempt, not runtime paths.
+
 Tests cover protocol properties, memory-stream invariants, handshake failures,
-timeouts, cancellation, and live loopback TCP tunnels.
+timeouts, cancellation, and live loopback TCP tunnels. They use explicit injection
+and fake streams rather than monkeypatches. See [validation](docs/validation.md)
+for the AST policy, mutation checks, individual commands, and LSP troubleshooting.

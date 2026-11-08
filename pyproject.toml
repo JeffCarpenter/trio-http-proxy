@@ -26,13 +26,16 @@ dev = [
     "coverage>=7.16.2",
     "hypothesis>=6.170.14",
     "pyreqwest>=0.13.0",
+    "pyright>=1.1.414",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
     "pytest-trio>=0.8.0",
+    "ruff>=0.17.4",
 ]
 
 [tool.pytest]
+pythonpath = ["."]
 trio_mode = true
 # A hung test must fail, not stall CI. The slowest test takes under 0.5 s.
 # pytest-timeout needs this as a string; a TOML integer is an INTERNALERROR.
@@ -41,7 +44,19 @@ timeout = "30"
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
 extraPaths = ["src"]
 pythonVersion = "3.14"
+
+[tool.coverage.run]
+branch = true
+source = ["trio_http_proxy"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+# Only static-only imports are excluded; no executable path may be excluded.
+exclude_lines = ['^if TYPE_CHECKING:$']
+# The false branch of this guard cannot execute at runtime.
+partial_branches = ['^if not TYPE_CHECKING:']
 
