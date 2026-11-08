@@ -32,7 +32,7 @@
    - `PipeTimeouts` accepted negative or `NaN` `idle_timeout` / `send_timeout`.
    - Fix:
      - Raise `ValueError` in `ConnectParser.__init__` when `maxreqsz < 1`.
-     - Raise `ValueError` in `PipeTimeouts.__init__` when `not (idle_timeout >= 0)` or `not (send_timeout >= 0)` or `not (now == now)`.
+     - Raise `ValueError` in `PipeTimeouts.__init__` when `idle_timeout < 0`, `send_timeout < 0`, or any parameter (`idle_timeout`, `send_timeout`, `now`) satisfies `math.isnan(...)`.
 
 5. **`pipe()` Calling `on_receive()` on EOF (`streaming.py`)**
    - `pipe()` called `on_receive()` before `if not chunk: break`, causing EOF (`b""`) to switch `PipeTimeouts.phase` to `"send"` even when no data was received or sent.
@@ -48,3 +48,19 @@
 7. **`bufmaxsz` Forwarding and CLI `--port` Validation (`proxy.py`, `docs/configuration.md`)**
    - Add `bufmaxsz: int = 8192` keyword parameter to `tunnel()` and `http_proxy()` and forward it to `process_as_connect_request` and `pipe_with_timeout`.
    - Validate `0 <= args.port <= 65535` in `main()` via `parser.error(...)`.
+
+## Surprises & Retrospective Insights
+
+1. **How `CONNECT .example.com:443` bypassed both `h11` and `urlsplit` to crash the entire Trio server nursery**:
+   - In `trio.serve_tcp`, every client handler runs as a child task in the server's nursery, so any uncaught exception in `http_proxy` cancels all sibling client tunnels and terminates `start_server`.
+   - `urllib.parse.urlsplit("//.example.com:443")` returned `hostname=".example.com"`, and CPython's `socket.getaddrinfo()` (inside `trio.open_tcp_stream`) ran `.encode("idna")` in C before calling the OS resolver. Because `UnicodeEncodeError` inherits from `ValueError` rather than `OSError`, `except OSError:` in `tunnel()` and `http_proxy()` missed it completely—even after 240,000 fuzz cases in `test_fuzz_protocol.py` (which generated valid `[a-z0-9]` labels and mocked `_connect`).
+
+2. **`test_fuzz_protocol.py` already knew `Content-Length` and `Transfer-Encoding` were illegal on `CONNECT`, even though `ConnectParser` did not**:
+   - `tests/test_fuzz_protocol.py:250-252` explicitly filtered `("host", "content-length", "transfer-encoding")` out of `_header_name_strategy`, yet `ConnectParser._poll()` had no check rejecting them, allowing `h11` to transition `their_state` to `SEND_BODY` while returning raw body/chunked framing bytes via `self._conn.trailing_data`.
+
+3. **Silent input normalization in `urllib.parse.urlsplit` (bpo-43882) and resulting dead code**:
+   - `urlsplit` silently strips `\r`, `\n`, and `\t` to follow the WHATWG URL spec, causing `parse_connect_target(b"exam\nple.com\r:443")` to succeed with `("example.com", 443)`.
+   - Conversely, once `@`, `?`, `#`, and `/` were rejected before `urlsplit(f"//{decoded_target}")`, the subsequent check on `parsed.path`, `parsed.query`, `parsed.fragment`, `parsed.username`, and `parsed.password` could never be reached.
+
+4. **`h11`'s `max_incomplete_event_size` interaction with `trailing_data` at the exact header limit**:
+   - Passing `max_incomplete_event_size=maxreqsz` to `h11.Connection` does not falsely reject a small header block that arrives in the same chunk as a large TLS `ClientHello`, because `h11` checks `max_incomplete_event_size` only when `_extract_next_receive_event()` returns `NEED_DATA`. Once `\r\n\r\n` is present in the buffer, `h11` extracts `h11.Request` first and leaves `ConnectParser._poll()` (`self._received - len(trailing_data) > self._maxreqsz`) to measure strictly the header bytes.

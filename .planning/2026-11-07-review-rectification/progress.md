@@ -13,6 +13,7 @@
 - Implemented fixes across `protocol.py`, `timeouts.py`, `streaming.py`, `proxy.py`, and `docs/configuration.md`.
 - Added 36 new regression test cases across `tests/test_protocol.py`, `tests/test_sansio.py`, `tests/test_pipe_deadlines.py`, `tests/test_tunnel_cleanup.py`, `tests/test_tunnel_forwarding.py`, `tests/test_cli.py`, and `tests/test_proxy_tcp_integration.py`.
 - Verified zero LSP diagnostics via `mcpls` `get_diagnostics` on all modified files and ran `just ci` (`ruff format --check`, `ruff check`, `just sansio`, `pyright`, `pytest`).
+- Committed fixes (`b13f8bd`) and recorded retrospective surprises in `findings.md`.
 
 ### Test Results
 | Test | Expected | Actual | Status |
