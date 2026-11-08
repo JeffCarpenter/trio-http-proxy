@@ -4,7 +4,7 @@
 Rectify all code-review findings across `src/trio_http_proxy/` while strictly preserving structured concurrency invariants, the sans-I/O boundary, and existing test contracts, backed by targeted regression tests.
 
 ## Next Step
-Done. All code review concerns rectified and verified with `mcpls` diagnostics and `just ci`.
+Done. Pushed `nano` to `origin/nano` through `5c959fe`; ROI-ranked backlog written to `.planning/2026-11-07-review-rectification/next_steps.yaml`.
 
 ## Current Phase
 Phase 5 (complete)

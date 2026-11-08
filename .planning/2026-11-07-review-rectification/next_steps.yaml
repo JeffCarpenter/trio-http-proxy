@@ -1,0 +1,86 @@
+# Prioritized follow-up backlog for trio_http_proxy (nano branch)
+# Ranked by Return on Investment (value / effort)
+---
+branch: nano
+base_commit: 5c959fe
+items:
+  - rank: 1
+    id: branch-coverage-audit
+    title: "Verify 100% line and branch coverage on src/trio_http_proxy/"
+    roi: very_high
+    effort: minimal
+    impact: high
+    rationale: >-
+      pytest-cov is already installed in pyproject.toml. A single 2-second run
+      pinpoints any remaining unexercised branches in the 8 source modules
+      before writing new tests or mutating code.
+    scope:
+      - src/trio_http_proxy/
+      - tests/
+    command: "uv run --locked pytest --cov=trio_http_proxy --cov-branch --cov-report=term-missing"
+    acceptance_criteria:
+      - "100% line and branch coverage across src/trio_http_proxy/, or explicit tests added for any missed branches."
+
+  - rank: 2
+    id: ci-and-pyright-config-hygiene
+    title: "Consolidate Pyright config and enforce ruff format --check in just ci"
+    roi: high
+    effort: low
+    impact: medium_high
+    rationale: >-
+      pyrightconfig.json currently shadows [tool.pyright] in pyproject.toml
+      (making include = [\"src\"] dead and drifting on extraPaths/pythonVersion),
+      and justfile's lint-ci recipe runs ruff check without ruff format --check.
+    scope:
+      - pyrightconfig.json
+      - pyproject.toml
+      - justfile
+    acceptance_criteria:
+      - "Single source of truth for Pyright configuration covering both src/ and tests/."
+      - "just lint-ci runs both ruff format --check and ruff check."
+      - "just ci passes cleanly."
+
+  - rank: 3
+    id: mutation-verify-b13f8bd-guards
+    title: "Mutation-check all guards introduced in commit b13f8bd"
+    roi: high
+    effort: medium
+    impact: high
+    rationale: >-
+      Proves via scratch-copy PYTHONPATH mutation that every guard added during
+      the review rectification is killed by a fast test assertion rather than
+      surviving silently or hanging until pytest-timeout fires.
+    scope:
+      - src/trio_http_proxy/protocol.py
+      - src/trio_http_proxy/streaming.py
+      - src/trio_http_proxy/timeouts.py
+      - src/trio_http_proxy/proxy.py
+    mutants_to_kill:
+      - "protocol.py: remove ASCII control/whitespace guard in parse_connect_target"
+      - "protocol.py: remove '\\' and '%' from forbidden delimiter tuple in parse_connect_target"
+      - "protocol.py: remove desthost.encode('idna') check in parse_connect_target"
+      - "protocol.py: remove Content-Length / Transfer-Encoding check in ConnectParser._poll"
+      - "protocol.py: remove maxreqsz < 1 check in ConnectParser.__init__"
+      - "timeouts.py: remove negative / NaN validation in PipeTimeouts.__init__"
+      - "streaming.py: move on_receive() back above 'if not chunk: break' in pipe()"
+      - "proxy.py: remove (BrokenResourceError, ClosedResourceError, OSError) suppression in _reply_error"
+      - "proxy.py: drop bufmaxsz forwarding in tunnel() and http_proxy()"
+      - "proxy.py: remove --port 0..65535 check in main()"
+    acceptance_criteria:
+      - "10 of 10 scratch-copy mutants fail at least one unit test assertion without timing out."
+
+  - rank: 4
+    id: fuzz-nursery-and-idna-boundary
+    title: "Extend Hypothesis fuzzing to assert IDNA/IPv6 resolvability and http_proxy nursery isolation"
+    roi: medium_high
+    effort: medium
+    impact: high
+    rationale: >-
+      test_parse_connect_target_invariants previously checked only that host is
+      a non-empty str and port is in 1..65535, which allowed '.example.com' to
+      pass fuzzing and later crash trio.open_tcp_stream with UnicodeEncodeError.
+    scope:
+      - tests/test_fuzz_protocol.py
+    acceptance_criteria:
+      - "test_parse_connect_target_invariants asserts every accepted host passes ipaddress.IPv6Address(host) or host.encode('idna')."
+      - "Property test feeds arbitrary byte streams to http_proxy inside a Trio nursery and asserts no exception ever escapes http_proxy."
