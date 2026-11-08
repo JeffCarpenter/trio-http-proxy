@@ -17,7 +17,7 @@ from trio_http_proxy import (
     tunnel,
 )
 
-from .streams import RecordingStream
+from .streams import RecordingStream, receive_headers
 
 
 @pytest.fixture
@@ -70,6 +70,26 @@ async def test_tunnel_bad_request_sends_400_and_raises():
     assert called is False
     reply = await test_client.receive_some(4096)
     assert reply == http.HTTP_400_BAD_REQUEST
+
+
+async def test_tunnel_ipvfuture_sends_400_without_connecting() -> None:
+    proxy_client, test_client = tt.memory_stream_pair()
+    upstream, peer = tt.memory_stream_pair()
+    calls: list[tuple[str, int]] = []
+
+    async def connect(host: str, port: int) -> trio.abc.Stream:
+        calls.append((host, port))
+        return upstream
+
+    with trio.fail_after(5):
+        async with proxy_client, test_client, upstream, peer:
+            await test_client.send_all(connect_request(target=b"[v1.localhost]:443"))
+            with pytest.raises(ProxyProtocolError):
+                await tunnel(proxy_client, _connect=connect)
+            headers, trailing = await receive_headers(test_client, max_bytes=1)
+            assert headers == http.HTTP_400_BAD_REQUEST
+            assert trailing == b""
+            assert calls == []
 
 
 async def test_tunnel_times_out_reading_connect_sends_408():

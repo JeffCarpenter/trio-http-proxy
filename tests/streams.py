@@ -5,6 +5,30 @@ from collections.abc import Awaitable, Callable
 import trio
 
 
+async def receive_headers(
+    stream: trio.abc.ReceiveStream, *, max_bytes: int = 4096
+) -> tuple[bytes, bytes]:
+    """Read a complete HTTP header block and retain any coalesced payload."""
+    buffer = bytearray()
+    while (end := buffer.find(b"\r\n\r\n")) < 0:
+        chunk = await stream.receive_some(max_bytes)
+        if not chunk:
+            raise EOFError("stream closed before the HTTP headers ended")
+        buffer.extend(chunk)
+    end += 4
+    return bytes(buffer[:end]), bytes(buffer[end:])
+
+
+async def receive_until_eof(
+    stream: trio.abc.ReceiveStream, *, initial: bytes = b"", max_bytes: int = 4096
+) -> bytes:
+    """Assemble a close-delimited response, including already received bytes."""
+    buffer = bytearray(initial)
+    while chunk := await stream.receive_some(max_bytes):
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
 class RecordingStream(trio.abc.HalfCloseableStream):
     """Wrap a half-closeable stream; optionally run an injected send operation first.
 

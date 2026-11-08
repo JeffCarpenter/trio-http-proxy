@@ -3,11 +3,16 @@ from functools import partial
 import pytest
 import trio
 
+from tests.streams import receive_headers
 
-async def _dest_http_server(stream: trio.SocketStream) -> None:
+
+async def _dest_http_server(stream: trio.abc.Stream) -> None:
     """Reply 200 OK to a single request, echoing the request line as the body."""
-    request = await stream.receive_some(4096)
-    body = request.split(b"\r\n", 1)[0] if request else b""
+    try:
+        request, _ = await receive_headers(stream)
+    except EOFError:
+        return
+    body = request.split(b"\r\n", 1)[0]
     await stream.send_all(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Length: %d\r\n"

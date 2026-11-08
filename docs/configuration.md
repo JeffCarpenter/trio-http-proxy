@@ -29,6 +29,13 @@ Old variables such as `TRIO_HTTP_PROXY_PORT`, `PORT`, and
 the limiter helpers have been removed. HTTP constants are available as
 uppercase names in `trio_http_proxy.http`; the old lowercase aliases are gone.
 
+## Supported CONNECT targets
+
+Only CONNECT requests are supported. Targets must be ASCII `host:port`
+authorities with a DNS name, IPv4 address, or bracketed IPv6 literal (for
+example, `[::1]:443`). Unsupported IPvFuture literals are rejected with HTTP
+400 before any upstream connection attempt.
+
 ## Safety limits
 
 These are library defaults, not CLI or environment settings.

@@ -52,6 +52,14 @@ def test_parse_connect_target_invalid(target: bytes):
         parse_connect_target(target)
 
 
+@pytest.mark.parametrize(
+    "target", [b"[v1.localhost]:443", b"[vF.example.org]:8443", b"[v1.foo:bar]:443"]
+)
+def test_parse_connect_target_rejects_unsupported_ipvfuture(target: bytes) -> None:
+    with pytest.raises(ProxyProtocolError):
+        parse_connect_target(target)
+
+
 async def test_process_as_connect_request_success():
     client_tx, proxy_rx = trio.testing.memory_stream_pair()
     await client_tx.send_all(

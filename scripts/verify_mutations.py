@@ -61,7 +61,7 @@ MUTATIONS = (
         (
             (
                 (
-                    '    if not decoded_target.startswith("["):\n'
+                    "    else:\n"
                     "        try:\n"
                     '            desthost.encode("idna")\n'
                     "        except UnicodeError as exc:\n"

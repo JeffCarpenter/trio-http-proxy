@@ -83,6 +83,35 @@ def test_allows_fake_state_and_explicit_injection(source: str) -> None:
     assert check_source(source) == ()
 
 
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        "trio.SocketStream | None",
+        "None | trio.SocketStream",
+        "int | None | trio.SocketStream",
+        '"trio.SocketStream"',
+        '"trio.SocketStream | None"',
+        'Optional["trio.SocketStream"]',
+        'Annotated["trio.SocketStream | None", "meta"]',
+        '"Optional[trio.SocketStream]"',
+    ],
+)
+@pytest.mark.parametrize("declaration", ["parameter", "variable"])
+def test_rejects_dependency_replacement_through_annotations(
+    annotation: str, declaration: str
+) -> None:
+    source = "import trio\nfrom typing import Annotated, Optional\n"
+    if declaration == "parameter":
+        source += f"def test_bad(stream: {annotation}):\n    stream.socket = replacement_socket\n"
+    else:
+        source += f"stream: {annotation}\nstream.socket = replacement_socket\n"
+
+    violations = check_source(source)
+
+    assert len(violations) == 1, source
+    assert "replacement" in violations[0].reason
+
+
 def test_reports_line_and_reason() -> None:
     violations = check_source("import trio\ntrio.open_tcp_stream = fake\n")
     assert len(violations) == 1

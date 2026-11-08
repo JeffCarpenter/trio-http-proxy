@@ -61,6 +61,18 @@ class PolicyVisitor(ast.NodeVisitor):
         return self.path(node).split(".")[0] in self.modules
 
     def annotation_path(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                expression = ast.parse(node.value, mode="eval").body
+            except SyntaxError:
+                return ""
+            return self.annotation_path(expression)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            for item in (node.left, node.right):
+                origin = self.annotation_path(item)
+                if origin.split(".")[0] in self.modules:
+                    return origin
+            return ""
         path = self.path(node)
         if path.split(".")[0] not in {"typing", "typing_extensions"}:
             return path
@@ -148,6 +160,10 @@ class PolicyVisitor(ast.NodeVisitor):
         self.write(node.target, node.value)
         self.generic_visit(node)
         self.bind(node.target, node.value)
+        if isinstance(node.target, ast.Name):
+            origin = self.annotation_path(node.annotation)
+            if origin.split(".")[0] in self.modules:
+                self.bindings[node.target.id] = origin
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.write(node.target, node.value)

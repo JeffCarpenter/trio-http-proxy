@@ -7,6 +7,7 @@ with next_request(). Callers own all I/O and timeouts.
 from __future__ import annotations
 
 from collections.abc import Buffer
+from ipaddress import IPv6Address
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
@@ -28,7 +29,7 @@ def parse_connect_target(target: bytes) -> tuple[str, int]:
     """Parse and validate an RFC 7231 §4.3.6 authority-form CONNECT request-target.
 
     Must be host:port only. Rejects userinfo, path, query, and fragment delimiters.
-    Correctly parses bracketed IPv6 literals (e.g. "[::1]:443").
+    Supports DNS names, IPv4 and bracketed IPv6 (e.g. "[::1]:443"), not IPvFuture.
     Raises ProxyProtocolError on invalid target.
     """
     try:
@@ -56,7 +57,14 @@ def parse_connect_target(target: bytes) -> tuple[str, int]:
         raise ProxyProtocolError(f"{target!r} has an invalid port range")
     if not desthost:
         raise ProxyProtocolError(f"{target!r} missing host")
-    if not decoded_target.startswith("["):
+    if decoded_target.startswith("["):
+        try:
+            IPv6Address(desthost)
+        except ValueError as exc:
+            raise ProxyProtocolError(
+                f"{target!r} is not a supported IPv6 literal"
+            ) from exc
+    else:
         try:
             desthost.encode("idna")
         except UnicodeError as exc:
