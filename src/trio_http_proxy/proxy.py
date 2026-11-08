@@ -17,9 +17,15 @@ from .streaming import pipe_with_timeout
 logger = logging.getLogger(__name__)
 
 
+_ERROR_REPLY_TIMEOUT: float = 5.0
+
+
 async def _reply_error(stream: trio.abc.SendStream, response: bytes) -> None:
-    with trio.move_on_after(5):
-        await stream.send_all(response)
+    with trio.move_on_after(_ERROR_REPLY_TIMEOUT):
+        try:
+            await stream.send_all(response)
+        except trio.BrokenResourceError, trio.ClosedResourceError, OSError:
+            pass
 
 
 async def process_as_connect_request(
@@ -50,6 +56,7 @@ async def process_as_connect_request(
 async def tunnel(
     client_stream: trio.abc.Stream,
     *,
+    bufmaxsz: int = 8192,
     read_timeout: float = 10.0,
     connect_timeout: float = 10.0,
     maxreqsz: int = 16384,
@@ -64,7 +71,10 @@ async def tunnel(
     """
     try:
         host, port, trailing_data = await process_as_connect_request(
-            client_stream, read_timeout=read_timeout, maxreqsz=maxreqsz
+            client_stream,
+            bufmaxsz=bufmaxsz,
+            read_timeout=read_timeout,
+            maxreqsz=maxreqsz,
         )
     except ProxyProtocolError as exc:
         await _reply_error(client_stream, error_response(exc))
@@ -77,7 +87,7 @@ async def tunnel(
     try:
         with trio.fail_after(connect_timeout):
             dest_stream = await (_connect or trio.open_tcp_stream)(host, port)
-    except OSError:
+    except OSError, UnicodeError:
         await _reply_error(client_stream, http.HTTP_502_BAD_GATEWAY)
         raise
     except trio.TooSlowError:
@@ -99,6 +109,7 @@ async def tunnel(
 async def http_proxy(
     client_stream: trio.abc.Stream,
     *,
+    bufmaxsz: int = 8192,
     idle_timeout: float = 300.0,
     send_timeout: float = 30.0,
     read_timeout: float = 10.0,
@@ -111,6 +122,7 @@ async def http_proxy(
         try:
             dest_stream = await tunnel(
                 client_stream,
+                bufmaxsz=bufmaxsz,
                 read_timeout=read_timeout,
                 connect_timeout=connect_timeout,
                 maxreqsz=maxreqsz,
@@ -123,6 +135,7 @@ async def http_proxy(
             trio.BrokenResourceError,
             trio.ClosedResourceError,
             OSError,
+            UnicodeError,
         ):
             logger.debug("CONNECT failed", exc_info=True)
             return
@@ -139,6 +152,7 @@ async def http_proxy(
                                 pipe_with_timeout,
                                 source,
                                 target,
+                                bufmaxsz=bufmaxsz,
                                 idle_timeout=idle_timeout,
                                 send_timeout=send_timeout,
                             )
@@ -169,6 +183,8 @@ def main() -> None:
     )
     parser.add_argument("--port", type=int, default=8080, help="listen port (8080)")
     args = parser.parse_args()
+    if not (0 <= args.port <= 65535):
+        parser.error(f"argument --port: must be between 0 and 65535, got {args.port}")
     logging.basicConfig(level=logging.INFO)
     try:
         trio.run(partial(start_server, args.port, host=args.host))

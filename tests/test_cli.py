@@ -37,3 +37,13 @@ def test_main_handles_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("sys.argv", ["trio_http_proxy"])
     monkeypatch.setattr(proxy.trio, "run", interrupt)
     proxy.main()
+
+
+@pytest.mark.parametrize("bad_port", ["-1", "65536", "70000"])
+def test_main_rejects_out_of_range_port(
+    bad_port: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.argv", ["trio_http_proxy", "--port", bad_port])
+    with pytest.raises(SystemExit) as exc_info:
+        proxy.main()
+    assert exc_info.value.code == 2

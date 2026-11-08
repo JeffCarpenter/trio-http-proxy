@@ -36,22 +36,16 @@ def parse_connect_target(target: bytes) -> tuple[str, int]:
     except UnicodeDecodeError as exc:
         raise ProxyProtocolError(f"{target!r} contains invalid octets") from exc
 
-    if any(c in decoded_target for c in ("@", "?", "#", "/")):
+    if any(ord(c) <= 0x20 or ord(c) >= 0x7F for c in decoded_target):
+        raise ProxyProtocolError(f"{target!r} contains control or whitespace octets")
+
+    if any(c in decoded_target for c in ("@", "?", "#", "/", "\\", "%")):
         raise ProxyProtocolError(f"{target!r} is not authority-form (RFC 7231 §4.3.6)")
 
     try:
         parsed = urlsplit(f"//{decoded_target}")
     except ValueError as exc:
         raise ProxyProtocolError(f"{target!r} is not a valid authority") from exc
-
-    if (
-        parsed.path
-        or parsed.query
-        or parsed.fragment
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        raise ProxyProtocolError(f"{target!r} is not authority-form (RFC 7231 §4.3.6)")
 
     try:
         desthost, destport = parsed.hostname, parsed.port
@@ -60,8 +54,13 @@ def parse_connect_target(target: bytes) -> tuple[str, int]:
 
     if destport is None or not (1 <= destport <= 65535):
         raise ProxyProtocolError(f"{target!r} has an invalid port range")
-    if not desthost or not desthost.strip():
+    if not desthost:
         raise ProxyProtocolError(f"{target!r} missing host")
+    if not decoded_target.startswith("["):
+        try:
+            desthost.encode("idna")
+        except UnicodeError as exc:
+            raise ProxyProtocolError(f"{target!r} has an invalid host") from exc
 
     return desthost, destport
 
@@ -82,6 +81,8 @@ class ConnectParser:
     """
 
     def __init__(self, *, maxreqsz: int = 16384) -> None:
+        if maxreqsz < 1:
+            raise ValueError(f"maxreqsz must be >= 1, got {maxreqsz}")
         self._maxreqsz = maxreqsz
         self._conn = h11.Connection(
             our_role=h11.SERVER,
@@ -148,6 +149,12 @@ class ConnectParser:
 
         if event.method != http.HTTP_METHOD_CONNECT:
             raise ProxyProtocolError(f"Expected CONNECT method, got {event.method!r}")
+
+        if any(
+            name in (b"content-length", b"transfer-encoding")
+            for name, _ in event.headers
+        ):
+            raise ProxyProtocolError("CONNECT request must not contain framing headers")
 
         host, port = parse_connect_target(event.target)
         return ConnectRequest(host, port, trailing_data)

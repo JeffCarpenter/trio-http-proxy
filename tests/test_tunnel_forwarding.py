@@ -221,3 +221,44 @@ async def test_http_proxy_forwards_send_timeout_to_pipes(
         )
         # 1 s until the bytes arrive, then the send deadline.
         assert trio.current_time() - started == 1.0 + SEND_TIMEOUT
+
+
+async def test_http_proxy_forwards_bufmaxsz(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, proxy_client = tt.memory_stream_pair()
+    dest_proxy, dest_peer = tt.memory_stream_pair()
+    client_max_bytes: list[int | None] = []
+    dest_max_bytes: list[int | None] = []
+    original_client_receive = proxy_client.receive_some
+    original_dest_receive = dest_proxy.receive_some
+
+    async def recording_client_receive(
+        max_bytes: int | None = None,
+    ) -> bytes | bytearray:
+        client_max_bytes.append(max_bytes)
+        return await original_client_receive(max_bytes)
+
+    async def recording_dest_receive(
+        max_bytes: int | None = None,
+    ) -> bytes | bytearray:
+        dest_max_bytes.append(max_bytes)
+        return await original_dest_receive(max_bytes)
+
+    async def connect(host: str, port: int) -> trio.abc.Stream:
+        return dest_proxy
+
+    monkeypatch.setattr(proxy_client, "receive_some", recording_client_receive)
+    monkeypatch.setattr(dest_proxy, "receive_some", recording_dest_receive)
+    async with client, proxy_client, dest_proxy, dest_peer:
+        await client.send_all(CONNECT)
+        await dest_peer.send_all(b"reply")
+        await client.send_eof()
+        await dest_peer.send_eof()
+        await http_proxy(proxy_client, bufmaxsz=256, _connect=connect)
+
+    # First read is in process_as_connect_request (via tunnel); subsequent reads are in pipe_with_timeout.
+    assert len(client_max_bytes) >= 2
+    assert all(size == 256 for size in client_max_bytes)
+    assert len(dest_max_bytes) >= 2
+    assert all(size == 256 for size in dest_max_bytes)

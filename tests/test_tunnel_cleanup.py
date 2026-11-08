@@ -6,7 +6,7 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy import http_proxy, tunnel
+from trio_http_proxy import ProxyProtocolError, http, http_proxy, tunnel
 
 
 @pytest.mark.parametrize("stage", ["initial_data", "response"])
@@ -134,3 +134,48 @@ async def test_stalled_error_reply_is_bounded(
         await http_proxy(proxy_client)
         assert trio.current_time() - started == 5
         assert await client.receive_some(4096) == b""
+
+
+@pytest.mark.parametrize(
+    "write_error", [trio.BrokenResourceError, trio.ClosedResourceError, OSError]
+)
+async def test_tunnel_preserves_primary_exception_when_error_reply_fails(
+    write_error: type[Exception],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, proxy_client = tt.memory_stream_pair()
+
+    async def fail_send(data: bytes | bytearray | memoryview) -> None:
+        raise write_error("client gone")
+
+    async def fail_connect(host: str, port: int) -> trio.abc.Stream:
+        raise OSError("upstream unreachable")
+
+    monkeypatch.setattr(proxy_client, "send_all", fail_send)
+    async with client, proxy_client:
+        await client.send_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        with pytest.raises(ProxyProtocolError):
+            await tunnel(proxy_client, _connect=fail_connect)
+
+    client2, proxy_client2 = tt.memory_stream_pair()
+    monkeypatch.setattr(proxy_client2, "send_all", fail_send)
+    async with client2, proxy_client2:
+        await client2.send_all(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        )
+        with pytest.raises(OSError, match="upstream unreachable"):
+            await tunnel(proxy_client2, _connect=fail_connect)
+
+
+async def test_connect_unicode_error_replies_502_and_is_caught_by_http_proxy() -> None:
+    client, proxy_client = tt.memory_stream_pair()
+
+    async def bad_idna_connect(host: str, port: int) -> trio.abc.Stream:
+        raise UnicodeEncodeError("idna", host, 0, 1, "label empty")
+
+    async with client, proxy_client:
+        await client.send_all(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        )
+        await http_proxy(proxy_client, _connect=bad_idna_connect)
+        assert await client.receive_some(4096) == http.HTTP_502_BAD_GATEWAY

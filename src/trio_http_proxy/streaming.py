@@ -22,15 +22,15 @@ async def pipe(
     """Forward chunks from from_stream to to_stream until EOF.
 
     When on_receive or on_send is given, call it immediately after each
-    receive_some() or send_all(). On EOF, call to_stream.send_eof() if
-    supported to signal half-close.
+    non-empty receive_some() or send_all(). On EOF, call to_stream.send_eof()
+    if supported to signal half-close.
     """
     while True:
         chunk = await from_stream.receive_some(bufmaxsz)
-        if on_receive is not None:
-            on_receive()
         if not chunk:
             break
+        if on_receive is not None:
+            on_receive()
         await to_stream.send_all(chunk)
         if on_send is not None:
             on_send()

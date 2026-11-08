@@ -10,7 +10,7 @@ import pytest
 import trio
 import trio.testing as tt
 
-from trio_http_proxy.streaming import pipe_with_timeout
+from trio_http_proxy.streaming import pipe, pipe_with_timeout
 
 
 class ScriptedSource(trio.abc.ReceiveStream):
@@ -72,3 +72,20 @@ async def test_send_stall_fires_at_the_send_deadline_not_the_idle_one(
         )
 
     assert trio.current_time() - started == 1.0 + 30.0
+
+
+async def test_pipe_does_not_call_on_receive_on_eof() -> None:
+    """on_receive and on_send fire only for non-empty chunks, never on EOF."""
+    events: list[str] = []
+    source = ScriptedSource([(0.0, b"first"), (0.0, b"second"), (0.0, b"")])
+    sink = RecordingSink()
+
+    await pipe(
+        source,
+        sink,
+        on_receive=lambda: events.append("receive"),
+        on_send=lambda: events.append("send"),
+    )
+
+    assert sink.received == [b"first", b"second"]
+    assert events == ["receive", "send", "receive", "send"]

@@ -37,10 +37,11 @@ These are library defaults, not CLI or environment settings.
 | Error response write deadline | 5 seconds | Fixed |
 | Per-direction idle timeout | 300 seconds | `http_proxy(idle_timeout=...)`, `pipe_with_timeout(idle_timeout=...)` |
 | Per-direction send timeout | 30 seconds | `http_proxy(send_timeout=...)`, `pipe_with_timeout(send_timeout=...)` |
-| Read chunk size | 8192 bytes | `process_as_connect_request(bufmaxsz=...)`, `pipe(bufmaxsz=...)`, `pipe_with_timeout(bufmaxsz=...)` |
+| Read chunk size | 8192 bytes | `process_as_connect_request(bufmaxsz=...)`, `tunnel(bufmaxsz=...)`, `http_proxy(bufmaxsz=...)`, `pipe(bufmaxsz=...)`, `pipe_with_timeout(bufmaxsz=...)` |
 
-`http_proxy` passes `read_timeout`, `connect_timeout`, `maxreqsz` and
-`send_timeout` to `tunnel`. One `send_timeout` value bounds both the
+`http_proxy` passes `bufmaxsz`, `read_timeout`, `connect_timeout`, `maxreqsz`
+and `send_timeout` to `tunnel`, and `bufmaxsz`, `idle_timeout` and
+`send_timeout` to `pipe_with_timeout`. One `send_timeout` value bounds both the
 handshake writes (the early tunnel data upstream plus the 200 reply, sharing one
 deadline) and each pipe send.
 

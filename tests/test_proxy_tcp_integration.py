@@ -102,3 +102,23 @@ async def test_server_cancellation_closes_active_tunnel(nursery: trio.Nursery) -
     async with client:
         assert await client.receive_some(4096) == b""
     await upstream_closed.wait()
+
+
+async def test_live_tcp_invalid_dns_label_returns_400_and_keeps_server_alive(
+    nursery: trio.Nursery, dest_server_port: int
+) -> None:
+    listeners = await nursery.start(partial(start_server, 0))
+    proxy_port = listeners[0].socket.getsockname()[1]
+
+    async with await trio.open_tcp_stream("127.0.0.1", proxy_port) as bad_client:
+        await bad_client.send_all(
+            b"CONNECT .example.com:443 HTTP/1.1\r\nHost: .example.com:443\r\n\r\n"
+        )
+        assert await bad_client.receive_some(4096) == http.HTTP_400_BAD_REQUEST
+        assert await bad_client.receive_some(4096) == b""
+
+    async with await trio.open_tcp_stream("127.0.0.1", proxy_port) as good_client:
+        await good_client.send_all(connect_request(dest_server_port))
+        assert (
+            await good_client.receive_some(4096) == http.HTTP_200_CONNECTION_ESTABLISHED
+        )

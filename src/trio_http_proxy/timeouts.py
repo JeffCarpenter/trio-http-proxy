@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 
@@ -16,6 +17,14 @@ class PipeTimeouts:
     __slots__ = ("deadline", "idle_timeout", "phase", "send_timeout")
 
     def __init__(self, *, idle_timeout: float, send_timeout: float, now: float) -> None:
+        if (
+            idle_timeout < 0
+            or send_timeout < 0
+            or math.isnan(idle_timeout)
+            or math.isnan(send_timeout)
+            or math.isnan(now)
+        ):
+            raise ValueError("idle_timeout, send_timeout, and now must be valid")
         self.idle_timeout = idle_timeout
         self.send_timeout = send_timeout
         self.phase: Literal["idle", "send"] = "idle"

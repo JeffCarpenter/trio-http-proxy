@@ -401,3 +401,45 @@ def test_parser_eof_after_an_error_keeps_the_first_error() -> None:
     parser.receive_eof()
     with pytest.raises(ProxyProtocolError, match="Expected CONNECT"):
         parser.next_request()
+
+
+@pytest.mark.parametrize(
+    "framing_header",
+    [
+        b"Content-Length: 5\r\n",
+        b"Content-Length: 0\r\n",
+        b"Transfer-Encoding: chunked\r\n",
+    ],
+)
+def test_parser_rejects_framing_headers_on_connect(framing_header: bytes) -> None:
+    parser = ConnectParser()
+    parser.receive_data(
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"
+        + framing_header
+        + b"\r\n"
+    )
+    with pytest.raises(ProxyProtocolError, match="framing headers"):
+        parser.next_request()
+
+
+@pytest.mark.parametrize("bad_maxreqsz", [0, -1, -100])
+def test_parser_rejects_nonpositive_maxreqsz(bad_maxreqsz: int) -> None:
+    with pytest.raises(ValueError, match="maxreqsz must be >= 1"):
+        ConnectParser(maxreqsz=bad_maxreqsz)
+
+
+@pytest.mark.parametrize(
+    ("idle_timeout", "send_timeout", "now"),
+    [
+        (-1.0, 30.0, 0.0),
+        (300.0, -0.1, 0.0),
+        (float("nan"), 30.0, 0.0),
+        (300.0, float("nan"), 0.0),
+        (300.0, 30.0, float("nan")),
+    ],
+)
+def test_pipe_timeouts_rejects_invalid_parameters(
+    idle_timeout: float, send_timeout: float, now: float
+) -> None:
+    with pytest.raises(ValueError, match="must be valid"):
+        PipeTimeouts(idle_timeout=idle_timeout, send_timeout=send_timeout, now=now)
